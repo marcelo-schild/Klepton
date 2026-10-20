@@ -5704,9 +5704,52 @@ static int klovrp_fake_present(void) {
                          || kl_env_str("KL_OVRP_POKE", NULL) != NULL;
     return fake;
 }
+// KL_OVRP_HAND_SCRIPT="<s>:<L|R>:<dx>,<dy>,<dz>;..." — a host run's hands, placed
+// relative to the head (metres, head frame: +x right, +y up, -z ahead) from that
+// many seconds on, until that hand's next entry; "<s>:<L|R>:off" hands it back.
+// Timed on KL_OVRP_POKE's clock, so the two scripts line up. For a tutorial that
+// asks for a gesture — HITMAN 3 VR: Reloaded's "move the item into the wrist
+// inventory ring" (Mac, 2026-10-21). Diagnostic; a headset never sets it.
+#define KLOVRP_HS_MAX 64
+static struct { double t; int hand, off; float d[3]; } g_hs[KLOVRP_HS_MAX];
+static int g_hs_n = -1;
+static void klovrp_hand_script(int hand, klovrp_pose *p) {
+    if (g_hs_n < 0) {
+        g_hs_n = 0;
+        const char *s = kl_env_str("KL_OVRP_HAND_SCRIPT", NULL);
+        while (s && *s && g_hs_n < KLOVRP_HS_MAX) {
+            double t; char h; float x, y, z; int n = 0;
+            if (sscanf(s, "%lf:%c:off%n", &t, &h, &n) == 2 && n) {
+                g_hs[g_hs_n].t = t; g_hs[g_hs_n].hand = (h == 'L' || h == 'l') ? 0 : 1; g_hs[g_hs_n].off = 1; g_hs_n++;
+            } else if (sscanf(s, "%lf:%c:%f,%f,%f%n", &t, &h, &x, &y, &z, &n) == 5 && n) {
+                g_hs[g_hs_n].t = t; g_hs[g_hs_n].hand = (h == 'L' || h == 'l') ? 0 : 1; g_hs[g_hs_n].off = 0;
+                g_hs[g_hs_n].d[0] = x; g_hs[g_hs_n].d[1] = y; g_hs[g_hs_n].d[2] = z; g_hs_n++;
+            } else break;
+            s = strchr(s, ';');
+            if (s) s++;
+        }
+        if (g_hs_n) fprintf(stderr, "  [ovrp] KL_OVRP_HAND_SCRIPT: %d hand placement(s)\n", g_hs_n);
+    }
+    if (!g_hs_n) return;
+    double now = klovrp_mono_now();
+    if (g_poke_t0 == 0.0) g_poke_t0 = now;
+    double el = now - g_poke_t0;
+    int at = -1;
+    for (int i = 0; i < g_hs_n; i++)
+        if (g_hs[i].hand == hand && g_hs[i].t <= el && (at < 0 || g_hs[i].t >= g_hs[at].t)) at = i;
+    if (at < 0 || g_hs[at].off) return;
+    klovrp_pose head = klovrp_head();
+    float ox, oy, oz;
+    klovrp_qrot(&head, g_hs[at].d[0], g_hs[at].d[1], g_hs[at].d[2], &ox, &oy, &oz);
+    p->px = head.px + ox; p->py = head.py + oy; p->pz = head.pz + oz;
+    p->qx = head.qx; p->qy = head.qy; p->qz = head.qz; p->qw = head.qw;
+    p->vx = p->vy = p->vz = 0; p->avx = p->avy = p->avz = 0;
+}
+
 int kl_ovrp_hand_motion(int hand, float *pos, float *quat, float *vel, float *ang) {
     if ((unsigned)hand > 1) return 0;
     klovrp_pose p = klovrp_hand(hand);
+    klovrp_hand_script(hand, &p);
     if (pos)  { pos[0] = p.px; pos[1] = p.py; pos[2] = p.pz; }
     if (quat) { quat[0] = p.qx; quat[1] = p.qy; quat[2] = p.qz; quat[3] = p.qw; }
     if (vel)  { vel[0] = p.vx; vel[1] = p.vy; vel[2] = p.vz; }

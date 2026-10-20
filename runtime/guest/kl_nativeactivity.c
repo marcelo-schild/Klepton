@@ -38,7 +38,7 @@ typedef void (*anativeactivity_oncreate_fn)(kl_ANativeActivity *, void *, size_t
 // language. Never called, the package manager looked for
 // "//packagedefinition.txt", found nothing and stopped on its own trap
 // (ZPackageManagerBase, Mac run 2026-10-20). Only a library that exports the
-// native is called; the order matches Java: right after onCreate returns.
+// native is called, and it is called just BEFORE onCreate (see kl_na_create).
 typedef void (*kl_na_set_android_info_fn)(void *env, void *thiz, void *pkg, void *obb,
                                           void *files, void *locale);
 static void kl_na_java_on_create(kl_image *img, const char *data_path, FILE *out) {
@@ -120,8 +120,15 @@ int kl_na_create(kl_image *img, const char *entry, const char *data_path, FILE *
     }
 
     kl_jni_local_frame_push();
-    onCreate(&g_act, NULL, 0);
+    // Before onCreate, not after it as Java orders them: onCreate starts the
+    // engine's own thread, and HITMAN's went straight on to its package
+    // manager. When that thread won the race the paths were still empty — it
+    // opened "//packagedefinition.txt" and stopped on its own trap (headset,
+    // 2026-10-20, a run in German that happened to be quicker; the same build
+    // in English had set them first). The native only copies the four strings
+    // into the engine's buffers, so it needs nothing onCreate makes.
     kl_na_java_on_create(img, data_path, out);
+    onCreate(&g_act, NULL, 0);
     kl_jni_local_frame_pop();
     if (out) {
         fprintf(out, "  onCreate returned; %d of %zu callbacks registered\n",

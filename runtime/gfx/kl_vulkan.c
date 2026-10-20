@@ -1532,7 +1532,24 @@ static int cap_prepare(klvk_device *d, VkDeviceSize need) {
     return 1;
 }
 
-static const char *cap_dir(void) { return kl_env_str("KL_VK_OUT", NULL); }
+// "~/..." is taken from $HOME: on a headset the app's container, whose path
+// changes with every install, so a launch can name its Documents folder
+// without knowing it (KL_VK_OUT=~/Documents/vkout).
+static const char *cap_dir(void) {
+    static char buf[1024];
+    static int done;
+    static const char *dir;
+    if (!done) {
+        done = 1;
+        dir = kl_env_str("KL_VK_OUT", NULL);
+        const char *home = getenv("HOME");
+        if (dir && dir[0] == '~' && dir[1] == '/' && home && *home) {
+            snprintf(buf, sizeof buf, "%s%s", home, dir + 1);
+            dir = buf;
+        }
+    }
+    return dir;
+}
 
 // Copy any image out and write it as a PNG.
 //

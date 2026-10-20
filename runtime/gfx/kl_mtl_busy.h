@@ -16,5 +16,8 @@ double kl_mtl_busy_take(unsigned long *buffers);
 // long enough to have been compiled, and the ones answered at once from what
 // the system had compiled before. Both 0 while nothing is installed.
 void kl_mtl_compiles_take(unsigned long *compiled, unsigned long *cached);
+// The next render pipeline this thread creates gets this Metal logic operation
+// (private API; see kl_mtl_busy.m). -1 for none. Needs kl_mtl_busy_install().
+void kl_mtl_logic_op_next(int metal_op);
 
 #endif

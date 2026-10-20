@@ -193,6 +193,7 @@ static void *mvk_open(void) {
 static void *g_mvk;
 static PFN_vkGetInstanceProcAddr real_gipa;
 static PFN_vkGetDeviceProcAddr   real_gdpa;
+static int klvk_logic_op_on(void);   // KL_VK_LOGIC_OP, defined with klvk_feature_surgery
 
 // Pipeline-object hooks (kl_vk_pipe_hooks.h): an add-on records every sampler,
 // layout, shader module, render pass and pipeline the guest creates, and
@@ -249,6 +250,7 @@ static void vk_init(void) {
         if (kl_env_on("KL_MVK_COMPILE_TIMEOUT", def))
             setenv("MVK_CONFIG_METAL_COMPILE_TIMEOUT", "10000000000", 0); // 10 s
     }
+
 
     // wanderer black world: a MoltenVK/SPIRV-Cross argument-buffer codegen bug. A
     // fragment material referencing TWO Material Parameter Collections (two dynamic
@@ -994,6 +996,22 @@ static void dev_resolve(klvk_device *d) {
 // however many leading fields it overwrites is how many flags the struct has.
 #define KLVK_FEAT_SENTINEL 0xA5A5A5A5u
 #define KLVK_FEAT_WORDS    256
+// KL_VK_LOGIC_OP (default on for HITMAN 3 VR: Reloaded): its light culling
+// (lightculling.frag) ORs each light's bit into a tile mask with VK_LOGIC_OP_OR
+// on a uint target. Without logic ops every light overwrote the tile, tiles kept
+// only their last light, and the level showed dark regions with stepped edges
+// (Mac, 2026-10-20). MoltenVK reports no logicOp (it is built without private
+// API), so the operation is set on the Metal pipeline underneath it
+// (kl_mtl_logic_op_next, kl_mtl_busy.m) while the Vulkan pipeline is created.
+static int klvk_logic_op_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_VK_LOGIC_OP", t && !strcmp(t, "x8012387035448196"));
+    }
+    return on;
+}
 static void klvk_feature_surgery(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci) {
     PFN_vkGetPhysicalDeviceFeatures2 get = (PFN_vkGetPhysicalDeviceFeatures2)
         real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2");
@@ -5150,10 +5168,16 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
                     !!c->pTessellationState, !!c->pViewportState, !!c->pRasterizationState,
                     !!c->pMultisampleState, !!c->pDepthStencilState, !!c->pColorBlendState,
                     !!c->pDynamicState, (void *)c->renderPass, c->subpass, (unsigned)c->flags);
-            if (c->pColorBlendState) fprintf(stderr, " cb.att %u", c->pColorBlendState->attachmentCount);
+            if (c->pColorBlendState) fprintf(stderr, " cb.att %u logicop %u/%d blend0 %d wmask0 %#x", c->pColorBlendState->attachmentCount,
+                                             c->pColorBlendState->logicOpEnable, (int)c->pColorBlendState->logicOp,
+                                             c->pColorBlendState->attachmentCount && c->pColorBlendState->pAttachments ? (int)c->pColorBlendState->pAttachments[0].blendEnable : -1,
+                                             c->pColorBlendState->attachmentCount && c->pColorBlendState->pAttachments ? (unsigned)c->pColorBlendState->pAttachments[0].colorWriteMask : 0);
             for (uint32_t k = 0; c->pDynamicState && k < c->pDynamicState->dynamicStateCount; k++)
                 fprintf(stderr, "%s%d", k ? "," : " dyn=", (int)c->pDynamicState->pDynamicStates[k]);
             for (const VkBaseInStructure *x = c->pNext; x; x = x->pNext) fprintf(stderr, " next=%d", (int)x->sType);
+            for (uint32_t k = 0; k < c->stageCount && c->pStages; k++)
+                if (c->pStages[k].stage == VK_SHADER_STAGE_FRAGMENT_BIT && klvk_fs_on())
+                    fprintf(stderr, " fs %08x", klvk_fs_get(g_fs_mod, (uint64_t)(uintptr_t)c->pStages[k].module));
             fprintf(stderr, "\n");
         }
     }
@@ -5297,6 +5321,25 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
         fflush(stderr);
     }
     double t0 = kl_pipe_ms();
+    // A logic operation MoltenVK would drop (KL_VK_LOGIC_OP): set on the Metal
+    // pipeline it is about to create, from underneath (kl_mtl_logic_op_next).
+    int logic = -1;
+    if (n == 1 && use && use[0].pColorBlendState && use[0].pColorBlendState->logicOpEnable && klvk_logic_op_on()) {
+        // Vulkan's order -> Apple's (see kl_mtl_busy.m)
+        static const int vk2mtl[16] = { 0 /*CLEAR*/, 6 /*AND*/, 12 /*AND_REVERSE*/, 2 /*COPY*/, 13 /*AND_INVERTED*/,
+                                        4 /*NO_OP*/, 10 /*XOR*/, 8 /*OR*/, 9 /*NOR*/, 11 /*EQUIVALENT*/, 5 /*INVERT*/,
+                                        14 /*OR_REVERSE*/, 3 /*COPY_INVERTED*/, 15 /*OR_INVERTED*/, 7 /*NAND*/, 1 /*SET*/ };
+        unsigned vop = (unsigned)use[0].pColorBlendState->logicOp;
+        if (vop < 16) {
+            static int installed;
+            if (!installed) { installed = 1; extern int kl_mtl_busy_install(void); kl_mtl_busy_install(); }
+            logic = vk2mtl[vop];
+            extern void kl_mtl_logic_op_next(int);
+            kl_mtl_logic_op_next(logic);
+            static int said;
+            if (said++ < 3) VKI("logic op %u (Metal %d) for a pipeline being created (KL_VK_LOGIC_OP)\n", vop, logic);
+        }
+    }
     VkResult r = real ? real(dev, cache, n, use, alloc, out)
                       : VK_ERROR_INITIALIZATION_FAILED;
     if (r < 0 && real && use && out && klvk_vin_on()) {
@@ -5307,6 +5350,7 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
         }
         if (!left) r = VK_SUCCESS;
     }
+    if (logic >= 0) { extern void kl_mtl_logic_op_next(int); kl_mtl_logic_op_next(-1); }
     if (pipe_trace) { VKI("pipe-trace: DONE through #%llu (r=%d)\n", g_pipe_enter, (int)r); fflush(stderr); }
     free(mod); free(ias); free(mss); free(masks);
     if (fixed) { static int said; if (said < 8) { said++;
@@ -7893,6 +7937,14 @@ static VkResult VKAPI_CALL klvk_EnumeratePhysicalDevices(
                             (unsigned)qf[k].queueFlags, qf[k].queueCount);
                     }
                 }
+                {
+                    PFN_vkGetPhysicalDeviceFeatures gf =
+                        (PFN_vkGetPhysicalDeviceFeatures)real_gipa(inst, "vkGetPhysicalDeviceFeatures");
+                    VkPhysicalDeviceFeatures pf; memset(&pf, 0, sizeof pf);
+                    if (gf) gf(tmp[i], &pf);
+                    VKI("  phys[%u] logicOp %u dualSrcBlend %u (MVK_CONFIG_USE_METAL_PRIVATE_API=%s)\n", i,
+                        pf.logicOp, pf.dualSrcBlend, getenv("MVK_CONFIG_USE_METAL_PRIVATE_API") ? getenv("MVK_CONFIG_USE_METAL_PRIVATE_API") : "unset");
+                }
                 VKI("  phys[%u] '%s' api %u.%u.%u type %d vendor %#x device %#x "
                     "queueFamilies %u graphics %d\n", i, p.deviceName,
                     VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion),
@@ -8219,7 +8271,9 @@ static void VKAPI_CALL klvk_CmdBindPipeline(void *cb, uint32_t bindPoint, uint64
     if (!pipeline) { static int said; if (said < 8) { said++;
         VKI("vkCmdBindPipeline: NULL pipeline bound (bindPoint %u) — a following "
             "draw will dereference null in MoltenVK\n", bindPoint); } }
-    if (bindPoint == 0 /* graphics */ && klvk_fs_on()) {
+    // A variant bound by the dynamic-vertex-input emulation keeps the shader
+    // hash its deferred pipeline was bound with (klvk_vi_settle).
+    if (bindPoint == 0 /* graphics */ && klvk_fs_on() && !t_vi_internal) {
         t_fs_hash = klvk_fs_get(g_fs_pipe, pipeline);
         if (!t_fs_hash) t_fs_hash = 0xffffffffu;
         t_fs_skip = 0;

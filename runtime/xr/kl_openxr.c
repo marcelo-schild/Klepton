@@ -4482,6 +4482,17 @@ static XrResult klxr_SuggestInteractionProfileBindings(
                 if (strcmp(suffix, "/input/y/click") == 0) { kind = KLXR_SRC_BUTTON_OTHER; bit = KL_OVRP_RAW_Y; }
                 if (strcmp(suffix, "/input/x/touch") == 0 || strcmp(suffix, "/input/y/touch") == 0) kind = KLXR_SRC_NONE;
             }
+            // A BOOLEAN action bound to the bare /input/thumbstick reads the
+            // stick's click: the spec has a boolean bound to an identifier take
+            // its click component. Served as the whole stick it read the X
+            // deflection, non-zero on every push — HITMAN 3 VR: Reloaded binds
+            // "thumbstick_click" that way, so each snap turn on the right stick
+            // toggled crouching and each step on the left one let go of a
+            // dragged body (headset, 2026-10-20).
+            if (kind == KLXR_SRC_STICK_VEC && a->type == KLXR_ACTION_TYPE_BOOLEAN) {
+                kind = KLXR_SRC_BUTTON;
+                bit  = hand ? KL_OVRP_RAW_RTHUMBSTICK : KL_OVRP_RAW_LTHUMBSTICK;
+            }
             // A row whose bit for THIS hand is zero names a control this hand
             // does not have (a/b on the left, x/y on the right). Not an error
             // — just not bound.
@@ -9181,6 +9192,50 @@ int kl_openxr_input_selftest(FILE *f) {
         ok &= klxr_st_ok(f, "Valve: a source path has a display name",
                          lr == KLXR_SUCCESS &&
                          strstr(nb, "Right Controller") != NULL);
+    }
+
+    // A BOOLEAN bound to the bare /input/thumbstick is the stick's click, not
+    // its deflection — HITMAN 3 VR: Reloaded's "thumbstick_click" (crouch on
+    // the right, the drag release on the left) fired on every push before.
+    klxr_st_boot();
+    {
+        XrActionSetCreateInfo hsi; memset(&hsi, 0, sizeof hsi);
+        hsi.type = XR_TYPE_ACTION_SET_CREATE_INFO;
+        snprintf(hsi.actionSetName, sizeof hsi.actionSetName, "%s", "hitman");
+        void *hset = NULL;
+        klxr_CreateActionSet(&g_instance, &hsi, &hset);
+        void *hclick = klxr_st_action(hset, "thumbstick_click", KLXR_ACTION_TYPE_BOOLEAN);
+        void *hpos   = klxr_st_action(hset, "thumbstick_pos", KLXR_ACTION_TYPE_VECTOR2F);
+        const XrActionSuggestedBinding hitman_map[] = {
+            klxr_st_sb(hclick, "/user/hand/right/input/thumbstick"),
+            klxr_st_sb(hpos,   "/user/hand/right/input/thumbstick"),
+        };
+        klxr_st_bind_all(KLXR_ACTIVE_PROFILE, hitman_map, 2);
+        ok &= klxr_st_ok(f, "bare thumbstick: a boolean binds the click, a Vector2f the stick",
+                         ((klxr_action *)hclick)->kind[1] == KLXR_SRC_BUTTON &&
+                         ((klxr_action *)hclick)->bit[1] == KL_OVRP_RAW_RTHUMBSTICK &&
+                         ((klxr_action *)hpos)->kind[1] == KLXR_SRC_STICK_VEC);
+
+        XrActionStateGetInfo hgi; memset(&hgi, 0, sizeof hgi);
+        hgi.type = XR_TYPE_ACTION_STATE_GET_INFO;
+        hgi.action = hclick;
+        klxr_StringToPath(&g_instance, "/user/hand/right", &hgi.subactionPath);
+        XrActionStateBoolean hb;
+        kl_ovrp_set_hand_pose(1, 0.2f, 1.0f, -0.3f, 0, 0, 0, 1);
+        kl_ovrp_set_controller_input(1, 0, 0, 0, 0, 1.0f, 0.0f);
+        kl_ovrp_frame_latch();
+        klxr_st_sync();
+        memset(&hb, 0, sizeof hb);
+        klxr_GetActionStateBoolean(&g_session, &hgi, &hb);
+        ok &= klxr_st_ok(f, "bare thumbstick: a full push is not a click",
+                         hb.isActive && !hb.currentState);
+        kl_ovrp_set_controller_input(1, KL_OVRP_RAW_RTHUMBSTICK, 0, 0, 0, 0.0f, 0.0f);
+        kl_ovrp_frame_latch();
+        klxr_st_sync();
+        memset(&hb, 0, sizeof hb);
+        klxr_GetActionStateBoolean(&g_session, &hgi, &hb);
+        ok &= klxr_st_ok(f, "bare thumbstick: pressing the stick is",
+                         hb.isActive && hb.currentState);
     }
 
     memset(&g_session, 0, sizeof g_session);

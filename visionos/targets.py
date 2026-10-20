@@ -1238,9 +1238,12 @@ STORE_DEFAULTS = {
     # (the mixed space, the default anyway), a frame on every second refresh —
     # an even 50, the half rate the Quest build draws at with space warp — 4096
     # an eye (klovrp_title_cap in kl_ovrp.c) and foveated rendering at "high".
-    # No reset: a player who has chosen otherwise keeps it.
+    # No reset: a player who has chosen otherwise keeps it. Shaders compiled
+    # behind the picture as well (KL_VK_ASYNC_PIPES, with KL_VK_ASYNC_RP): each
+    # new one held the picture 0.3-0.9 s on the headset (2026-10-20); the Mac
+    # mission looks the same with it once they are there.
     "x8012387035448196": {"foveation": True, "vk_foveation": "high",
-                          "test_on": "KL_GUEST_PACE_DIV"},
+                          "test_on": "KL_GUEST_PACE_DIV,KL_VK_ASYNC_PIPES"},
 }
 
 

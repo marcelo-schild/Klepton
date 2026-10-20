@@ -6197,7 +6197,20 @@ static uint64_t klvk_vi_variant(klvk_vipipe *p, const klvk_vi_layout *l) {
     c.pVertexInputState = &vis;
     VkPipeline real = VK_NULL_HANDLE;
     double t0 = kl_pipe_ms();
-    VkResult r = klvk_CreateGraphicsPipelines0(p->dev, VK_NULL_HANDLE, 1, &c, NULL, &real);
+    // Behind the frame when KL_VK_ASYNC_PIPES asks for it: this is where such a
+    // guest's compiles really happen — its vkCreateGraphicsPipelines only made
+    // the handle above — so the switch never reached them, and on the headset
+    // each new variant held the picture 0.3-0.9 s (HITMAN 3 VR: Reloaded,
+    // 2026-10-20). klvk_ap_create answers with the pipeline, or with a handle of
+    // its own that klvk_ap_bind resolves (dropping the draws until it is there),
+    // and applies its own rule of which pipelines qualify. A pipeline with a
+    // logic op stays in place: that op reaches Metal through one flag set around
+    // the compile (kl_mtl_logic_op_next), which compiles on other threads would
+    // share.
+    int lop = c.pColorBlendState && c.pColorBlendState->logicOpEnable;
+    VkResult r = klvk_ap_mode() && !lop
+        ? klvk_ap_create(p->dev, VK_NULL_HANDLE, 1, &c, NULL, &real)
+        : klvk_CreateGraphicsPipelines0(p->dev, VK_NULL_HANDLE, 1, &c, NULL, &real);
     double ms = kl_pipe_ms() - t0;
     klvk_vi_var *v = calloc(1, sizeof *v);
     if (v) { v->l = *l; v->real = r == VK_SUCCESS ? (uint64_t)(uintptr_t)real : 0; v->next = p->vars; p->vars = v; p->nvars++; }
@@ -6306,6 +6319,7 @@ static int klvk_vi_bind(void *cb, uint32_t bindPoint, uint64_t pipeline) {
     return 1;
 }
 // From klvk_DestroyPipeline: 1 if it was one of ours (its variants are destroyed).
+static void VKAPI_CALL klvk_DestroyPipeline(VkDevice dev, uint64_t pipeline, const VkAllocationCallbacks *alloc);
 static int klvk_vi_destroy(VkDevice dev, uint64_t pipeline,
                            void (*real)(VkDevice, uint64_t, const VkAllocationCallbacks *)) {
     klvk_vipipe *p = klvk_vi_from(pipeline);
@@ -6316,7 +6330,8 @@ static int klvk_vi_destroy(VkDevice dev, uint64_t pipeline,
     pthread_mutex_unlock(&g_vi_mu);
     for (klvk_vi_var *v = p->vars, *nx; v; v = nx) {
         nx = v->next;
-        if (v->real && real) real(dev, v->real, NULL);
+        if (v->real && klvk_ap_from(v->real)) klvk_DestroyPipeline(dev, v->real, NULL);   // compiled behind the frame
+        else if (v->real && real) real(dev, v->real, NULL);
         free(v);
     }
     for (uint32_t s = 0; s < p->ci.stageCount; s++)

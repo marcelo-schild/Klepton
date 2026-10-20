@@ -3957,7 +3957,7 @@ static unsigned g_prof_pass_barriers, g_prof_pass_barriers_dropped;
 #define KLVK_FS_SLOTS 8192u
 static struct { uint64_t key; uint32_t hash; } g_fs_mod[KLVK_FS_SLOTS], g_fs_pipe[KLVK_FS_SLOTS];
 static struct { uint32_t hash; uint32_t draws; } g_fs_count[2048];
-static uint32_t g_fs_skip[512];
+static uint32_t g_fs_skip[2048];
 static int g_fs_nskip = -1, g_fs_stats = -1;
 static __thread uint32_t t_fs_hash;
 static __thread int t_fs_skip;
@@ -4050,12 +4050,29 @@ static void klvk_after_note(uint32_t hash, int start) {
     }
     if (t_after_n >= 0 && t_after_n < 24) t_after_seq[t_after_n++] = hash;
 }
+// KL_VK_FS_FROM=<seconds>: both of the knobs above start that long after the
+// first draw — so a player can walk to the place in question with every shader
+// there, and the count is of that place alone. HITMAN 3 VR: Reloaded's window
+// in its tutorial's third room, found on the headset (2026-10-21).
+static int klvk_fs_armed(void) {
+    static int armed = -1;
+    static double from, t0;
+    if (armed > 0) return 1;
+    if (armed < 0) { from = kl_env_float("KL_VK_FS_FROM", 0.0f); armed = from > 0 ? 0 : 1; if (armed) return 1; }
+    double now = klvk_prof_now();
+    if (t0 == 0) t0 = now;
+    if (now - t0 < from) return 0;
+    armed = 1;
+    VKI("KL_VK_FS_FROM: counting and dropping fragment shaders from %.0f s on\n", from);
+    return 1;
+}
 // At a draw: 1 if it is to be dropped.
 static int klvk_fs_draw(void) {
     KFE(KFE_DRAW);
     klvk_after_note(t_fs_hash, 0);
     klvk_ev(" D%08llx", t_fs_hash, 0);
     if (!klvk_fs_on()) return 0;
+    if (!klvk_fs_armed()) return 0;
     if (g_fs_stats > 0) {
         if (!t_fs_hash) t_fs_hash = 0xffffffffu;        // a pipeline whose fragment shader is not known
         for (unsigned i = 0; i < sizeof g_fs_count / sizeof *g_fs_count; i++) {

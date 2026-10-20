@@ -5243,6 +5243,7 @@ typedef struct {
     // Vulkan: 1 + the first compositor stage this swapchain's images are filed
     // under (klxr_vk_stage_base), 0 while none is assigned.
     int      vk_stage1;
+    int      vk_flat;      // its images were told to kl_vulkan as a flat layer's (klxr_vk_flat)
 } klxr_swapchain;
 
 static klxr_swapchain g_swapchains[KLXR_SWAPCHAIN_MAX];
@@ -5604,6 +5605,17 @@ static int klxr_vk_stage_base(klxr_swapchain *sc) {
     }
     sc->vk_stage1 = 1;
     return 0;
+}
+
+// A Vulkan swapchain submitted as a flat layer (quad, cylinder, equirect) is
+// not an eye: kl_vulkan takes every swapchain image for one until told, and
+// foveation would shade a panel around the eye's straight-ahead point
+// (kl_vulkan_xr_image_not_eye — HITMAN 3 VR: Reloaded's loading screens).
+static void klxr_vk_flat(klxr_swapchain *sc) {
+    if (!sc || sc->vk_flat || !sc->session || sc->session->gfx != KLXR_GFX_VULKAN) return;
+    sc->vk_flat = 1;
+    for (int i = 0; i < sc->count; i++)
+        kl_vulkan_xr_image_not_eye((unsigned long long)(uintptr_t)sc->vk_img[i]);
 }
 
 static void klxr_publish_eye_vulkan(klxr_swapchain *sc, int eye, int slice) {
@@ -7115,6 +7127,7 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                 const XrCompositionLayerEquirect2KHR *eq =
                     (const XrCompositionLayerEquirect2KHR *)layer;
                 klxr_swapchain *sc = klxr_swapchain_of(eq->subImage.swapchain);
+                klxr_vk_flat(sc);
                 if (sc && sc->last_released >= 0 && sc->last_released < sc->count &&
                     nquads < (int)(sizeof quads / sizeof *quads)) {
                     kl_ovrp_overlay *o = &quads[nquads];
@@ -7226,6 +7239,7 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     q = &qbuf;
                 }
                 klxr_swapchain *sc = klxr_swapchain_of(q->subImage.swapchain);
+                klxr_vk_flat(sc);
                 if (sc && sc->last_released >= 0 &&
                     sc->last_released < sc->count) {
                     // eyeVisibility BOTH means one image for both eyes; LEFT

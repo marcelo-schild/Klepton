@@ -10913,6 +10913,7 @@ static void fove_xr_image(VkImage img, uint32_t layers, uint32_t w, uint32_t h) 
             "recognised as an eye (drawn unfoveated)\n", KLVK_XR_EYE_N, (void *)img, w, h);
 }
 
+static void fove_xr_reg_drop_locked(VkImage img);
 // An image going away (the guest's vkDestroyImage): every table drops it — a
 // guest that recreates its targets must not fill them, a VkImage handle reused
 // for an unrelated image must not be taken for an eye, and a confirmed
@@ -10933,6 +10934,7 @@ static void fove_image_gone(VkImage img) {
                 memset(&g_xr_col[i], 0, sizeof g_xr_col[i]);
                 __atomic_sub_fetch(&g_xr_col_n, 1, __ATOMIC_RELAXED);
             }
+        fove_xr_reg_drop_locked(img);
         pthread_mutex_unlock(&g_xr_col_lock);
     }
     pthread_mutex_lock(&g_gimg_lock);
@@ -10968,6 +10970,59 @@ static int fove_runtime_eye_wh(VkImage img, uint32_t *layers, int *eye, uint32_t
 }
 static int fove_runtime_eye(VkImage img, uint32_t *layers, int *eye) {
     return fove_runtime_eye_wh(img, layers, eye, NULL, NULL);
+}
+
+// A runtime image is taken for an eye from the moment it is made, because an
+// OpenXR swapchain does not say what it is for: only xrEndFrame shows a
+// projection layer or a flat one. HITMAN 3 VR: Reloaded draws its loading and
+// menu screens into a 1920x1080 swapchain it submits as a QUAD layer; foveated
+// around the eye's straight-ahead point, half of that panel was shaded at an
+// eighth of the rate and its text could not be read (headset, 2026-10-20;
+// Mac: "map 1920x1080 ... 47.5% of the fragments"). kl_openxr calls
+// kl_vulkan_xr_image_not_eye for such a swapchain's images: it stops being an
+// eye, and the eye targets a pass registered through it (its MSAA colour and
+// depth, which kl_fove marks by themselves) are dropped. g_xr_reg remembers
+// which those were.
+#define KLVK_XR_REG_N 64
+static struct { VkImage img; void *ct, *dt; } g_xr_reg[KLVK_XR_REG_N];
+static void fove_xr_reg_note(VkImage img, void *ct, void *dt) {   // under nothing; g_xr_col_lock taken here
+    if (!img) return;
+    pthread_mutex_lock(&g_xr_col_lock);
+    int free_i = -1;
+    for (int i = 0; i < KLVK_XR_REG_N; i++) {
+        if (g_xr_reg[i].img == img && g_xr_reg[i].ct == ct && g_xr_reg[i].dt == dt) { free_i = -2; break; }
+        if (!g_xr_reg[i].img && free_i == -1) free_i = i;
+    }
+    if (free_i >= 0) { g_xr_reg[free_i].img = img; g_xr_reg[free_i].ct = ct; g_xr_reg[free_i].dt = dt; }
+    pthread_mutex_unlock(&g_xr_col_lock);
+}
+static void fove_xr_reg_drop_locked(VkImage img) {        // under g_xr_col_lock
+    for (int i = 0; i < KLVK_XR_REG_N; i++)
+        if (g_xr_reg[i].img == img) memset(&g_xr_reg[i], 0, sizeof g_xr_reg[i]);
+}
+void kl_vulkan_xr_image_not_eye(unsigned long long image) {
+    VkImage img = (VkImage)(uintptr_t)image;
+    if (!img || !kl_fove_on()) return;
+    void *drop[2 * KLVK_XR_REG_N];
+    int nd = 0, was = 0;
+    pthread_mutex_lock(&g_xr_col_lock);
+    for (int i = 0; i < KLVK_XR_EYE_N; i++)
+        if (g_xr_col[i].img == img) {
+            memset(&g_xr_col[i], 0, sizeof g_xr_col[i]);
+            __atomic_sub_fetch(&g_xr_col_n, 1, __ATOMIC_RELAXED);
+            was = 1;
+        }
+    for (int i = 0; i < KLVK_XR_REG_N; i++)
+        if (g_xr_reg[i].img == img) {
+            if (g_xr_reg[i].ct) drop[nd++] = g_xr_reg[i].ct;
+            if (g_xr_reg[i].dt) drop[nd++] = g_xr_reg[i].dt;
+            memset(&g_xr_reg[i], 0, sizeof g_xr_reg[i]);
+        }
+    pthread_mutex_unlock(&g_xr_col_lock);
+    for (int i = 0; i < nd; i++) kl_fove_forget(drop[i]);
+    if (was)
+        VKI("[fove] swapchain image %p is a flat layer's, not an eye: drawn unfoveated "
+            "(%d eye target(s) registered through it dropped)\n", (void *)img, nd);
 }
 
 // Any kl_ovrp eye image of this extent? A target the size of a runtime eye
@@ -11426,7 +11481,10 @@ static int fove_rp(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi) {
                 VKI("[fove] intermediate %p: MSAA x%u scene with storeOp DONT_CARE, resolved by a later subpass into "
                     "attachment #%d (x1): its samples stay in physical layout through the pass, the resolve target "
                     "is what gets expanded\n", (void *)ci, cs, r.res_late);
-        } else kl_fove_note_eye_array(ct, dt, cw, ch, cs, (uint32_t)lay, one);
+        } else {
+            kl_fove_note_eye_array(ct, dt, cw, ch, cs, (uint32_t)lay, one);
+            fove_xr_reg_note(direct ? ci : ri, ct, dt);
+        }
     }
     // What this pass is, for an indirect draw recorded inside it.
     {

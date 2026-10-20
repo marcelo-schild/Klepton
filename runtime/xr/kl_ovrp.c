@@ -1747,6 +1747,11 @@ static int klovrp_title_cap(const char *t) {
         // start window and asked for it as the default when it was verified,
         // 2026-10-18 (7-8 ms of GPU a frame at 60 a second there).
         if (t && strcmp(t, "x2401648309868679") == 0) cap_dflt = 4096;
+        // HITMAN 3 VR: Reloaded (Glacier on Vulkan, OpenXR): its owner's choice in
+        // the start window, made the default for new players (2026-10-20), with
+        // 100 Hz, a frame on every second refresh and foveation at "high"
+        // (targets.py STORE_DEFAULTS).
+        if (t && strcmp(t, "x8012387035448196") == 0) cap_dflt = 4096;
         // Star Wars Pinball VR (UE 4.25 on GLES): its owner chose 4608 in the
         // start window and asked for it as the default, 2026-10-19, with 120 Hz
         // and a frame on every second refresh (targets.py STORE_DEFAULTS). On

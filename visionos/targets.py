@@ -1233,6 +1233,14 @@ STORE_DEFAULTS = {
     # when the head turned (on device, 2026-10-18; the double squeeze measured
     # on the Mac with KL_GLFB_MTL=1 KL_VRR=1 KL_GLFB_DUMP_FBOS=1).
     "x3919415921458774": {"foveation": False, "foveation_reset": 1},
+    # HITMAN 3 VR: Reloaded (Glacier, Vulkan, OpenXR). Its owner's choices in
+    # the start window, made the default for new players (2026-10-20): 100 Hz
+    # (the mixed space, the default anyway), a frame on every second refresh —
+    # an even 50, the half rate the Quest build draws at with space warp — 4096
+    # an eye (klovrp_title_cap in kl_ovrp.c) and foveated rendering at "high".
+    # No reset: a player who has chosen otherwise keeps it.
+    "x8012387035448196": {"foveation": True, "vk_foveation": "high",
+                          "test_on": "KL_GUEST_PACE_DIV"},
 }
 
 

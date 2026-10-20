@@ -1984,11 +1984,20 @@ const char *kl_guest_path(const char *path, char *buf, size_t cap) {
 // enough storage space to install required resources" for a failed extract), so
 // the only reliable way to find which call actually failed is to watch them all.
 // KL_TRACE_FS=fail narrows it to the failures.
+// HITMAN 3 VR: Reloaded reports a failed save in its own words only; until that
+// is understood its failures are traced without asking (2026-10-20). The
+// target is known only once the guest is set up, so before that this answers
+// "off" without deciding.
 static int kl_fs_trace_mode(void) {
     static int mode = -1;   // 0 off, 1 failures only, 2 everything
     if (mode < 0) {
         const char *e = kl_env_str("KL_TRACE_FS", NULL);
-        mode = !e ? 0 : (strcmp(e, "fail") == 0 ? 1 : 2);
+        if (!e) {
+            extern const char *kl_driver_target_name(void);
+            const char *t = kl_driver_target_name();
+            if (!t) return 0;
+            mode = strcmp(t, "x8012387035448196") == 0 ? 1 : 0;
+        } else mode = strcmp(e, "fail") == 0 ? 1 : 2;
     }
     return mode;
 }

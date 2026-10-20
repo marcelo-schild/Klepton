@@ -5518,7 +5518,7 @@ void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
 // lands on the screens they show. Seconds cannot do that here — startup is
 // dominated by the engine's one-time shader optimization, which is minutes and
 // is not the same length twice.
-#define KLOVRP_POKE_MAX 32
+#define KLOVRP_POKE_MAX 160
 static struct klovrp_poke {
     double   t;                       // seconds after the first read
     long     frame;                   // ...or the guest frame, when >= 0
@@ -5680,7 +5680,13 @@ int kl_ovrp_controller_input(int hand, uint32_t *buttons, uint32_t *touches,
     // hand publishes both in the same breath, and there is no separate "the
     // buttons are meaningful" signal here. A hand-tracked hand therefore reads
     // present with every button released, which is the truth about it.
-    return __atomic_load_n(&g_hand_set[hand], __ATOMIC_ACQUIRE) ? 1 : 0;
+    // The press knobs (KL_OVRP_POKE, KL_OVRP_FAKE_BUTTONS / _TRIGGER) make a hand
+    // present too: on the Mac no frontend publishes one, and an OpenXR guest's
+    // actions read nothing from an absent hand (HITMAN 3 VR: Reloaded, 2026-10-20).
+    static int fake = -1;
+    if (fake < 0) fake = kl_env_uint("KL_OVRP_FAKE_BUTTONS", 0) != 0 || kl_env_str("KL_OVRP_FAKE_TRIGGER", NULL) != NULL
+                         || kl_env_str("KL_OVRP_POKE", NULL) != NULL;
+    return (fake || __atomic_load_n(&g_hand_set[hand], __ATOMIC_ACQUIRE)) ? 1 : 0;
 }
 
     // KL_OVRP_HANDS_SWEEP=1: collapse both hands onto the head and sweep their

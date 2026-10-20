@@ -6061,15 +6061,94 @@ static int klvk_vi_same(const klvk_vi_layout *x, const klvk_vi_layout *y) {
     return x->hash == y->hash && x->nb == y->nb && x->na == y->na &&
            !memcmp(x->b, y->b, x->nb * sizeof *x->b) && !memcmp(x->a, y->a, x->na * sizeof *x->a);
 }
+// An integer vertex format the vertex shader reads as float: its SCALED twin.
+// SPIRV-Cross refuses the pair outright ("Vertex attribute type mismatch
+// between host and shader"); Vulkan calls it undefined, and a GL-minded engine
+// means the integer value as a number — which is what a SCALED format hands the
+// shader (Metal converts uchar/ushort to float). 32-bit integers have no SCALED
+// format and are left as they are. HITMAN 3 VR: Reloaded, headset 2026-10-20:
+// nine pipelines of its world refused this way.
+static VkFormat klvk_vi_scaled(VkFormat f) {
+    switch ((int)f) {
+    case VK_FORMAT_R8_UINT: return VK_FORMAT_R8_USCALED;            case VK_FORMAT_R8_SINT: return VK_FORMAT_R8_SSCALED;
+    case VK_FORMAT_R8G8_UINT: return VK_FORMAT_R8G8_USCALED;        case VK_FORMAT_R8G8_SINT: return VK_FORMAT_R8G8_SSCALED;
+    case VK_FORMAT_R8G8B8_UINT: return VK_FORMAT_R8G8B8_USCALED;    case VK_FORMAT_R8G8B8_SINT: return VK_FORMAT_R8G8B8_SSCALED;
+    case VK_FORMAT_R8G8B8A8_UINT: return VK_FORMAT_R8G8B8A8_USCALED; case VK_FORMAT_R8G8B8A8_SINT: return VK_FORMAT_R8G8B8A8_SSCALED;
+    case VK_FORMAT_B8G8R8A8_UINT: return VK_FORMAT_B8G8R8A8_USCALED; case VK_FORMAT_B8G8R8A8_SINT: return VK_FORMAT_B8G8R8A8_SSCALED;
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: return VK_FORMAT_A2B10G10R10_USCALED_PACK32;
+    case VK_FORMAT_A2B10G10R10_SINT_PACK32: return VK_FORMAT_A2B10G10R10_SSCALED_PACK32;
+    case VK_FORMAT_R16_UINT: return VK_FORMAT_R16_USCALED;          case VK_FORMAT_R16_SINT: return VK_FORMAT_R16_SSCALED;
+    case VK_FORMAT_R16G16_UINT: return VK_FORMAT_R16G16_USCALED;    case VK_FORMAT_R16G16_SINT: return VK_FORMAT_R16G16_SSCALED;
+    case VK_FORMAT_R16G16B16_UINT: return VK_FORMAT_R16G16B16_USCALED; case VK_FORMAT_R16G16B16_SINT: return VK_FORMAT_R16G16B16_SSCALED;
+    case VK_FORMAT_R16G16B16A16_UINT: return VK_FORMAT_R16G16B16A16_USCALED; case VK_FORMAT_R16G16B16A16_SINT: return VK_FORMAT_R16G16B16A16_SSCALED;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+// ...and the other way round: a float, normalized or scaled format the shader
+// reads as int or uint gets the integer format of the same size, which hands
+// the shader the stored bits — what a Quest's vertex fetch does (the reasoning
+// of KL_VK_VIN_INT). HITMAN 3 VR: Reloaded's skinned meshes read their bone
+// indices (in_weightIndices, uint4) from R8G8B8A8_UNORM; Metal refused
+// "uint4 cannot be read using MTLAttributeFormatUChar4Normalized" (Mac 2026-10-20).
+static VkFormat klvk_vi_integer(VkFormat f, int sint) {
+#define KLVK_VI_I(a, b, c, d, ui, si) case a: case b: case c: case d: return sint ? si : ui;
+    switch ((int)f) {
+    KLVK_VI_I(VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SNORM, VK_FORMAT_R8_USCALED, VK_FORMAT_R8_SSCALED, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT)
+    KLVK_VI_I(VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_SNORM, VK_FORMAT_R8G8_USCALED, VK_FORMAT_R8G8_SSCALED, VK_FORMAT_R8G8_UINT, VK_FORMAT_R8G8_SINT)
+    KLVK_VI_I(VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SNORM, VK_FORMAT_R8G8B8A8_USCALED, VK_FORMAT_R8G8B8A8_SSCALED, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_SINT)
+    KLVK_VI_I(VK_FORMAT_R16_UNORM, VK_FORMAT_R16_SNORM, VK_FORMAT_R16_USCALED, VK_FORMAT_R16_SSCALED, VK_FORMAT_R16_UINT, VK_FORMAT_R16_SINT)
+    KLVK_VI_I(VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16_SNORM, VK_FORMAT_R16G16_USCALED, VK_FORMAT_R16G16_SSCALED, VK_FORMAT_R16G16_UINT, VK_FORMAT_R16G16_SINT)
+    KLVK_VI_I(VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_SNORM, VK_FORMAT_R16G16B16A16_USCALED, VK_FORMAT_R16G16B16A16_SSCALED, VK_FORMAT_R16G16B16A16_UINT, VK_FORMAT_R16G16B16A16_SINT)
+    case VK_FORMAT_R16_SFLOAT:          return sint ? VK_FORMAT_R16_SINT : VK_FORMAT_R16_UINT;
+    case VK_FORMAT_R16G16_SFLOAT:       return sint ? VK_FORMAT_R16G16_SINT : VK_FORMAT_R16G16_UINT;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return sint ? VK_FORMAT_R16G16B16A16_SINT : VK_FORMAT_R16G16B16A16_UINT;
+    case VK_FORMAT_R32_SFLOAT:          return sint ? VK_FORMAT_R32_SINT : VK_FORMAT_R32_UINT;
+    case VK_FORMAT_R32G32_SFLOAT:       return sint ? VK_FORMAT_R32G32_SINT : VK_FORMAT_R32G32_UINT;
+    case VK_FORMAT_R32G32B32_SFLOAT:    return sint ? VK_FORMAT_R32G32B32_SINT : VK_FORMAT_R32G32B32_UINT;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return sint ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_UINT;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+#undef KLVK_VI_I
+}
+// The vertex stage's input types (klvk_vin_*; recorded while KL_VK_VIN_FILL is on).
+static int klvk_vi_inputs(const klvk_vipipe *p, klvk_vin_ent *in) {
+    for (uint32_t k = 0; k < p->ci.stageCount; k++)
+        if (p->ci.pStages[k].stage == VK_SHADER_STAGE_VERTEX_BIT)
+            return klvk_vin_get(g_vin_mod, (uint64_t)(uintptr_t)p->ci.pStages[k].module, in);
+    return 0;
+}
+
 // The variant of a deferred pipeline for one layout, compiled on first use.
 static uint64_t klvk_vi_variant(klvk_vipipe *p, const klvk_vi_layout *l) {
     pthread_mutex_lock(&p->mu);
     for (klvk_vi_var *v = p->vars; v; v = v->next)
         if (klvk_vi_same(&v->l, l)) { uint64_t r = v->real; pthread_mutex_unlock(&p->mu); return r; }
+    // The layout as compiled: integer formats the shader reads as float made SCALED.
+    VkVertexInputAttributeDescription attrs[KLVK_VI_MAXA];
+    memcpy(attrs, l->a, l->na * sizeof *attrs);
+    klvk_vin_ent in = {0};
+    int have_in = klvk_vi_inputs(p, &in);
+    unsigned scaled = 0;
+    for (uint32_t i = 0; have_in && i < l->na; i++) {
+        if (attrs[i].location >= 32) continue;
+        uint32_t bit = 1u << attrs[i].location;
+        VkFormat sc = VK_FORMAT_UNDEFINED;
+        if (in.f & bit) sc = klvk_vi_scaled(attrs[i].format);
+        else if (in.u & bit) sc = klvk_vi_integer(attrs[i].format, 0);
+        else if (in.i & bit) sc = klvk_vi_integer(attrs[i].format, 1);
+        if (sc != VK_FORMAT_UNDEFINED) { attrs[i].format = sc; scaled++; }
+    }
+    if (scaled) {
+        static unsigned said;
+        if (said++ < 4 || !(said % 100))
+            VKI("dynamic vertex input: %u attribute(s) given in the format the shader reads them as "
+                "(integer read as float: SCALED; float/normalized read as integer: the integer format) "
+                "(%u variant(s) so far)\n", scaled, said);
+    }
     VkPipelineVertexInputStateCreateInfo vis = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount = l->nb, .pVertexBindingDescriptions = l->b,
-        .vertexAttributeDescriptionCount = l->na, .pVertexAttributeDescriptions = l->a };
+        .vertexAttributeDescriptionCount = l->na, .pVertexAttributeDescriptions = attrs };
     VkGraphicsPipelineCreateInfo c = p->ci;
     c.pVertexInputState = &vis;
     VkPipeline real = VK_NULL_HANDLE;
@@ -6083,8 +6162,15 @@ static uint64_t klvk_vi_variant(klvk_vipipe *p, const klvk_vi_layout *l) {
     unsigned m = __atomic_add_fetch(&made, 1, __ATOMIC_RELAXED);
     if (r != VK_SUCCESS) {
         unsigned f = __atomic_add_fetch(&failed, 1, __ATOMIC_RELAXED);
-        if (f <= 8) VKI("dynamic vertex input: a variant (%u bindings, %u attributes) was refused (%d)\n",
-                        l->nb, l->na, (int)r);
+        if (f <= 12) {
+            char desc[512]; size_t o = 0;
+            for (uint32_t i = 0; i < l->na && o + 40 < sizeof desc; i++)
+                o += (size_t)snprintf(desc + o, sizeof desc - o, " loc%u:fmt%d@b%u+%u",
+                                      attrs[i].location, (int)attrs[i].format, attrs[i].binding, attrs[i].offset);
+            VKI("dynamic vertex input: a variant (%u bindings, %u attributes) was refused (%d);%s; "
+                "shader reads float %#x int %#x uint %#x%s\n", l->nb, l->na, (int)r, desc,
+                in.f, in.i, in.u, have_in ? "" : " (types unknown)");
+        }
     }
     if (m <= 3 || !(m % 200))
         VKI("dynamic vertex input: %u variant(s) compiled so far (this one %.1f ms, %u bindings, %u attributes)\n",
@@ -6218,8 +6304,8 @@ static void VKAPI_CALL klvk_DestroyShaderModule(VkDevice dev, uint64_t mod, cons
     if (!real && real_gdpa) real = (void (*)(VkDevice, uint64_t, const VkAllocationCallbacks *))
         real_gdpa(dev, "vkDestroyShaderModule");
     klvk_ap_drain();
+    if (klvk_vi_mod_hold(mod)) return;   // a deferred pipeline still needs it, and its input types (klvk_vi_*)
     if (klvk_vin_on()) klvk_vin_del(g_vin_mod, mod);
-    if (klvk_vi_mod_hold(mod)) return;   // a deferred pipeline still needs it (klvk_vi_*)
     if (real) real(dev, mod, alloc);
 }
 static void VKAPI_CALL klvk_DestroyPipelineLayout(VkDevice dev, uint64_t layout, const VkAllocationCallbacks *alloc) {
@@ -9383,6 +9469,94 @@ static int klvk_eye_on(void) {
     }
     return on;
 }
+
+// ---------------------------------------------------------------------------
+// KL_VK_VRS_STRIP (default on): the shading-rate built-ins, made plain
+// variables. HITMAN 3 VR: Reloaded's fragment shaders read ShadingRateKHR (a
+// debug tint by the rate the Quest shaded at) and SPIRV-Cross has no Metal
+// type for it — "unsupported-built-in-type", and the whole shader fails, so
+// the world was black on the headset while the interface drew (2026-10-20).
+// Metal has no variable-rate shading, so the honest value is the full rate,
+// 0: each such variable (and a vertex shader's PrimitiveShadingRateKHR output,
+// whose writes nothing reads) becomes a Private variable initialised to null,
+// with its own pointer type; the decoration, the capability and the extension
+// go. Only modules that use one are touched. Returns a malloc'd module or NULL.
+static uint32_t *klvk_spirv_strip_vrs(const uint32_t *code, size_t nw, size_t *out_nw) {
+    if (!code || nw < 6 || code[0] != 0x07230203u) return NULL;
+    enum { MAXS = 8 };
+    uint32_t sid[MAXS]; int ns = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t len = code[i] >> 16, op = code[i] & 0xffffu;
+        if (!len || i + len > nw) return NULL;
+        if (op == 71 /* OpDecorate */ && len >= 4 && code[i + 2] == 11 /* BuiltIn */ &&
+            (code[i + 3] == 4444 /* ShadingRateKHR */ || code[i + 3] == 4432 /* PrimitiveShadingRateKHR */) && ns < MAXS)
+            sid[ns++] = code[i + 1];
+        i += len;
+    }
+    if (!ns) return NULL;
+    uint32_t bound = code[3];
+    // pointee of each pointer type, looked up as variables come
+    uint32_t *o = malloc((nw + 16 * ns) * 4);
+    if (!o) return NULL;
+    memcpy(o, code, 5 * 4);
+    size_t n = 5;
+    int old14 = code[1] < 0x00010400u;      // before 1.4 the interface lists only Input/Output
+    for (size_t i = 5; i < nw; ) {
+        uint32_t len = code[i] >> 16, op = code[i] & 0xffffu;
+        const uint32_t *w = &code[i];
+        int skip = 0;
+        if (op == 17 /* OpCapability */ && w[1] == 4422 /* FragmentShadingRateKHR */) skip = 1;
+        if (op == 10 /* OpExtension */ && !strcmp((const char *)&w[1], "SPV_KHR_fragment_shading_rate")) skip = 1;
+        if ((op == 71 /* OpDecorate */) && len >= 2)
+            for (int k = 0; k < ns; k++) if (w[1] == sid[k]) skip = 1;
+        if (op == 59 /* OpVariable */ && len >= 4) {
+            int hit = 0;
+            for (int k = 0; k < ns; k++) if (w[2] == sid[k]) hit = 1;
+            if (hit) {
+                uint32_t pointee = 0;
+                for (size_t j = 5; j < i; ) {     // its pointer type was declared before it
+                    uint32_t l2 = code[j] >> 16, o2 = code[j] & 0xffffu;
+                    if (!l2) break;
+                    if (o2 == 32 /* OpTypePointer */ && l2 == 4 && code[j + 1] == w[1]) pointee = code[j + 3];
+                    j += l2;
+                }
+                if (!pointee) { free(o); return NULL; }
+                uint32_t ptr = bound++, nul = bound++;
+                o[n++] = (4u << 16) | 32; o[n++] = ptr; o[n++] = 6 /* Private */; o[n++] = pointee;
+                o[n++] = (3u << 16) | 46 /* OpConstantNull */; o[n++] = pointee; o[n++] = nul;
+                o[n++] = (5u << 16) | 59; o[n++] = ptr; o[n++] = w[2]; o[n++] = 6; o[n++] = nul;
+                i += len;
+                continue;
+            }
+        }
+        if (op == 15 /* OpEntryPoint */ && old14 && len > 3) {
+            // the name runs from word 3 to the word holding its terminating zero
+            size_t j = 3;
+            while (j < len) { uint32_t x = w[j++]; if (!(x & 0xff000000u) || !(x & 0xff0000u) || !(x & 0xff00u) || !(x & 0xffu)) break; }
+            size_t start = n;
+            for (size_t k = 0; k < j; k++) o[n++] = w[k];
+            for (; j < len; j++) {
+                int drop = 0;
+                for (int k = 0; k < ns; k++) if (w[j] == sid[k]) drop = 1;
+                if (!drop) o[n++] = w[j];
+            }
+            o[start] = ((uint32_t)(n - start) << 16) | 15;
+            i += len;
+            continue;
+        }
+        if (!skip) { memcpy(&o[n], w, len * 4); n += len; }
+        i += len;
+    }
+    o[3] = bound;
+    *out_nw = n;
+    return o;
+}
+static int klvk_vrs_strip_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_VK_VRS_STRIP", 1);
+    return on;
+}
+
 static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
         const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *alloc,
         VkShaderModule *out) {
@@ -9482,6 +9656,17 @@ static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
             mf = *ci; mf.pCode = msfix; mf.codeSize = mw * 4; ci = &mf;
         }
     }
+    uint32_t *vrs = NULL;
+    VkShaderModuleCreateInfo vf;
+    if (ci && ci->pCode && !(ci->codeSize & 3u) && klvk_vrs_strip_on()) {
+        size_t vw = 0;
+        if ((vrs = klvk_spirv_strip_vrs(ci->pCode, ci->codeSize / 4, &vw))) {
+            vf = *ci; vf.pCode = vrs; vf.codeSize = vw * 4; ci = &vf;
+            static unsigned said;
+            if (said++ < 3 || !(said % 200))
+                VKI("shading-rate built-ins made plain variables (rate 0, the full rate) in %u module(s) so far\n", said);
+        }
+    }
     VkResult r = klvk_CreateShaderModule0(dev, ci, alloc, out);
     if (r == VK_SUCCESS && out && ci && ci->pCode && !(ci->codeSize & 3u) && klvk_vin_on()) {
         klvk_vin_ent in;
@@ -9508,6 +9693,7 @@ static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
             if (f) { fwrite(ci->pCode, 1, ci->codeSize, f); fclose(f); }
         }
     }
+    free(vrs);
     free(msfix);
     free(sky);
     free(eye);

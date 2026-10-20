@@ -6,6 +6,8 @@
 // discipline are Steam Link's, proven across the whole SL arc, and nothing here
 // is new behaviour.
 #include "kl_nativeactivity.h"
+#include <sys/stat.h>
+#include "klepton.h"
 
 #include "kl_jni.h"
 #include "kl_ndk.h"
@@ -50,6 +52,21 @@ static void kl_na_java_on_create(kl_image *img, const char *data_path, FILE *out
     snprintf(obb, sizeof obb, "/sdcard/Android/obb/%s", pkg ? pkg : "");
     kl_jni_locale_parts(lang, sizeof lang, country, sizeof country);
     snprintf(locale, sizeof locale, "%s_%s", lang, country);
+    // getObbDir() and getExternalFilesDir() create their folders on Android; the
+    // game takes them as there. Its save manager asks statvfs about the files
+    // folder before every save and fails the save when that fails — "SAVE
+    // FAILED" on the headset and on the Mac, whose /sdcard had no files/ yet
+    // (2026-10-20). So both are made here, under their host names.
+    const char *dirs[2] = { obb, data_path };
+    for (int d = 0; d < 2; d++) {
+        char hp[1024];
+        const char *h = kl_guest_path(dirs[d], hp, sizeof hp);
+        char part[1024];
+        snprintf(part, sizeof part, "%s", h ? h : "");
+        for (char *c = part + 1; *c; c++)
+            if (*c == '/') { *c = 0; mkdir(part, 0755); *c = '/'; }
+        if (*part) mkdir(part, 0755);
+    }
     if (out) {
         fprintf(out, "  [na] nativeSetAndroidInfo(%s, %s, %s, %s) — the game's Java onCreate\n",
                 pkg ? pkg : "(null)", obb, data_path, locale);

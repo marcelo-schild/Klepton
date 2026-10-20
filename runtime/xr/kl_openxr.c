@@ -36,6 +36,7 @@
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
@@ -855,7 +856,8 @@ enum { KLXR_GATE_ALWAYS = 0,      // unconditional
        KLXR_GATE_VULKAN = 2,      // ...only when MoltenVK is actually reachable
        KLXR_GATE_USER_PRESENCE = 3,    // ...missioniss only (see below)
        KLXR_GATE_PERF_METRICS = 4,     // ...not for Moss from Steam (see below)
-       KLXR_GATE_FRAME_CONTROLLER = 5 };   // ...Moss from Steam only (see below)
+       KLXR_GATE_FRAME_CONTROLLER = 5,     // ...Moss from Steam only (see below)
+       KLXR_GATE_SPACE_WARP = 6 };         // ...HITMAN 3 VR: Reloaded only (see below)
 
 static const struct { const char *name; uint32_t version; int gate; } g_extensions[] = {
     { "XR_KHR_opengl_es_enable",       10, KLXR_GATE_ALWAYS },
@@ -976,6 +978,26 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
     { "XR_META_performance_metrics",          2, KLXR_GATE_PERF_METRICS },
     { "XR_EXT_user_presence",                 1, KLXR_GATE_USER_PRESENCE },
     { "XR_VALVE_frame_controller_interaction", 1, KLXR_GATE_FRAME_CONTROLLER },
+    // XR_FB_space_warp — HITMAN 3 VR: Reloaded (x8012387035448196, IOI's Glacier
+    // engine as "Anubis", OpenXR + Vulkan) REQUIRES it at xrCreateInstance,
+    // whether or not it was enumerated. Refused, it does not stop: it goes on
+    // without an instance, every call after that is XR_ERROR_HANDLE_INVALID,
+    // "No capable Vulkan physical device found", and it hands MoltenVK a NULL
+    // VkDevice in vkGetDeviceProcAddr — SIGSEGV in MVKDevice::getProcAddr on
+    // the headset (2026-10-20, toolchain 701, both launches).
+    //
+    // The extension has no entry points. It is one output struct on
+    // xrGetSystemProperties (the recommended motion-vector size, filled below)
+    // and one input struct chained onto each projection view (motion vectors
+    // and depth for the runtime to synthesise frames from). Nothing here
+    // synthesises frames: the chained info is named and not read, as before,
+    // and each frame the game submits is shown as it is. The motion-vector and
+    // depth swapchains are ordinary Vulkan swapchains (RGBA16F, D24S8/D32 are
+    // in the format list already). Gated to that one target, because a game
+    // that only PROBES for it would otherwise switch space warp on and may
+    // render at half rate, expecting the runtime to fill in; KL_XR_SPACE_WARP
+    // overrides.
+    { "XR_FB_space_warp",                     2, KLXR_GATE_SPACE_WARP },
 };
 #define KLXR_EXT_ALL ((uint32_t)(sizeof g_extensions / sizeof g_extensions[0]))
 
@@ -1060,6 +1082,11 @@ static int klxr_ext_gate_open(int gate) {
         // path. The profile itself has been driveable here since VRChat. For that build only;
         // KL_XR_FRAME_CONTROLLER overrides.
         return kl_env_on("KL_XR_FRAME_CONTROLLER", klxr_moss_from_steam());
+    case KLXR_GATE_SPACE_WARP: {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        return kl_env_on("KL_XR_SPACE_WARP", t && !strcmp(t, "x8012387035448196"));
+    }
     case KLXR_GATE_PERF_METRICS: {
         // XR_META_performance_metrics is in the list by name only: none of its
         // four entry points is served. A guest that asks xrGetInstanceProcAddr
@@ -1186,6 +1213,7 @@ static const char *klxr_chain_type_name(int32_t t) {
     case 1000122000: return "XrCompositionLayerDepthTestVARJO";
     case 1000135000: return "XrFrameEndInfoML";
     case 1000171000: return "XrCompositionLayerSpaceWarpInfoFB";
+    case 1000171001: return "XrSystemSpaceWarpPropertiesFB";
     case 1000204000: return "XrCompositionLayerSettingsFB";
     case 1000212000: return "XrCompositionLayerDepthTestFB";
     case 1000216000: return "XrLocalDimmingFrameEndInfoMETA";
@@ -1486,6 +1514,35 @@ static XrResult klxr_GetSystem(void *instance, const XrSystemGetInfo *info,
     return KLXR_SUCCESS;
 }
 
+// XrSystemSpaceWarpPropertiesFB, for the one game that gets XR_FB_space_warp
+// (KLXR_GATE_SPACE_WARP). The exception to "we never fill chained structs":
+// that game sizes its motion-vector swapchain from these two numbers, and the
+// zero an unfilled struct leaves would be a swapchain of no size. The chain is
+// still not trusted — every node is read through vm_read_overwrite (see
+// klxr_note_chain_types) and the walk stops at 8 — and the struct is written
+// only after all of it read back. The size is a quarter of the eye in each
+// direction: motion vectors are a low-resolution image, and the number is a
+// recommendation the game may round or ignore.
+struct klxr_space_warp_props { int32_t type; int32_t pad; void *next; uint32_t w, h; };
+static void klxr_fill_space_warp_props(void *next, int ew, int eh) {
+    for (int depth = 0; next && depth < 8; depth++) {
+        struct klxr_space_warp_props node;
+        vm_size_t got = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)next, sizeof node,
+                              (vm_address_t)&node, &got) != KERN_SUCCESS || got != sizeof node) return;
+        if (node.type == 1000171001) {
+            uint32_t w = (uint32_t)((ew > 0 ? ew : 1832) / 4), h = (uint32_t)((eh > 0 ? eh : 1920) / 4);
+            uint32_t *size = (uint32_t *)((char *)next + offsetof(struct klxr_space_warp_props, w));
+            size[0] = w;
+            size[1] = h;
+            fprintf(stderr, "  [xr] XR_FB_space_warp: motion vectors %ux%u recommended (a quarter of the eye); "
+                            "frames are not synthesised here\n", w, h);
+            return;
+        }
+        next = node.next;
+    }
+}
+
 static XrResult klxr_GetSystemProperties(void *instance, XrSystemId system_id,
                                          XrSystemProperties *props) {
     fprintf(stderr, "  [xr] >> %s\n", "xrGetSystemProperties");
@@ -1541,6 +1598,7 @@ static XrResult klxr_GetSystemProperties(void *instance, XrSystemId system_id,
     props->graphicsProperties.maxLayerCount = 16;
     props->trackingProperties.orientationTracking = 1;
     props->trackingProperties.positionTracking = 1;
+    if (klxr_ext_gate_open(KLXR_GATE_SPACE_WARP)) klxr_fill_space_warp_props(props->next, ew, eh);
     return KLXR_SUCCESS;
 }
 

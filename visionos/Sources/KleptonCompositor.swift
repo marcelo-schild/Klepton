@@ -362,6 +362,12 @@ final class KleptonCompositor {
     /// The overlay pass — a guest's non-eye layers. nil when it failed to
     /// build, which is named at construction rather than per frame.
     private var overlayPipeline: MTLRenderPipelineState?
+    /// The projection-layer pass for a layer that asks to be blended by its
+    /// alpha (XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT): premultiplied
+    /// colour, as OpenXR has it unless the layer says otherwise, and the
+    /// unpremultiplied variant. See encodeProjLayers.
+    private var projBlendPipeline: MTLRenderPipelineState?
+    private var projBlendUnpremulPipeline: MTLRenderPipelineState?
     /// The equirect (360 panorama) overlay pipeline and its depth state.
     /// Drawn as a skybox behind the eye content: depth-tests .greaterEqual at
     /// the far plane and writes no depth, so real eye pixels stay in front and
@@ -1128,6 +1134,22 @@ final class KleptonCompositor {
             amplification = device.supportsVertexAmplificationCount(2) ? 2 : 1
             desc.maxVertexAmplificationCount = amplification
             pipeline = try device.makeRenderPipelineState(descriptor: desc)
+            // The same pass, blending — for a projection layer stacked on others
+            // that asks for it by its alpha. kl_reproject_f hands out the
+            // guest's alpha (and drops what is fully transparent) when the
+            // layer's uniforms carry eye_alpha 1.
+            for premul in [true, false] {
+                desc.colorAttachments[0].isBlendingEnabled = true
+                desc.colorAttachments[0].rgbBlendOperation = .add
+                desc.colorAttachments[0].alphaBlendOperation = .add
+                desc.colorAttachments[0].sourceRGBBlendFactor = premul ? .one : .sourceAlpha
+                desc.colorAttachments[0].sourceAlphaBlendFactor = .one
+                desc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+                desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+                let ps = try? device.makeRenderPipelineState(descriptor: desc)
+                if premul { projBlendPipeline = ps } else { projBlendUnpremulPipeline = ps }
+            }
+            desc.colorAttachments[0].isBlendingEnabled = false
 
             // Depth WRITES, which this pass never did. visionOS reprojects the
             // submitted frame using its depth buffer, so a pass that writes no
@@ -3838,7 +3860,22 @@ final class KleptonCompositor {
                     for n in uniforms.indices { uniforms[n].grid_eye = 0 }
                 }
             }
-            enc.setRenderPipelineState(pipeline)
+            // A layer over others that asks to be blended by its alpha is: its
+            // empty pixels let what is under it show (HITMAN 3 VR: Reloaded's
+            // interface layer over its world). The first layer drawn is the
+            // backdrop and stays opaque, as before.
+            var layerPipeline: MTLRenderPipelineState = pipeline
+            if drawn > 0, (pl.xr_flags & 0x2) != 0,
+               let bp = (pl.xr_flags & 0x4) != 0 ? projBlendUnpremulPipeline : projBlendPipeline {
+                layerPipeline = bp
+                for n in uniforms.indices { uniforms[n].eye_alpha = 1 }
+                if !loggedProjBlend.contains(i) {
+                    loggedProjBlend.insert(i)
+                    NSLog("[cp] projection layer \(i) is blended over the ones before it by its alpha "
+                          + "(flags 0x\(String(pl.xr_flags, radix: 16)))")
+                }
+            }
+            enc.setRenderPipelineState(layerPipeline)
             enc.setFragmentTexture(bind0, index: 0)
             enc.setFragmentTexture(bind1, index: 1)
             enc.setFragmentSamplerState(sampler, index: 0)
@@ -3920,6 +3957,7 @@ final class KleptonCompositor {
     private var identityGridBuffer: MTLBuffer?
     private var loggedLayerUnwarp = -1
     private var loggedProjMiss = Set<Int>()
+    private var loggedProjBlend = Set<Int>()
     private var lastProjShape = ""
 
     /// The layers that are NOT the eye, drawn on top of it in the same encoder.

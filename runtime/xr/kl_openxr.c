@@ -7202,6 +7202,7 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                 memset(pl_cur, 0, sizeof *pl_cur);
                 pl_cur->slot[0] = pl_cur->slot[1] = -1;
                 pl_cur->pose[6] = 1.0f;          // identity orientation
+                pl_cur->xr_flags = (int)proj->layerFlags;
             } else {
                 static int said;
                 if (!said++)

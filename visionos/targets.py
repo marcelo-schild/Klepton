@@ -1236,8 +1236,9 @@ STORE_DEFAULTS = {
     # HITMAN 3 VR: Reloaded (Glacier, Vulkan, OpenXR). Its owner's choices in
     # the start window, made the default for new players (2026-10-20): 100 Hz
     # (the mixed space, the default anyway), a frame on every second refresh —
-    # an even 50, the half rate the Quest build draws at with space warp — 4096
-    # an eye (klovrp_title_cap in kl_ovrp.c) and foveated rendering at "high".
+    # an even 50, the half rate the Quest build draws at with space warp — 3584
+    # an eye (klovrp_title_cap in kl_ovrp.c; 4096 ran out of memory at level
+    # changes) and foveated rendering at "high".
     # No reset: a player who has chosen otherwise keeps it. Shaders compiled
     # behind the picture as well (KL_VK_ASYNC_PIPES, with KL_VK_ASYNC_RP): each
     # new one held the picture 0.3-0.9 s on the headset (2026-10-20); the Mac

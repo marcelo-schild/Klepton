@@ -5229,6 +5229,9 @@ typedef struct {
     // are GL FBOs over tex[], reused to copy the default framebuffer in.
     void    *surface;
     uint32_t blit_fbo[KLXR_SWAPCHAIN_IMAGES];
+    // Vulkan: 1 + the first compositor stage this swapchain's images are filed
+    // under (klxr_vk_stage_base), 0 while none is assigned.
+    int      vk_stage1;
 } klxr_swapchain;
 
 static klxr_swapchain g_swapchains[KLXR_SWAPCHAIN_MAX];
@@ -5564,6 +5567,34 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
 // through them and the frame record names the one it drew. Publishing only the
 // released image would leave the compositor sampling a stage that was never
 // filled on the two frames either side of it.
+// Where a Vulkan swapchain's images are filed in the compositor's eye table: a
+// block of its own per swapchain. They used to be filed under their image index
+// alone, so two projection layers from two swapchains — HITMAN 3 VR: Reloaded's
+// world and its interface — landed in the same entries: the interface replaced
+// the world in the compositor (a black world under the menus), and because one
+// swapchain at a time owned an eye the two re-published over each other every
+// frame (the world flashing up now and then; headset, 2026-10-20). The first
+// swapchain gets block 0, so a guest with one projection layer is filed as
+// before. A block is free when no live swapchain holds it.
+static int klxr_vk_stage_base(klxr_swapchain *sc) {
+    if (sc->vk_stage1) return sc->vk_stage1 - 1;
+    for (int b = 0; b + sc->count <= KL_MTL_MAX_STAGES; b += KLXR_SWAPCHAIN_IMAGES) {
+        int used = 0;
+        for (int i = 0; i < KLXR_SWAPCHAIN_MAX && !used; i++)
+            if (&g_swapchains[i] != sc && g_swapchains[i].magic == KLXR_MAGIC_SWAPCHAIN &&
+                g_swapchains[i].vk_stage1 == b + 1) used = 1;
+        if (!used) {
+            sc->vk_stage1 = b + 1;
+            if (b) fprintf(stderr, "  [xr] swapchain %ux%u filed under compositor stages %d..%d "
+                                   "(another projection swapchain holds 0..)\n",
+                           sc->width, sc->height, b, b + sc->count - 1);
+            return b;
+        }
+    }
+    sc->vk_stage1 = 1;
+    return 0;
+}
+
 static void klxr_publish_eye_vulkan(klxr_swapchain *sc, int eye, int slice) {
     if (sc->vk_pub & (1u << eye)) return;
     if (klxr_format_is_depth(sc->session, sc->format)) return;
@@ -5571,16 +5602,17 @@ static void klxr_publish_eye_vulkan(klxr_swapchain *sc, int eye, int slice) {
     for (int k = 0; k < sc->count; k++) {
         void *tex = kl_vulkan_xr_image_mtl(sc->vk_img[k]);
         if (!tex) continue;
-        kl_glfb_note_eye_mtl_texture(eye, k, tex, slice,
+        kl_glfb_note_eye_mtl_texture(eye, klxr_vk_stage_base(sc) + k, tex, slice,
                                      (int)sc->width, (int)sc->height);
         done++;
     }
     if (done == sc->count) {
-        // Same rule as the GL route: exactly one swapchain owns an eye at a
-        // time, and the guest rebuilds its eye swapchains across scenes with
-        // the OLD one destroyed after the new one is asserted.
+        // Same rule as the GL route, within a block of stages: one swapchain
+        // owns an eye's entries at a time, and the guest rebuilds its eye
+        // swapchains across scenes with the OLD one destroyed after the new one
+        // is asserted. A swapchain filed under other stages is left alone.
         for (int i = 0; i < KLXR_SWAPCHAIN_MAX; i++)
-            if (&g_swapchains[i] != sc) {
+            if (&g_swapchains[i] != sc && g_swapchains[i].vk_stage1 == sc->vk_stage1) {
                 if (g_swapchains[i].mtl_eye == eye) g_swapchains[i].mtl_eye = -1;
                 g_swapchains[i].vk_pub &= ~(1u << eye);
             }
@@ -6078,9 +6110,10 @@ static XrResult klxr_DestroySwapchain(void *swapchain) {
     // double-counts in the object census, which is what that census exists to
     // be trusted for.
     if (sc->vk_pub) {
+        int base = sc->vk_stage1 ? sc->vk_stage1 - 1 : 0;
         for (int e = 0; e < 2; e++)
             if (sc->vk_pub & (1u << e))
-                for (int i = 0; i < sc->count; i++) kl_glfb_release_eye_texture(e, i);
+                for (int i = 0; i < sc->count; i++) kl_glfb_release_eye_texture(e, base + i);
     } else if (sc->mtl_eye >= 0) {
         for (int i = 0; i < sc->count; i++) kl_glfb_release_eye_texture(sc->mtl_eye, i);
     } else if (gl_DeleteTextures) {
@@ -7369,7 +7402,7 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     // GL path's array-vs-2D split has no counterpart.
                     klxr_publish_eye_vulkan(sc, (int)v,
                                             (int)proj->views[v].subImage.imageArrayIndex);
-                    slot = sc->last_released;
+                    slot = klxr_vk_stage_base(sc) + sc->last_released;
                 } else if (klxr_eye_mirror_on() || sc->array_size > 1) {
                     slot = klxr_mirror_eye_image(sc, (int)v,
                                           (int)proj->views[v].subImage.imageArrayIndex);
@@ -7377,7 +7410,8 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     klxr_back_eye_images(sc, (int)v);
                     slot = sc->last_released;
                 }
-                if (layers_on && pl_cur && li > 0 && slot == sc->last_released) {
+                if (layers_on && pl_cur && li > 0 && slot == sc->last_released &&
+                    !(sc->session && sc->session->gfx == KLXR_GFX_VULKAN)) {
                     static int said;
                     if (!said++)
                         fprintf(stderr, "  [xr] projection layer %u reaches the "

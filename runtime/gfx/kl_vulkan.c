@@ -4000,7 +4000,9 @@ static int klvk_fs_on(void) {
         g_fs_nskip = n;
         if (n) fprintf(stderr, "  [vk] KL_VK_SKIP_FS: draws of %d fragment shader(s) are dropped\n", n);
     }
-    return g_fs_nskip > 0 || g_fs_stats > 0;
+    static int sct = -1;
+    if (sct < 0) sct = kl_env_str("KL_VK_SCISSOR_TRACE", NULL) != NULL;
+    return g_fs_nskip > 0 || g_fs_stats > 0 || sct;
 }
 // KL_VK_DESC_TRACE=1: for a few frames well into a run, the order in which a
 // recording thread updates descriptor sets, binds them and draws, from the
@@ -4050,6 +4052,71 @@ static void klvk_after_note(uint32_t hash, int start) {
     }
     if (t_after_n >= 0 && t_after_n < 24) t_after_seq[t_after_n++] = hash;
 }
+// KL_VK_SCISSOR_TRACE=<hash>,...: for draws whose fragment shader has one of
+// these hashes (KL_VK_FS_STATS's), the scissor and viewport set last on the
+// recording thread, for the first 80 such draws (after KL_VK_FS_FROM). Written
+// for HITMAN 3 VR: Reloaded's Scaleform board, which a headset showed cut into
+// screen-aligned steps (2026-10-21).
+static __thread VkRect2D t_sc[4];
+static __thread uint32_t t_sc_first, t_sc_n;
+static __thread VkViewport t_vp[4];
+static __thread uint32_t t_vp_first, t_vp_n;
+static void VKAPI_CALL klvk_CmdSetScissor(void *cb, uint32_t first, uint32_t n, const VkRect2D *r) {
+    static void (*real)(void *, uint32_t, uint32_t, const VkRect2D *);
+    if (!real && real_gdpa) real = (void (*)(void *, uint32_t, uint32_t, const VkRect2D *))
+        real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdSetScissor");
+    t_sc_first = first; t_sc_n = n < 4 ? n : 4;
+    for (uint32_t i = 0; r && i < t_sc_n; i++) t_sc[i] = r[i];
+    if (real) real(cb, first, n, r);
+}
+static void VKAPI_CALL klvk_CmdSetViewport(void *cb, uint32_t first, uint32_t n, const VkViewport *v) {
+    static void (*real)(void *, uint32_t, uint32_t, const VkViewport *);
+    if (!real && real_gdpa) real = (void (*)(void *, uint32_t, uint32_t, const VkViewport *))
+        real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdSetViewport");
+    t_vp_first = first; t_vp_n = n < 4 ? n : 4;
+    for (uint32_t i = 0; v && i < t_vp_n; i++) t_vp[i] = v[i];
+    if (real) real(cb, first, n, v);
+}
+static void klvk_scissor_trace(uint32_t hash) {
+    static uint32_t list[32];
+    static int n = -1;
+    static unsigned said;
+    if (n < 0) {
+        n = 0;
+        const char *e = kl_env_str("KL_VK_SCISSOR_TRACE", NULL);
+        while (e && *e && n < 32) {
+            char *end = NULL;
+            unsigned long v = strtoul(e, &end, 16);
+            if (end == e) break;
+            list[n++] = (uint32_t)v;
+            e = *end == ',' ? end + 1 : end;
+        }
+    }
+    if (!n || said >= 80) return;
+    int hit = 0;
+    for (int i = 0; i < n; i++) if (list[i] == hash) hit = 1;
+    if (!hit) return;
+    // Only scissors that cut something: a full-frame one says nothing.
+    int cut = 0;
+    for (uint32_t i = 0; i < t_sc_n && i < t_vp_n; i++) {
+        int vw = (int)(t_vp[i].width < 0 ? -t_vp[i].width : t_vp[i].width);
+        int vh = (int)(t_vp[i].height < 0 ? -t_vp[i].height : t_vp[i].height);
+        if ((int)t_sc[i].extent.width < vw || (int)t_sc[i].extent.height < vh || t_sc[i].offset.x || t_sc[i].offset.y) cut = 1;
+    }
+    if (!cut) return;
+    said++;
+    char sc[256] = "", vp[256] = "";
+    size_t o = 0;
+    for (uint32_t i = 0; i < t_sc_n && o + 48 < sizeof sc; i++)
+        o += (size_t)snprintf(sc + o, sizeof sc - o, " [%u] %dx%d+%d+%d", t_sc_first + i, (int)t_sc[i].extent.width,
+                              (int)t_sc[i].extent.height, t_sc[i].offset.x, t_sc[i].offset.y);
+    o = 0;
+    for (uint32_t i = 0; i < t_vp_n && o + 48 < sizeof vp; i++)
+        o += (size_t)snprintf(vp + o, sizeof vp - o, " [%u] %.0fx%.0f+%.0f+%.0f", t_vp_first + i, (double)t_vp[i].width,
+                              (double)t_vp[i].height, (double)t_vp[i].x, (double)t_vp[i].y);
+    VKI("scissor trace %08x: scissor%s | viewport%s\n", hash, sc[0] ? sc : " (none set)", vp[0] ? vp : " (none set)");
+}
+
 // KL_VK_FS_FROM=<seconds>: both of the knobs above start that long after the
 // first draw — so a player can walk to the place in question with every shader
 // there, and the count is of that place alone. HITMAN 3 VR: Reloaded's window
@@ -4073,6 +4140,7 @@ static int klvk_fs_draw(void) {
     klvk_ev(" D%08llx", t_fs_hash, 0);
     if (!klvk_fs_on()) return 0;
     if (!klvk_fs_armed()) return 0;
+    klvk_scissor_trace(t_fs_hash);
     if (g_fs_stats > 0) {
         if (!t_fs_hash) t_fs_hash = 0xffffffffu;        // a pipeline whose fragment shader is not known
         for (unsigned i = 0; i < sizeof g_fs_count / sizeof *g_fs_count; i++) {
@@ -11846,7 +11914,7 @@ static const entry g_ours[] = {
     E(CmdBindIndexBuffer), E(CmdBindVertexBuffers), E(CmdDrawIndexed),
     E(CmdSetSampleLocationsEXT), E(CmdSetSampleLocationsEnableEXT), E(CmdSetBlendConstants),
     E(CmdDraw), E(CmdDrawIndirect), E(CmdDrawIndexedIndirect), E(CmdClearAttachments), E(CmdBeginQuery), E(CmdEndQuery), E(CreateQueryPool), E(GetQueryPoolResults),
-    E(CmdBindPipeline), E(CmdBindDescriptorSets),
+    E(CmdBindPipeline), E(CmdBindDescriptorSets), E(CmdSetScissor), E(CmdSetViewport),
     E(GetImageMemoryRequirements), E(CreateBufferView),
     R(CreateShaderModule), R(CreateDescriptorSetLayout), E(CreateDescriptorPool),
     R(CreateSampler), R(CreatePipelineLayout),

@@ -27,6 +27,38 @@ typedef void (*anativeactivity_oncreate_fn)(kl_ANativeActivity *, void *, size_t
         } else if (out) fprintf(out, "  [na] %s — not registered\n", #name);    \
     } while (0)
 
+// What a game's own Java onCreate does after NativeActivity.onCreate, for the
+// games whose Java hands the engine its paths through a native rather than the
+// ANativeActivity struct. HITMAN 3 VR: Reloaded (x8012387035448196, XR Games'
+// com.xrgames.MainActivity) calls nativeSetAndroidInfo(packageName,
+// getObbDir(), getExternalFilesDir(null), Locale.getDefault()) there; the
+// engine keeps them as ZG2Android::packageName/obbFilePath/dataFilePath/
+// language. Never called, the package manager looked for
+// "//packagedefinition.txt", found nothing and stopped on its own trap
+// (ZPackageManagerBase, Mac run 2026-10-20). Only a library that exports the
+// native is called; the order matches Java: right after onCreate returns.
+typedef void (*kl_na_set_android_info_fn)(void *env, void *thiz, void *pkg, void *obb,
+                                          void *files, void *locale);
+static void kl_na_java_on_create(kl_image *img, const char *data_path, FILE *out) {
+    kl_na_set_android_info_fn set_info =
+        (kl_na_set_android_info_fn)kl_sym(img, "Java_com_xrgames_MainActivity_nativeSetAndroidInfo");
+    if (!set_info) return;
+    const char *pkg = kl_jni_guest_package();
+    char obb[256], locale[32], lang[16] = "en", country[16] = "US";
+    // The guest's /sdcard is the files folder (kl_guest_path), and a store
+    // game's extra files are installed under Android/obb/<package> there.
+    snprintf(obb, sizeof obb, "/sdcard/Android/obb/%s", pkg ? pkg : "");
+    kl_jni_locale_parts(lang, sizeof lang, country, sizeof country);
+    snprintf(locale, sizeof locale, "%s_%s", lang, country);
+    if (out) {
+        fprintf(out, "  [na] nativeSetAndroidInfo(%s, %s, %s, %s) — the game's Java onCreate\n",
+                pkg ? pkg : "(null)", obb, data_path, locale);
+        fflush(out);
+    }
+    set_info(g_act.env, g_act.clazz, kl_jni_new_string(pkg ? pkg : ""), kl_jni_new_string(obb),
+             kl_jni_new_string(data_path), kl_jni_new_string(locale));
+}
+
 int kl_na_create(kl_image *img, const char *entry, const char *data_path, FILE *out) {
     if (!img) {
         if (out) fprintf(out, "  [na] no image to enter\n");
@@ -72,6 +104,7 @@ int kl_na_create(kl_image *img, const char *entry, const char *data_path, FILE *
 
     kl_jni_local_frame_push();
     onCreate(&g_act, NULL, 0);
+    kl_na_java_on_create(img, data_path, out);
     kl_jni_local_frame_pop();
     if (out) {
         fprintf(out, "  onCreate returned; %d of %zu callbacks registered\n",

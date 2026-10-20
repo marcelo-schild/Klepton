@@ -857,7 +857,7 @@ enum { KLXR_GATE_ALWAYS = 0,      // unconditional
        KLXR_GATE_USER_PRESENCE = 3,    // ...missioniss only (see below)
        KLXR_GATE_PERF_METRICS = 4,     // ...not for Moss from Steam (see below)
        KLXR_GATE_FRAME_CONTROLLER = 5,     // ...Moss from Steam only (see below)
-       KLXR_GATE_SPACE_WARP = 6 };         // ...HITMAN 3 VR: Reloaded only (see below)
+       KLXR_GATE_HITMAN3 = 6 };            // ...HITMAN 3 VR: Reloaded only (see below)
 
 static const struct { const char *name; uint32_t version; int gate; } g_extensions[] = {
     { "XR_KHR_opengl_es_enable",       10, KLXR_GATE_ALWAYS },
@@ -995,9 +995,22 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
     // depth swapchains are ordinary Vulkan swapchains (RGBA16F, D24S8/D32 are
     // in the format list already). Gated to that one target, because a game
     // that only PROBES for it would otherwise switch space warp on and may
-    // render at half rate, expecting the runtime to fill in; KL_XR_SPACE_WARP
+    // render at half rate, expecting the runtime to fill in; KL_XR_HITMAN3_EXTS
     // overrides.
-    { "XR_FB_space_warp",                     2, KLXR_GATE_SPACE_WARP },
+    //
+    // The same game requires two more, also without entry points (a Mac run
+    // lists every name it asks for, see klxr_CreateInstance):
+    // XR_FB_foveation_vulkan — a fragment-density-map image chained onto
+    // xrEnumerateSwapchainImages for a swapchain created with the FB foveation
+    // flag; the chained struct is not filled, so the game is told no such
+    // image (VK_NULL_HANDLE), the same answer as "no foveation", and MoltenVK
+    // has no fragment density maps to offer anyway.
+    // XR_META_vulkan_swapchain_create_info — extra VkImage create/usage flags
+    // chained onto xrCreateSwapchain; named and not read, the images are
+    // created with kl_vulkan's own usage set.
+    { "XR_FB_space_warp",                     2, KLXR_GATE_HITMAN3 },
+    { "XR_FB_foveation_vulkan",               1, KLXR_GATE_HITMAN3 },
+    { "XR_META_vulkan_swapchain_create_info", 1, KLXR_GATE_HITMAN3 },
 };
 #define KLXR_EXT_ALL ((uint32_t)(sizeof g_extensions / sizeof g_extensions[0]))
 
@@ -1082,10 +1095,10 @@ static int klxr_ext_gate_open(int gate) {
         // path. The profile itself has been driveable here since VRChat. For that build only;
         // KL_XR_FRAME_CONTROLLER overrides.
         return kl_env_on("KL_XR_FRAME_CONTROLLER", klxr_moss_from_steam());
-    case KLXR_GATE_SPACE_WARP: {
+    case KLXR_GATE_HITMAN3: {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
-        return kl_env_on("KL_XR_SPACE_WARP", t && !strcmp(t, "x8012387035448196"));
+        return kl_env_on("KL_XR_HITMAN3_EXTS", t && !strcmp(t, "x8012387035448196"));
     }
     case KLXR_GATE_PERF_METRICS: {
         // XR_META_performance_metrics is in the list by name only: none of its
@@ -1460,15 +1473,21 @@ static XrResult klxr_CreateInstance(const XrInstanceCreateInfo *info, void **ins
             (unsigned long long)(g_instance.api_version >> 48) & 0xffff,
             (unsigned long long)(g_instance.api_version >> 32) & 0xffff,
             (unsigned long long)(g_instance.api_version & 0xffffffff));
+    // Every name is listed before the refusal, not only the first missing one:
+    // a guest that asks for several it was never offered (HITMAN 3 VR: Reloaded
+    // asked for XR_FB_space_warp, then XR_FB_foveation_vulkan) otherwise costs
+    // one run per name.
+    int missing = 0;
     for (uint32_t i = 0; i < info->enabledExtensionCount; i++) {
         const char *name = info->enabledExtensionNames[i];
         int known = klxr_ext_advertised(name);
         fprintf(stderr, "  [xr]   extension: %-40s %s\n", name,
                 known ? "enabled" : "NOT PRESENT");
-        if (!known) { g_instance.magic = 0; KLXR_RET(KLXR_ERROR_EXTENSION_NOT_PRESENT); }
+        if (!known) { missing++; continue; }
         if (strcmp(name, "XR_KHR_opengl_es_enable") == 0) g_instance.ext_opengl_es = 1;
         if (strcmp(name, "XR_KHR_vulkan_enable") == 0)    g_instance.ext_vulkan = 1;
     }
+    if (missing) { g_instance.magic = 0; KLXR_RET(KLXR_ERROR_EXTENSION_NOT_PRESENT); }
 
     *instance = &g_instance;
     return KLXR_SUCCESS;
@@ -1515,7 +1534,7 @@ static XrResult klxr_GetSystem(void *instance, const XrSystemGetInfo *info,
 }
 
 // XrSystemSpaceWarpPropertiesFB, for the one game that gets XR_FB_space_warp
-// (KLXR_GATE_SPACE_WARP). The exception to "we never fill chained structs":
+// (KLXR_GATE_HITMAN3). The exception to "we never fill chained structs":
 // that game sizes its motion-vector swapchain from these two numbers, and the
 // zero an unfilled struct leaves would be a swapchain of no size. The chain is
 // still not trusted — every node is read through vm_read_overwrite (see
@@ -1598,7 +1617,7 @@ static XrResult klxr_GetSystemProperties(void *instance, XrSystemId system_id,
     props->graphicsProperties.maxLayerCount = 16;
     props->trackingProperties.orientationTracking = 1;
     props->trackingProperties.positionTracking = 1;
-    if (klxr_ext_gate_open(KLXR_GATE_SPACE_WARP)) klxr_fill_space_warp_props(props->next, ew, eh);
+    if (klxr_ext_gate_open(KLXR_GATE_HITMAN3)) klxr_fill_space_warp_props(props->next, ew, eh);
     return KLXR_SUCCESS;
 }
 
@@ -5175,6 +5194,7 @@ typedef struct {
     uint64_t usage;
     uint32_t tex[KLXR_SWAPCHAIN_IMAGES];       // GLES: texture names
     uint64_t vk_img[KLXR_SWAPCHAIN_IMAGES];    // Vulkan: VkImage handles
+    uint64_t vk_fdm[KLXR_SWAPCHAIN_IMAGES];    // Vulkan: XR_FB_foveation_vulkan density maps (klxr_fill_foveation_image)
     int      count;
     int      acquired;        // index the app currently holds, -1 when none
     int      last_released;   // ...and the last one it handed BACK, which is the
@@ -6070,6 +6090,41 @@ static XrResult klxr_DestroySwapchain(void *swapchain) {
     return KLXR_SUCCESS;
 }
 
+// XR_FB_foveation_vulkan: an XrSwapchainImageFoveationVulkanFB chained onto an
+// element asks for the swapchain image's fragment density map. HITMAN 3 VR:
+// Reloaded creates a view on it without checking, and VK_NULL_HANDLE made that
+// a SIGSEGV inside MoltenVK's MVKImageView (Mac run 2026-10-20). So it gets a
+// real image: R8G8_UNORM, one texel per 32x32 pixels (the Quest's density
+// texel size), as many layers as the swapchain. MoltenVK has no fragment
+// density maps, so nothing reads it — the eye is shaded at full density, which
+// is what an unfoveated image is anyway. The chain is read through
+// vm_read_overwrite like every guest chain here and written only once it read
+// back. Made once per image, kept with the swapchain like its colour images.
+struct klxr_fov_vk { int32_t type; int32_t pad; void *next; uint64_t image; uint32_t width, height; };
+static void klxr_fill_foveation_image(klxr_swapchain *sc, int i, void *next) {
+    for (int depth = 0; next && depth < 8; depth++) {
+        struct klxr_fov_vk node;
+        vm_size_t got = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)next, sizeof node,
+                              (vm_address_t)&node, &got) != KERN_SUCCESS || got != sizeof node) return;
+        if (node.type == 1000160000) {   // XR_TYPE_SWAPCHAIN_IMAGE_FOVEATION_VULKAN_FB
+            uint32_t w = (sc->width + 31) / 32, h = (sc->height + 31) / 32;
+            if (!sc->vk_fdm[i])
+                sc->vk_fdm[i] = kl_vulkan_xr_image(w, h, sc->array_size, 1, 16 /* VK_FORMAT_R8G8_UNORM */, 0);
+            struct klxr_fov_vk *out = (struct klxr_fov_vk *)next;
+            out->image = sc->vk_fdm[i];
+            out->width = w;
+            out->height = h;
+            if (i == 0)
+                fprintf(stderr, "  [xr] XR_FB_foveation_vulkan: density map %ux%u x%u for swapchain %ux%u "
+                                "(not read: MoltenVK has no fragment density maps)\n",
+                        w, h, sc->array_size, sc->width, sc->height);
+            return;
+        }
+        next = node.next;
+    }
+}
+
 static XrResult klxr_EnumerateSwapchainImages(void *swapchain, uint32_t capacity,
                                               uint32_t *count_out, void *images) {
     klxr_swapchain *sc = klxr_swapchain_of(swapchain);
@@ -6095,7 +6150,10 @@ static XrResult klxr_EnumerateSwapchainImages(void *swapchain, uint32_t capacity
             KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
         }
         XrSwapchainImageVulkanKHR *vk = (XrSwapchainImageVulkanKHR *)images;
-        for (int i = 0; i < sc->count; i++) vk[i].image = sc->vk_img[i];
+        for (int i = 0; i < sc->count; i++) {
+            vk[i].image = sc->vk_img[i];
+            klxr_fill_foveation_image(sc, i, vk[i].next);
+        }
         return KLXR_SUCCESS;
     }
     if (got != XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR) {

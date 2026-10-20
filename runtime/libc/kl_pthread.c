@@ -1221,6 +1221,29 @@ int klb_pthread_attr_setdetachstate(bionic_attr *a, int st) {
 int klb_pthread_attr_getstack(const bionic_attr *a, void **base, size_t *size) {
     *base = a->stack_base; *size = a->stack_size; return 0;
 }
+// The getters of the setters above, and pthread_setschedprio. HITMAN 3 VR:
+// Reloaded (IOI's Glacier engine) reads every attribute back before it starts a
+// thread and calls setschedprio on its workers; all six were unresolved and the
+// first one called aborted the game on the Mac (2026-10-20). They read what the
+// setters stored, bionic's values: PTHREAD_CREATE_DETACHED 1, and for the
+// inherit flag, which the setter (kl_shim.c) accepts but does not keep,
+// PTHREAD_INHERIT_SCHED 1 — the honest answer here, since visionOS schedules
+// every thread the same whatever the attr says.
+int klb_pthread_attr_getdetachstate(const bionic_attr *a, int *st) {
+    *st = (a->flags & BIONIC_ATTR_DETACHED) ? 1 : 0; return 0;
+}
+int klb_pthread_attr_getinheritsched(const bionic_attr *a, int *inherit) {
+    (void)a; *inherit = 1; return 0;
+}
+int klb_pthread_attr_getschedpolicy(const bionic_attr *a, int *policy) { *policy = a->policy; return 0; }
+int klb_pthread_attr_getschedparam(const bionic_attr *a, int32_t *priority) { *priority = a->prio; return 0; }
+int klb_pthread_attr_getguardsize(const bionic_attr *a, size_t *size) { *size = a->guard_size; return 0; }
+// Like setschedparam below: scheduling is the host's business, success is the honest no-op.
+int klb_pthread_setschedprio(void *t, int prio) { (void)t; (void)prio; return 0; }
+// bionic's pthread_rwlockattr_t is one long (the pshared/kind bits); nothing
+// reads it here (klb_pthread_rwlock_init ignores its attr), so init zeroes it.
+int klb_pthread_rwlockattr_init(long *attr) { *attr = 0; return 0; }
+int klb_pthread_rwlockattr_destroy(long *attr) { (void)attr; return 0; }
 int klb_pthread_getattr_np(pthread_t t, bionic_attr *a) {
     klb_pthread_attr_init(a);
     a->stack_size = pthread_get_stacksize_np(t);

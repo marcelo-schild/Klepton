@@ -333,6 +333,7 @@ typedef struct {
     VkPhysicalDevice  phys;
     uint32_t          queue_family;
     VkQueue           queue;          // for the acquire signal + the capture submit
+    uint32_t          spread;         // queues of family 0 spread over families 0..n-1 (klvk_queue_spread)
     PFN_vkGetDeviceQueue              GetDeviceQueue;
     PFN_vkCreateImage                 CreateImage;
     PFN_vkDestroyImage                DestroyImage;
@@ -442,6 +443,28 @@ static klvk_device *dev_find(VkDevice d) {
     for (int i = 0; i < g_ndev; i++) if (g_devs[i]->dev == d) return g_devs[i];
     return NULL;
 }
+// Queue spread, for HITMAN 3 VR: Reloaded (x8012387035448196). Its engine
+// (SVulkan::selectVulkanPhysicalDevice) takes only a queue family with graphics
+// and compute AND more than two queues, and asks for three of them. MoltenVK
+// offers four identical families of ONE queue each, so the engine found "No
+// capable Vulkan physical device", went on with the OpenXR device anyway and
+// fetched queue 1 of family 0, which does not exist: SIGSEGV in MoltenVK's
+// vkGetDeviceQueue (Mac run 2026-10-20). With the spread on, family 0 reports
+// as many queues as there are families like it, a request for k queues of
+// family 0 becomes one queue in each of families 0..k-1, and queue i of family
+// 0 is family i's queue. MoltenVK's families are all the same Metal device and
+// command buffers are bound to a queue only at submit, so the work lands where
+// it would have. KL_VK_QUEUE_SPREAD overrides.
+static int klvk_queue_spread_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_VK_QUEUE_SPREAD", t && !strcmp(t, "x8012387035448196"));
+    }
+    return on;
+}
+
 static klvk_device *dev_of_queue(VkQueue q) {
     // Queues are opaque; the guest may use one we never fetched. With a single
     // device — which is every case here — the answer is unambiguous.
@@ -1069,6 +1092,38 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
 
     VkDeviceCreateInfo mine = ci ? *ci : (VkDeviceCreateInfo){
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
+    // Queue spread (klvk_queue_spread_on): k queues of family 0 become one
+    // queue in each of families 0..k-1, unless the guest names one of those
+    // families itself.
+    VkDeviceQueueCreateInfo spread_qci[16];
+    uint32_t spread = 0;
+    if (ci && klvk_queue_spread_on()) {
+        for (uint32_t i = 0; i < ci->queueCreateInfoCount; i++) {
+            const VkDeviceQueueCreateInfo *q = &ci->pQueueCreateInfos[i];
+            if (q->queueFamilyIndex == 0 && q->queueCount > 1) spread = q->queueCount;
+        }
+        for (uint32_t i = 0; spread && i < ci->queueCreateInfoCount; i++) {
+            uint32_t f = ci->pQueueCreateInfos[i].queueFamilyIndex;
+            if (f != 0 && f < spread) spread = 0;
+        }
+        if (spread && spread + ci->queueCreateInfoCount <= 16) {
+            uint32_t n = 0;
+            for (uint32_t i = 0; i < ci->queueCreateInfoCount; i++) {
+                const VkDeviceQueueCreateInfo *q = &ci->pQueueCreateInfos[i];
+                if (q->queueFamilyIndex != 0) { spread_qci[n++] = *q; continue; }
+                for (uint32_t k = 0; k < spread; k++) {
+                    spread_qci[n] = *q;
+                    spread_qci[n].queueFamilyIndex = k;
+                    spread_qci[n].queueCount = 1;
+                    spread_qci[n].pQueuePriorities = q->pQueuePriorities ? &q->pQueuePriorities[k] : NULL;
+                    n++;
+                }
+            }
+            mine.queueCreateInfoCount = n;
+            mine.pQueueCreateInfos = spread_qci;
+            VKI("queue spread: %u queues of family 0 -> one in each of families 0..%u\n", spread, spread - 1);
+        } else spread = 0;
+    }
     mine.enabledExtensionCount = keep.n;
     mine.ppEnabledExtensionNames = keep.names;
     mine.enabledLayerCount = 0;
@@ -1083,6 +1138,7 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     d->dev = *out;
     d->phys = phys;
     d->queue_family = ci && ci->queueCreateInfoCount ? ci->pQueueCreateInfos[0].queueFamilyIndex : 0;
+    d->spread = spread;
     dev_resolve(d);
     // Foveation of the guest's scene pass, underneath MoltenVK (KL_VK_FOVEATE;
     // kl_mtl_foveate.m). Nothing happens unless it is asked for.
@@ -5076,6 +5132,25 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
     if (!real && real_gdpa)
         real = (PFN_vkCreateGraphicsPipelines)real_gdpa(dev, "vkCreateGraphicsPipelines");
 
+    // KL_VK_PIPE_DESCRIBE=1: which parts of each create info are absent, its
+    // dynamic states and its pNext types — what to look at when MoltenVK faults
+    // inside newMTLRenderPipelineDescriptor on a NULL member.
+    if (ci && kl_env_on("KL_VK_PIPE_DESCRIBE", 0)) {
+        for (uint32_t i = 0; i < n; i++) {
+            const VkGraphicsPipelineCreateInfo *c = &ci[i];
+            fprintf(stderr, "  [vk] pipeline %u/%u: stages %u vi %d ia %d tess %d vp %d rs %d ms %d ds %d cb %d dyn %d rp %p sub %u flags %#x",
+                    i, n, c->stageCount, !!c->pVertexInputState, !!c->pInputAssemblyState,
+                    !!c->pTessellationState, !!c->pViewportState, !!c->pRasterizationState,
+                    !!c->pMultisampleState, !!c->pDepthStencilState, !!c->pColorBlendState,
+                    !!c->pDynamicState, (void *)c->renderPass, c->subpass, (unsigned)c->flags);
+            if (c->pColorBlendState) fprintf(stderr, " cb.att %u", c->pColorBlendState->attachmentCount);
+            for (uint32_t k = 0; c->pDynamicState && k < c->pDynamicState->dynamicStateCount; k++)
+                fprintf(stderr, "%s%d", k ? "," : " dyn=", (int)c->pDynamicState->pDynamicStates[k]);
+            for (const VkBaseInStructure *x = c->pNext; x; x = x->pNext) fprintf(stderr, " next=%d", (int)x->sType);
+            fprintf(stderr, "\n");
+        }
+    }
+
     // KL_VK_FIX_PRIMRESTART (default ON): Metal cannot DISABLE primitive restart
     // for strip/fan topologies, so MoltenVK rejects a strip pipeline that sets
     // primitiveRestartEnable=FALSE with VK_ERROR_FEATURE_NOT_PRESENT and leaves a
@@ -7091,6 +7166,27 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceQueueFamilyProperties(
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceQueueFamilyProperties");
     if (real) real(pd, count, props);
     else if (count) *count = 0;
+    // Queue spread: family 0 reports one queue for each family like it.
+    if (props && count && *count > 1 && klvk_queue_spread_on()) {
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < *count; i++)
+            if (props[i].queueFlags == props[0].queueFlags && props[i].queueCount >= 1) n++; else break;
+        if (n > props[0].queueCount) {
+            static int said;
+            if (!said) { said = 1; VKI("queue spread: family 0 reported with %u queues (MoltenVK: %u)\n", n, props[0].queueCount); }
+            props[0].queueCount = n;
+        }
+    }
+}
+
+// Queue i of family 0 under the spread is family i's only queue.
+static void VKAPI_CALL klvk_GetDeviceQueue(VkDevice dev, uint32_t family, uint32_t index, VkQueue *queue) {
+    static PFN_vkGetDeviceQueue real;
+    if (!real && real_gdpa) real = (PFN_vkGetDeviceQueue)real_gdpa(dev, "vkGetDeviceQueue");
+    klvk_device *d = dev_find(dev);
+    if (d && d->spread && family == 0 && index > 0 && index < d->spread) { family = index; index = 0; }
+    if (real) real(dev, family, index, queue);
+    else if (queue) *queue = VK_NULL_HANDLE;
 }
 
 // The rest of the vkGetPhysicalDevice* family Unity's device init queries on the
@@ -7374,8 +7470,11 @@ static VkResult VKAPI_CALL klvk_EnumeratePhysicalDevices(
                     VkQueueFamilyProperties qf[16];
                     unsigned gv = nq < 16 ? nq : 16;
                     gq(tmp[i], &gv, qf);
-                    for (unsigned k = 0; k < gv; k++)
+                    for (unsigned k = 0; k < gv; k++) {
                         if (qf[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) gfx = 1;
+                        VKI("    family %u: flags %#x, %u queue(s)\n", k,
+                            (unsigned)qf[k].queueFlags, qf[k].queueCount);
+                    }
                 }
                 VKI("  phys[%u] '%s' api %u.%u.%u type %d vendor %#x device %#x "
                     "queueFamilies %u graphics %d\n", i, p.deviceName,
@@ -10941,7 +11040,7 @@ static const entry g_ours[] = {
     E(QueueSubmit),
     E(GetPhysicalDeviceProperties),
     E(GetPhysicalDeviceProperties2),
-    E(GetPhysicalDeviceQueueFamilyProperties),
+    E(GetPhysicalDeviceQueueFamilyProperties), E(GetDeviceQueue),
     E(GetPhysicalDeviceFeatures), E(GetPhysicalDeviceFeatures2),
     { "vkGetPhysicalDeviceFeatures2KHR", (PFN_vkVoidFunction)klvk_GetPhysicalDeviceFeatures2 },
     E(GetPhysicalDeviceMemoryProperties),

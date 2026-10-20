@@ -3428,6 +3428,11 @@ static float klxr_local_height(void) {
         // ~1.3 m above the seat and cockpit and menus lay deep in the floor (headset 2026-10-16:
         // `xrLocateViews in LOCAL: eye 0 at (-0.027 1.279 -0.036)`).
         if (t && strcmp(t, "x10048506838538799") == 0) on = 1;
+        // HITMAN 3 VR: Reloaded likewise: it places menus, tutorial hints and the
+        // inventory from LOCAL as OpenXR defines it. With LOCAL on the floor they
+        // hung about a metre low (headset 2026-10-20: `VIEW in LOCAL: (-0.006
+        // 1.085 -0.032)`; on the Mac the dialog's buttons were below the view).
+        if (t && strcmp(t, "x8012387035448196") == 0) on = 1;
     }
     if (!on) return kl_ovrp_eye_height();
     if (latched < 0.0f) {

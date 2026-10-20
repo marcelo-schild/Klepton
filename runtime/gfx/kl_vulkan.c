@@ -6163,7 +6163,7 @@ static uint64_t klvk_vi_variant(klvk_vipipe *p, const klvk_vi_layout *l) {
     if (r != VK_SUCCESS) {
         unsigned f = __atomic_add_fetch(&failed, 1, __ATOMIC_RELAXED);
         if (f <= 12) {
-            char desc[512]; size_t o = 0;
+            char desc[512]; size_t o = 0; desc[0] = 0;
             for (uint32_t i = 0; i < l->na && o + 40 < sizeof desc; i++)
                 o += (size_t)snprintf(desc + o, sizeof desc - o, " loc%u:fmt%d@b%u+%u",
                                       attrs[i].location, (int)attrs[i].format, attrs[i].binding, attrs[i].offset);
@@ -9551,6 +9551,101 @@ static uint32_t *klvk_spirv_strip_vrs(const uint32_t *code, size_t nw, size_t *o
     *out_nw = n;
     return o;
 }
+// KL_VK_VIEWINDEX_COPY (default on): a shader that hands the ViewIndex
+// built-in to a function by pointer. SPIRV-Cross makes gl_ViewIndex a const
+// local of main() for Metal and the function's parameter a `thread uint&`, and
+// Metal refuses the call ("no matching function ... would lose const
+// qualifier"). HITMAN 3 VR: Reloaded's level shaders do it in GetRoomIndex
+// (Mac, Guided Training, 2026-10-20: the world drew with pieces missing). So
+// the built-in is copied once, at the top of the entry point, into a Private
+// variable, and every use of it inside functions goes to the copy — which
+// SPIRV-Cross passes as an ordinary `thread uint&`. Only modules that pass the
+// built-in to a function are touched. Returns a malloc'd module or NULL.
+static uint32_t *klvk_spirv_viewindex_copy(const uint32_t *code, size_t nw, size_t *out_nw) {
+    if (!code || nw < 6 || code[0] != 0x07230203u) return NULL;
+    uint32_t v = 0, vptr = 0, pointee = 0, entry = 0;
+    int passed = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t len = code[i] >> 16, op = code[i] & 0xffffu;
+        if (!len || i + len > nw) return NULL;
+        if (op == 71 && len >= 4 && code[i + 2] == 11 && code[i + 3] == 4440 /* ViewIndex */) v = code[i + 1];
+        if (op == 15 && len >= 3 && !entry) entry = code[i + 2];
+        i += len;
+    }
+    if (!v || !entry) return NULL;
+    // Passed by pointer, or read inside a function other than the entry point —
+    // SPIRV-Cross then makes it a parameter of that function itself.
+    uint32_t fn = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t len = code[i] >> 16, op = code[i] & 0xffffu;
+        if (op == 54 && len >= 3) fn = code[i + 2];
+        if (op == 59 && len >= 4 && code[i + 2] == v) vptr = code[i + 1];
+        if (op == 57 /* OpFunctionCall */)
+            for (uint32_t k = 4; k < len; k++) if (code[i + k] == v) passed = 1;
+        if (fn && fn != entry && ((op == 61 && len >= 4 && code[i + 3] == v) ||
+                                  ((op == 65 || op == 66) && len >= 4 && code[i + 3] == v)))
+            passed = 1;
+        i += len;
+    }
+    if (!passed || !vptr) return NULL;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t len = code[i] >> 16, op = code[i] & 0xffffu;
+        if (op == 32 && len == 4 && code[i + 1] == vptr) pointee = code[i + 3];
+        i += len;
+    }
+    if (!pointee) return NULL;
+    uint32_t bound = code[3], tp = bound++, pv = bound++, tmp = bound++;
+    uint32_t *o = malloc((nw + 16) * 4);
+    if (!o) return NULL;
+    memcpy(o, code, 5 * 4);
+    size_t n = 5;
+    int in_funcs = 0, in_entry = 0, inserted = 0, after_label = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t len = code[i] >> 16, op = code[i] & 0xffffu;
+        const uint32_t *w = &code[i];
+        // the load and store go after the entry block's label and its OpVariables
+        if (in_entry && after_label && !inserted && op != 59 && op != 8 && op != 317) {
+            o[n++] = (4u << 16) | 61; o[n++] = pointee; o[n++] = tmp; o[n++] = v;
+            o[n++] = (3u << 16) | 62; o[n++] = pv; o[n++] = tmp;
+            inserted = 1;
+        }
+        size_t start = n;
+        memcpy(&o[n], w, len * 4); n += len;
+        // From SPIR-V 1.4 every global an entry point uses is in its interface.
+        if (op == 15 && code[1] >= 0x00010400u && w[2] == entry) {
+            o[n++] = pv;
+            o[start] = ((uint32_t)(n - start) << 16) | 15;
+        }
+        if (op == 54 /* OpFunction */) { in_funcs = 1; in_entry = w[2] == entry; after_label = 0; }
+        if (op == 248 /* OpLabel */ && in_entry) after_label = 1;
+        if (op == 59 && w[2] == v && !in_funcs) {
+            o[n++] = (4u << 16) | 32; o[n++] = tp; o[n++] = 6 /* Private */; o[n++] = pointee;
+            o[n++] = (4u << 16) | 59; o[n++] = tp; o[n++] = pv; o[n++] = 6;
+        }
+        if (in_funcs) {
+            uint32_t *x = &o[start];
+            switch (op) {
+            case 61: if (len >= 4 && x[3] == v) x[3] = pv; break;                  // OpLoad
+            case 62: if (len >= 3 && x[1] == v) x[1] = pv; break;                  // OpStore
+            case 63: for (uint32_t k = 1; k <= 2 && k < len; k++) if (x[k] == v) x[k] = pv; break;
+            case 65: case 66: case 67: if (len >= 4 && x[3] == v) x[3] = pv; break; // access chains
+            case 57: for (uint32_t k = 4; k < len; k++) if (x[k] == v) x[k] = pv; break;
+            default: break;
+            }
+        }
+        i += len;
+    }
+    if (!inserted) { free(o); return NULL; }
+    // the inserted load reads the built-in itself; it was written after the rewrite pass saw it
+    o[3] = bound;
+    *out_nw = n;
+    return o;
+}
+static int klvk_viewindex_copy_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_VK_VIEWINDEX_COPY", 1);
+    return on;
+}
 static int klvk_vrs_strip_on(void) {
     static int on = -1;
     if (on < 0) on = kl_env_on("KL_VK_VRS_STRIP", 1);
@@ -9667,6 +9762,17 @@ static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
                 VKI("shading-rate built-ins made plain variables (rate 0, the full rate) in %u module(s) so far\n", said);
         }
     }
+    uint32_t *vic = NULL;
+    VkShaderModuleCreateInfo vcf;
+    if (ci && ci->pCode && !(ci->codeSize & 3u) && klvk_viewindex_copy_on()) {
+        size_t vw = 0;
+        if ((vic = klvk_spirv_viewindex_copy(ci->pCode, ci->codeSize / 4, &vw))) {
+            vcf = *ci; vcf.pCode = vic; vcf.codeSize = vw * 4; ci = &vcf;
+            static unsigned said;
+            if (said++ < 3 || !(said % 200))
+                VKI("ViewIndex handed to a function: copied into a private variable in %u module(s) so far\n", said);
+        }
+    }
     VkResult r = klvk_CreateShaderModule0(dev, ci, alloc, out);
     if (r == VK_SUCCESS && out && ci && ci->pCode && !(ci->codeSize & 3u) && klvk_vin_on()) {
         klvk_vin_ent in;
@@ -9693,6 +9799,7 @@ static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
             if (f) { fwrite(ci->pCode, 1, ci->codeSize, f); fclose(f); }
         }
     }
+    free(vic);
     free(vrs);
     free(msfix);
     free(sky);

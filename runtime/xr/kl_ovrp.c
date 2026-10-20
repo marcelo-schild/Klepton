@@ -3503,6 +3503,16 @@ static void klovrp_headless_pose(void) {
     static uint64_t t0;
     if (state == 1 || state == 3) return;
     if (!state) {
+        // KL_OVRP_HEAD_AFTER=<s>: no head at all until then (a Mac run that must
+        // get through a menu the way it does without one — HITMAN 3 VR:
+        // Reloaded's pointer otherwise sits on a row and pins the selection).
+        static uint64_t first;
+        double wait = kl_env_float("KL_OVRP_HEAD_AFTER", 0.0f);
+        if (wait > 0) {
+            uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            if (!first) first = now;
+            if ((double)(now - first) / 1e9 < wait) return;
+        }
         const char *e = kl_env_str("KL_OVRP_HEAD", NULL);
         state = 1;
         if (!e || !*e || __atomic_load_n(&g_head_set, __ATOMIC_ACQUIRE)) return;
@@ -5525,6 +5535,7 @@ static struct klovrp_poke {
     uint32_t b[2];                    // raw button bits, per hand
     float    idx[2], grip[2];         // triggers, per hand
     float    sx, sy;                  // right thumbstick
+    float    lx, ly;                  // left thumbstick (LUP/LDOWN/LLEFT/LRIGHT)
     int      fired;
 } g_poke[KLOVRP_POKE_MAX];
 static int    g_poke_n = -1;          // -1 = not parsed yet
@@ -5550,14 +5561,22 @@ static int klovrp_poke_name(const char *n, size_t len, struct klovrp_poke *p) {
         { "DOWN",  1, KL_OVRP_RAW_RTHUMBSTICK_DOWN,  0, 0,  0, -1 },
         { "LEFT",  1, KL_OVRP_RAW_RTHUMBSTICK_LEFT,  0, 0, -1,  0 },
         { "RIGHT", 1, KL_OVRP_RAW_RTHUMBSTICK_RIGHT, 0, 0,  1,  0 },
+        // The left stick: HITMAN 3 VR: Reloaded's mission menu moves its
+        // selection with it and not with the right one (Mac, 2026-10-20).
+        { "LUP",    0, 0, 0, 0,  0,  1 },
+        { "LDOWN",  0, 0, 0, 0,  0, -1 },
+        { "LLEFT",  0, 0, 0, 0, -1,  0 },
+        { "LRIGHT", 0, 0, 0, 0,  1,  0 },
     };
     for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
         if (strlen(t[i].n) != len || strncasecmp(t[i].n, n, len) != 0) continue;
         p->b[t[i].hand] |= t[i].bit;
         if (t[i].idx)  p->idx[t[i].hand]  = 1.0f;
         if (t[i].grip) p->grip[t[i].hand] = 1.0f;
-        if (t[i].sx)   p->sx = t[i].sx;
-        if (t[i].sy)   p->sy = t[i].sy;
+        if (t[i].hand == 1 && t[i].sx) p->sx = t[i].sx;
+        if (t[i].hand == 1 && t[i].sy) p->sy = t[i].sy;
+        if (t[i].hand == 0 && t[i].sx) p->lx = t[i].sx;
+        if (t[i].hand == 0 && t[i].sy) p->ly = t[i].sy;
         return 1;
     }
     return 0;
@@ -5596,7 +5615,7 @@ static void klovrp_poke_parse(void) {
             if (!klovrp_poke_name(w, (size_t)(s - w), &p)) {
                 fprintf(stderr, "  [ovrp] KL_OVRP_POKE: no button named \"%.*s\" — "
                                 "A B X Y START BACK RTRIG LTRIG RGRIP LGRIP UP "
-                                "DOWN LEFT RIGHT\n", (int)(s - w), w);
+                                "DOWN LEFT RIGHT LUP LDOWN LLEFT LRIGHT\n", (int)(s - w), w);
                 ok = 0;
             }
             if (*s != '+') break;
@@ -5644,6 +5663,9 @@ static klovrp_input_state klovrp_input(int hand) {
         if (hand == 1) {
             if (p->sx != 0) v.stick_x = p->sx;
             if (p->sy != 0) v.stick_y = p->sy;
+        } else {
+            if (p->lx != 0) v.stick_x = p->lx;
+            if (p->ly != 0) v.stick_y = p->ly;
         }
     }
     return v;
@@ -5655,6 +5677,17 @@ static klovrp_input_state klovrp_input(int hand) {
 // ovrp_GetNodePoseState hands the other guest in the same frame. Reading
 // g_hand_pose directly here would have been the shorter line and would have
 // reintroduced the unlatched read in a new API.
+// The press knobs (KL_OVRP_POKE, KL_OVRP_FAKE_BUTTONS / _TRIGGER) make both hands
+// present and tracked at their parked pose: on the Mac no frontend publishes
+// one, an OpenXR guest's actions read nothing from an absent hand, and HITMAN 3
+// VR: Reloaded draws an untracked controller at the LOCAL origin — in the eye
+// once LOCAL is eye-level (2026-10-20).
+static int klovrp_fake_present(void) {
+    static int fake = -1;
+    if (fake < 0) fake = kl_env_uint("KL_OVRP_FAKE_BUTTONS", 0) != 0 || kl_env_str("KL_OVRP_FAKE_TRIGGER", NULL) != NULL
+                         || kl_env_str("KL_OVRP_POKE", NULL) != NULL;
+    return fake;
+}
 int kl_ovrp_hand_motion(int hand, float *pos, float *quat, float *vel, float *ang) {
     if ((unsigned)hand > 1) return 0;
     klovrp_pose p = klovrp_hand(hand);
@@ -5662,7 +5695,7 @@ int kl_ovrp_hand_motion(int hand, float *pos, float *quat, float *vel, float *an
     if (quat) { quat[0] = p.qx; quat[1] = p.qy; quat[2] = p.qz; quat[3] = p.qw; }
     if (vel)  { vel[0] = p.vx; vel[1] = p.vy; vel[2] = p.vz; }
     if (ang)  { ang[0] = p.avx; ang[1] = p.avy; ang[2] = p.avz; }
-    return __atomic_load_n(&g_hand_set[hand], __ATOMIC_ACQUIRE) ? 1 : 0;
+    return (klovrp_fake_present() || __atomic_load_n(&g_hand_set[hand], __ATOMIC_ACQUIRE)) ? 1 : 0;
 }
 
 int kl_ovrp_controller_input(int hand, uint32_t *buttons, uint32_t *touches,
@@ -5680,13 +5713,7 @@ int kl_ovrp_controller_input(int hand, uint32_t *buttons, uint32_t *touches,
     // hand publishes both in the same breath, and there is no separate "the
     // buttons are meaningful" signal here. A hand-tracked hand therefore reads
     // present with every button released, which is the truth about it.
-    // The press knobs (KL_OVRP_POKE, KL_OVRP_FAKE_BUTTONS / _TRIGGER) make a hand
-    // present too: on the Mac no frontend publishes one, and an OpenXR guest's
-    // actions read nothing from an absent hand (HITMAN 3 VR: Reloaded, 2026-10-20).
-    static int fake = -1;
-    if (fake < 0) fake = kl_env_uint("KL_OVRP_FAKE_BUTTONS", 0) != 0 || kl_env_str("KL_OVRP_FAKE_TRIGGER", NULL) != NULL
-                         || kl_env_str("KL_OVRP_POKE", NULL) != NULL;
-    return (fake || __atomic_load_n(&g_hand_set[hand], __ATOMIC_ACQUIRE)) ? 1 : 0;
+    return (klovrp_fake_present() || __atomic_load_n(&g_hand_set[hand], __ATOMIC_ACQUIRE)) ? 1 : 0;
 }
 
     // KL_OVRP_HANDS_SWEEP=1: collapse both hands onto the head and sweep their

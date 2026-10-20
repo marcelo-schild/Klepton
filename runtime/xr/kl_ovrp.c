@@ -2046,7 +2046,16 @@ static int klovrp_unify_default(void) {
     // Ghost Town uses the same widened eye texture and full-width viewport
     // for both eyes (3936x2465, then 5088x3204 with its resolution scale).
     // Match the compositor's cones to that symmetric-projection rendering.
-    static const char *on[] = { "intotheradius", "x5817243991680545", "walkabout", "x3634830803298285", "x9531494193591052" };
+    // HITMAN 3 VR: Reloaded (Glacier, OpenXR) does Meta's arithmetic itself: told
+    // the two canted cones it made its swapchain wider by their union (4096 ->
+    // 5193, x1.268 = 2 tan 60 / (tan 60 + tan 45)), drew both eyes through the
+    // left eye's viewport and frustum (no per-view viewports here, KL_XR_VIEW0_RECT)
+    // and so left the right eye's outer 15 degrees undrawn, while the start
+    // window said 4096 (the owner on device, 2026-10-20: "die auflösung ist 4096
+    // aber er rendert 5193"). Told the union, it draws each eye full width with
+    // one cone: the area the setting names, both eyes complete.
+    static const char *on[] = { "intotheradius", "x5817243991680545", "walkabout", "x3634830803298285", "x9531494193591052",
+                                "x8012387035448196" };
     const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;

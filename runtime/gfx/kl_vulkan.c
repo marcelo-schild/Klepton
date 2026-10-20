@@ -4703,6 +4703,10 @@ static void kl_pipe_report(const char *kind, unsigned n, double dt_ms) {
 static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
         VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *ci,
         const VkAllocationCallbacks *alloc, VkPipeline *out);
+// The dynamic-vertex-input emulation, defined after the async-pipeline block it borrows from.
+static int klvk_vi_on(void);
+static int klvk_vi_dynamic(const VkGraphicsPipelineCreateInfo *ci);
+static VkResult klvk_vi_defer(VkDevice dev, const VkGraphicsPipelineCreateInfo *ci, VkPipeline *out);
 static unsigned g_subpass_pipes;
 static VkResult klvk_ap_create(VkDevice dev, VkPipelineCache cache, uint32_t n,
         const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *alloc, VkPipeline *out);
@@ -4863,8 +4867,11 @@ static int klvk_vin_on(void) {
     if (on < 0) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
+        // HITMAN 3 VR: Reloaded's title screen has one (in_pos at location 2 of a
+        // two-attribute layout set with vkCmdSetVertexInputEXT, Mac 2026-10-20).
         on = kl_env_on("KL_VK_VIN_FILL", t && (!strcmp(t, "x24882487241367228") ||
-                                              !strcmp(t, "x5245041552210029")));
+                                              !strcmp(t, "x5245041552210029") ||
+                                              !strcmp(t, "x8012387035448196")));
     }
     return on;
 }
@@ -5148,6 +5155,23 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
                 fprintf(stderr, "%s%d", k ? "," : " dyn=", (int)c->pDynamicState->pDynamicStates[k]);
             for (const VkBaseInStructure *x = c->pNext; x; x = x->pNext) fprintf(stderr, " next=%d", (int)x->sType);
             fprintf(stderr, "\n");
+        }
+    }
+
+    // A pipeline whose vertex input is dynamic (VK_EXT_vertex_input_dynamic_state,
+    // which MoltenVK does not have) is not compiled here: it becomes a handle of
+    // ours, compiled once per vertex layout when the guest sets one (klvk_vi_*).
+    if (ci && klvk_vi_on()) {
+        int any = 0;
+        for (uint32_t i = 0; i < n; i++) any |= klvk_vi_dynamic(&ci[i]);
+        if (any) {
+            VkResult first = VK_SUCCESS;
+            for (uint32_t i = 0; i < n; i++) {
+                VkResult r = klvk_vi_dynamic(&ci[i]) ? klvk_vi_defer(dev, &ci[i], &out[i])
+                                                     : klvk_CreateGraphicsPipelines0(dev, cache, 1, &ci[i], alloc, &out[i]);
+                if (r != VK_SUCCESS && first == VK_SUCCESS) first = r;
+            }
+            return first;
         }
     }
 
@@ -5598,8 +5622,24 @@ static int klvk_ap_clone(klvk_ap_arena *a, const VkGraphicsPipelineCreateInfo *c
         o->field = klvk_ap_dup(a, ci->field, sizeof *ci->field); \
     }
     KLVK_AP_POD(pInputAssemblyState, "input assembly state")
-    KLVK_AP_POD(pRasterizationState, "rasterization state")
     KLVK_AP_POD(pDepthStencilState, "depth/stencil state")
+    if (ci->pRasterizationState) {
+        // Its one known chain member: depth clip (VK_EXT_depth_clip_enable, plain
+        // values) — HITMAN 3 VR: Reloaded chains it on every pipeline.
+        VkPipelineRasterizationStateCreateInfo *rs = klvk_ap_dup(a, ci->pRasterizationState, sizeof *rs);
+        if (!rs) return 0;
+        rs->pNext = NULL;
+        const void **rtail = &rs->pNext;
+        for (const VkBaseInStructure *x = ci->pRasterizationState->pNext; x; x = x->pNext) {
+            if (x->sType != VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT) {
+                klvk_ap_unknown("rasterization state", x); return 0; }
+            VkPipelineRasterizationDepthClipStateCreateInfoEXT *dc = klvk_ap_dup(a, x, sizeof *dc);
+            if (!dc) return 0;
+            dc->pNext = NULL;
+            *rtail = dc; rtail = &dc->pNext;
+        }
+        o->pRasterizationState = rs;
+    }
     o->pTessellationState = NULL;
     if (stages & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)) {
         KLVK_AP_POD(pTessellationState, "tessellation state")
@@ -5868,6 +5908,295 @@ static uint64_t klvk_ap_bind(void *cb, uint32_t bindPoint, uint64_t pipeline, in
     *drop = 1;
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// VK_EXT_vertex_input_dynamic_state, emulated (KL_VK_VI_EMU, default on; it only
+// ever touches pipelines that name VK_DYNAMIC_STATE_VERTEX_INPUT_EXT).
+//
+// HITMAN 3 VR: Reloaded (x8012387035448196, IOI's Glacier on a Quest) creates
+// every graphics pipeline WITHOUT a vertex input state and sets the layout per
+// draw with vkCmdSetVertexInputEXT — without even enabling the extension, which
+// the Quest's driver has and MoltenVK does not. MoltenVK built the Metal
+// pipeline descriptor from the missing state and faulted
+// (MVKGraphicsPipeline::initShaderConversionConfig, Mac run 2026-10-20).
+//
+// So such a pipeline is not compiled when it is created. The guest gets a
+// handle of ours holding a copy of the create info (klvk_ap_clone, the async
+// layer's deep copy) with the vertex-input dynamic state taken out; each layout
+// the guest sets while it is bound is compiled once into a real pipeline (a
+// variant) and bound in its place. A command buffer remembers the deferred
+// pipeline and the last layout, so the variant is bound on whichever of the two
+// calls comes second, and draws in between are left out (klvk_ap_mark), as for
+// a pipeline still compiling. The fragment-shading-rate dynamic state goes out
+// with it: MoltenVK has no shading rates either, and the guest's
+// vkCmdSetFragmentShadingRateKHR is already a no-op here. Binding divisors
+// other than 1 are not applied (said once). Shader modules a deferred pipeline
+// uses outlive the guest's vkDestroyShaderModule until the pipeline goes, since
+// a variant may be compiled long after the guest is done with its modules.
+// Costs: a Metal compile on the recording thread the first time a layout meets
+// a pipeline.
+#define KLVK_VI_MAX   32768u
+#define KLVK_VI_MAXB  16u
+#define KLVK_VI_MAXA  32u
+typedef struct { uint32_t nb, na, hash;
+                 VkVertexInputBindingDescription b[KLVK_VI_MAXB];
+                 VkVertexInputAttributeDescription a[KLVK_VI_MAXA]; } klvk_vi_layout;
+typedef struct klvk_vi_var { klvk_vi_layout l; uint64_t real; struct klvk_vi_var *next; } klvk_vi_var;
+typedef struct {
+    VkDevice dev;
+    VkGraphicsPipelineCreateInfo ci;   // owns what it points to (mem)
+    klvk_ap_arena mem;
+    klvk_vi_var *vars;
+    unsigned nvars;
+    pthread_mutex_t mu;
+} klvk_vipipe;
+static klvk_vipipe *g_vi_slot[KLVK_VI_MAX];
+static unsigned g_vi_next, g_vi_live;
+static pthread_mutex_t g_vi_mu = PTHREAD_MUTEX_INITIALIZER;
+static __thread int t_vi_internal;     // klvk_CmdBindPipeline called by the emulation itself
+
+static int klvk_vi_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_VK_VI_EMU", 1);
+    return on;
+}
+static int klvk_vi_dynamic(const VkGraphicsPipelineCreateInfo *ci) {
+    if (!ci->pDynamicState) return 0;
+    for (uint32_t k = 0; k < ci->pDynamicState->dynamicStateCount; k++)
+        if (ci->pDynamicState->pDynamicStates[k] == VK_DYNAMIC_STATE_VERTEX_INPUT_EXT) return 1;
+    return 0;
+}
+static klvk_vipipe *klvk_vi_from(uint64_t h) {
+    uintptr_t p = (uintptr_t)h, b = (uintptr_t)g_vi_slot;
+    if (p < b || p >= b + sizeof g_vi_slot || (p - b) % sizeof *g_vi_slot) return NULL;
+    return *(klvk_vipipe **)p;
+}
+
+// Shader modules held for deferred pipelines: count, and whether the guest has
+// already destroyed it (then it goes with its last pipeline).
+#define KLVK_VI_MODS 8192u
+static struct { uint64_t mod; unsigned refs; int dead; VkDevice dev; } g_vi_mod[KLVK_VI_MODS];
+static void klvk_vi_mod_ref(VkDevice dev, uint64_t mod, int delta) {
+    if (!mod) return;
+    uint64_t gone = 0;
+    pthread_mutex_lock(&g_vi_mu);
+    uint32_t i = (uint32_t)((mod >> 4) * 2654435761u) % KLVK_VI_MODS, free_at = KLVK_VI_MODS;
+    for (uint32_t n = 0; n < KLVK_VI_MODS; n++, i = (i + 1) % KLVK_VI_MODS) {
+        if (g_vi_mod[i].mod == mod) { free_at = i; break; }
+        if (!g_vi_mod[i].mod) { if (delta > 0) free_at = i; break; }
+    }
+    if (free_at < KLVK_VI_MODS) {
+        if (!g_vi_mod[free_at].mod) { g_vi_mod[free_at].mod = mod; g_vi_mod[free_at].dev = dev; }
+        if (delta > 0) g_vi_mod[free_at].refs++;
+        else if (g_vi_mod[free_at].refs && !--g_vi_mod[free_at].refs && g_vi_mod[free_at].dead) {
+            gone = mod; dev = g_vi_mod[free_at].dev;
+            g_vi_mod[free_at].dead = 0;   // the slot stays (probe chains), refs 0 and not dead
+        }
+    }
+    pthread_mutex_unlock(&g_vi_mu);
+    if (gone && real_gdpa) {
+        PFN_vkDestroyShaderModule d = (PFN_vkDestroyShaderModule)real_gdpa(dev, "vkDestroyShaderModule");
+        if (d) d(dev, (VkShaderModule)(uintptr_t)gone, NULL);
+    }
+}
+// 1 if the module is held: the guest's destroy is put off.
+static int klvk_vi_mod_hold(uint64_t mod) {
+    if (!mod || !__atomic_load_n(&g_vi_live, __ATOMIC_RELAXED)) return 0;
+    int held = 0;
+    pthread_mutex_lock(&g_vi_mu);
+    uint32_t i = (uint32_t)((mod >> 4) * 2654435761u) % KLVK_VI_MODS;
+    for (uint32_t n = 0; n < KLVK_VI_MODS && g_vi_mod[i].mod; n++, i = (i + 1) % KLVK_VI_MODS)
+        if (g_vi_mod[i].mod == mod) { if (g_vi_mod[i].refs) { g_vi_mod[i].dead = 1; held = 1; } break; }
+    pthread_mutex_unlock(&g_vi_mu);
+    return held;
+}
+
+static VkResult klvk_vi_defer(VkDevice dev, const VkGraphicsPipelineCreateInfo *ci, VkPipeline *out) {
+    klvk_vipipe *p = calloc(1, sizeof *p);
+    if (!p) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (!klvk_ap_clone(&p->mem, ci, &p->ci)) {
+        klvk_ap_free(&p->mem); free(p);
+        static int said;
+        if (said++ < 8) VKI("dynamic vertex input: a pipeline carries something the copy does not know — "
+                            "it is compiled as it is and will likely fail\n");
+        return klvk_CreateGraphicsPipelines0(dev, VK_NULL_HANDLE, 1, ci, NULL, out);
+    }
+    // Out with the two dynamic states nothing here can honour.
+    VkPipelineDynamicStateCreateInfo *d = (VkPipelineDynamicStateCreateInfo *)p->ci.pDynamicState;
+    if (d && d->pDynamicStates) {
+        VkDynamicState *ds = (VkDynamicState *)d->pDynamicStates;
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < d->dynamicStateCount; i++)
+            if (ds[i] != VK_DYNAMIC_STATE_VERTEX_INPUT_EXT &&
+                ds[i] != VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR) ds[k++] = ds[i];
+        d->dynamicStateCount = k;
+    }
+    p->ci.pVertexInputState = NULL;
+    p->dev = dev;
+    pthread_mutex_init(&p->mu, NULL);
+    pthread_mutex_lock(&g_vi_mu);
+    unsigned i, n;
+    for (n = 0, i = g_vi_next; n < KLVK_VI_MAX && g_vi_slot[i]; n++) i = (i + 1) % KLVK_VI_MAX;
+    if (n < KLVK_VI_MAX) { g_vi_slot[i] = p; g_vi_next = (i + 1) % KLVK_VI_MAX; g_vi_live++; }
+    unsigned live = g_vi_live;
+    pthread_mutex_unlock(&g_vi_mu);
+    if (n == KLVK_VI_MAX) {
+        klvk_ap_free(&p->mem); free(p);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    for (uint32_t s = 0; s < p->ci.stageCount; s++)
+        klvk_vi_mod_ref(dev, (uint64_t)(uintptr_t)p->ci.pStages[s].module, +1);
+    *out = (VkPipeline)(uintptr_t)&g_vi_slot[i];
+    if (live == 1 || !(live % 500))
+        VKI("dynamic vertex input: %u pipeline(s) waiting for their vertex layout "
+            "(VK_EXT_vertex_input_dynamic_state, emulated)\n", live);
+    return VK_SUCCESS;
+}
+
+static uint32_t klvk_vi_hash(const klvk_vi_layout *l) {
+    uint32_t h = klvk_fnv(l->b, l->nb * sizeof *l->b);
+    return h ^ (klvk_fnv(l->a, l->na * sizeof *l->a) * 16777619u) ^ (l->nb << 8) ^ l->na;
+}
+static int klvk_vi_same(const klvk_vi_layout *x, const klvk_vi_layout *y) {
+    return x->hash == y->hash && x->nb == y->nb && x->na == y->na &&
+           !memcmp(x->b, y->b, x->nb * sizeof *x->b) && !memcmp(x->a, y->a, x->na * sizeof *x->a);
+}
+// The variant of a deferred pipeline for one layout, compiled on first use.
+static uint64_t klvk_vi_variant(klvk_vipipe *p, const klvk_vi_layout *l) {
+    pthread_mutex_lock(&p->mu);
+    for (klvk_vi_var *v = p->vars; v; v = v->next)
+        if (klvk_vi_same(&v->l, l)) { uint64_t r = v->real; pthread_mutex_unlock(&p->mu); return r; }
+    VkPipelineVertexInputStateCreateInfo vis = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = l->nb, .pVertexBindingDescriptions = l->b,
+        .vertexAttributeDescriptionCount = l->na, .pVertexAttributeDescriptions = l->a };
+    VkGraphicsPipelineCreateInfo c = p->ci;
+    c.pVertexInputState = &vis;
+    VkPipeline real = VK_NULL_HANDLE;
+    double t0 = kl_pipe_ms();
+    VkResult r = klvk_CreateGraphicsPipelines0(p->dev, VK_NULL_HANDLE, 1, &c, NULL, &real);
+    double ms = kl_pipe_ms() - t0;
+    klvk_vi_var *v = calloc(1, sizeof *v);
+    if (v) { v->l = *l; v->real = r == VK_SUCCESS ? (uint64_t)(uintptr_t)real : 0; v->next = p->vars; p->vars = v; p->nvars++; }
+    pthread_mutex_unlock(&p->mu);
+    static unsigned made, failed;
+    unsigned m = __atomic_add_fetch(&made, 1, __ATOMIC_RELAXED);
+    if (r != VK_SUCCESS) {
+        unsigned f = __atomic_add_fetch(&failed, 1, __ATOMIC_RELAXED);
+        if (f <= 8) VKI("dynamic vertex input: a variant (%u bindings, %u attributes) was refused (%d)\n",
+                        l->nb, l->na, (int)r);
+    }
+    if (m <= 3 || !(m % 200))
+        VKI("dynamic vertex input: %u variant(s) compiled so far (this one %.1f ms, %u bindings, %u attributes)\n",
+            m, ms, l->nb, l->na);
+    return v ? v->real : 0;
+}
+
+// Per command buffer: the deferred pipeline bound and the last layout set.
+#define KLVK_VI_CBS 4096u
+typedef struct { uint64_t cb; klvk_vipipe *pipe; int have; klvk_vi_layout l; } klvk_vi_cb;
+static klvk_vi_cb g_vi_cb[KLVK_VI_CBS];
+static klvk_vi_cb *klvk_vi_cb_of(void *cb, int add) {
+    uint64_t h = (uint64_t)(uintptr_t)cb;
+    uint32_t i = (uint32_t)((h >> 4) * 2654435761u) % KLVK_VI_CBS;
+    for (uint32_t n = 0; n < KLVK_VI_CBS; n++, i = (i + 1) % KLVK_VI_CBS) {
+        uint64_t v = __atomic_load_n(&g_vi_cb[i].cb, __ATOMIC_ACQUIRE);
+        if (v == h) return &g_vi_cb[i];
+        if (!v) {
+            if (!add) return NULL;
+            uint64_t none = 0;
+            if (__atomic_compare_exchange_n(&g_vi_cb[i].cb, &none, h, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                return &g_vi_cb[i];
+            if (none == h) return &g_vi_cb[i];
+        }
+    }
+    static int said;
+    if (!said++) VKI("dynamic vertex input: the command-buffer table is full — draws on further "
+                     "command buffers are left out\n");
+    return NULL;
+}
+static void klvk_vi_begin(void *cb) {
+    klvk_vi_cb *e = klvk_vi_cb_of(cb, 0);
+    if (e) { e->pipe = NULL; e->have = 0; }
+}
+static void VKAPI_CALL klvk_CmdBindPipeline(void *cb, uint32_t bindPoint, uint64_t pipeline);
+// Bind the variant for what this command buffer has, if it has both.
+static void klvk_vi_settle(void *cb, klvk_vi_cb *e) {
+    if (!e || !e->pipe) return;
+    if (!e->have) { klvk_ap_mark(cb, 1); return; }    // no layout yet: its draws are left out
+    uint64_t real = klvk_vi_variant(e->pipe, &e->l);
+    if (!real) { klvk_ap_mark(cb, 1); return; }
+    t_vi_internal = 1;
+    klvk_CmdBindPipeline(cb, 0 /* graphics */, real);
+    t_vi_internal = 0;
+}
+static void VKAPI_CALL klvk_CmdSetVertexInputEXT(void *cb,
+        uint32_t nb, const VkVertexInputBindingDescription2EXT *b,
+        uint32_t na, const VkVertexInputAttributeDescription2EXT *a) {
+    klvk_vi_cb *e = klvk_vi_cb_of(cb, 1);
+    if (!e) return;
+    if (nb > KLVK_VI_MAXB || na > KLVK_VI_MAXA) {
+        static int said;
+        if (!said++) VKI("dynamic vertex input: a layout of %u bindings / %u attributes is beyond %u / %u — "
+                         "its draws are left out\n", nb, na, KLVK_VI_MAXB, KLVK_VI_MAXA);
+        e->have = 0;
+        klvk_ap_mark(cb, 1);
+        return;
+    }
+    klvk_vi_layout l;
+    memset(&l, 0, sizeof l);
+    l.nb = nb; l.na = na;
+    for (uint32_t i = 0; i < nb; i++) {
+        l.b[i].binding = b[i].binding; l.b[i].stride = b[i].stride; l.b[i].inputRate = b[i].inputRate;
+        if (b[i].divisor != 1) { static int said; if (!said++)
+            VKI("dynamic vertex input: binding divisor %u is not applied\n", b[i].divisor); }
+    }
+    for (uint32_t i = 0; i < na; i++) {
+        l.a[i].location = a[i].location; l.a[i].binding = a[i].binding;
+        l.a[i].format = a[i].format; l.a[i].offset = a[i].offset;
+    }
+    l.hash = klvk_vi_hash(&l);
+    if (e->have && klvk_vi_same(&e->l, &l)) return;    // the same again: nothing changes
+    e->l = l; e->have = 1;
+    klvk_vi_settle(cb, e);
+}
+// From klvk_CmdBindPipeline: 1 if the pipeline was one of ours (handled here).
+static int klvk_vi_bind(void *cb, uint32_t bindPoint, uint64_t pipeline) {
+    if (t_vi_internal || bindPoint != 0) return 0;
+    klvk_vipipe *p = __atomic_load_n(&g_vi_live, __ATOMIC_RELAXED) ? klvk_vi_from(pipeline) : NULL;
+    if (!p) {
+        klvk_vi_cb *e = __atomic_load_n(&g_vi_live, __ATOMIC_RELAXED) ? klvk_vi_cb_of(cb, 0) : NULL;
+        if (e) e->pipe = NULL;
+        return 0;
+    }
+    klvk_vi_cb *e = klvk_vi_cb_of(cb, 1);
+    if (!e) { klvk_ap_mark(cb, 1); return 1; }
+    e->pipe = p;
+    klvk_vi_settle(cb, e);
+    return 1;
+}
+// From klvk_DestroyPipeline: 1 if it was one of ours (its variants are destroyed).
+static int klvk_vi_destroy(VkDevice dev, uint64_t pipeline,
+                           void (*real)(VkDevice, uint64_t, const VkAllocationCallbacks *)) {
+    klvk_vipipe *p = klvk_vi_from(pipeline);
+    if (!p) return 0;
+    pthread_mutex_lock(&g_vi_mu);
+    *(klvk_vipipe **)(uintptr_t)pipeline = NULL;
+    g_vi_live--;
+    pthread_mutex_unlock(&g_vi_mu);
+    for (klvk_vi_var *v = p->vars, *nx; v; v = nx) {
+        nx = v->next;
+        if (v->real && real) real(dev, v->real, NULL);
+        free(v);
+    }
+    for (uint32_t s = 0; s < p->ci.stageCount; s++)
+        klvk_vi_mod_ref(dev, (uint64_t)(uintptr_t)p->ci.pStages[s].module, -1);
+    klvk_ap_free(&p->mem);
+    pthread_mutex_destroy(&p->mu);
+    free(p);
+    return 1;
+}
+
 static void VKAPI_CALL klvk_DestroyPipeline(VkDevice dev, uint64_t pipeline, const VkAllocationCallbacks *alloc) {
     static void (*real)(VkDevice, uint64_t, const VkAllocationCallbacks *);
     if (!real && real_gdpa) real = (void (*)(VkDevice, uint64_t, const VkAllocationCallbacks *))
@@ -5880,6 +6209,7 @@ static void VKAPI_CALL klvk_DestroyPipeline(VkDevice dev, uint64_t pipeline, con
         pthread_mutex_unlock(&g_ap_mu);
         if (!pipeline) return;
     }
+    if (klvk_vi_destroy(dev, pipeline, real)) return;
     if (__atomic_load_n(&g_vin_pipes, __ATOMIC_RELAXED)) klvk_vin_del(g_vin_pipe, pipeline);
     if (real) real(dev, pipeline, alloc);
 }
@@ -5889,6 +6219,7 @@ static void VKAPI_CALL klvk_DestroyShaderModule(VkDevice dev, uint64_t mod, cons
         real_gdpa(dev, "vkDestroyShaderModule");
     klvk_ap_drain();
     if (klvk_vin_on()) klvk_vin_del(g_vin_mod, mod);
+    if (klvk_vi_mod_hold(mod)) return;   // a deferred pipeline still needs it (klvk_vi_*)
     if (real) real(dev, mod, alloc);
 }
 static void VKAPI_CALL klvk_DestroyPipelineLayout(VkDevice dev, uint64_t layout, const VkAllocationCallbacks *alloc) {
@@ -7553,6 +7884,7 @@ static VkResult VKAPI_CALL klvk_BeginCommandBuffer(void *cb, const void *bi) {
         real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkBeginCommandBuffer");
     klvk_cb_set_idx(cb, 0);
     klvk_vin_begin(cb);
+    klvk_vi_begin(cb);
     fove_sec_begin((VkCommandBuffer)cb);   // a re-recorded secondary no longer carries its old indirect draw
     return real ? real(cb, bi) : VK_ERROR_INITIALIZATION_FAILED;
 }
@@ -7817,6 +8149,7 @@ static void VKAPI_CALL klvk_CmdBindPipeline(void *cb, uint32_t bindPoint, uint64
     int drop = 0;
     pipeline = klvk_ap_bind(cb, bindPoint, pipeline, &drop);
     if (drop) return;
+    if (klvk_vi_bind(cb, bindPoint, pipeline)) return;   // dynamic vertex input: bound by the layout
     if (real) real(cb, bindPoint, pipeline);
     if (bindPoint == 0 /* graphics */) klvk_vin_pipeline_bound(cb, pipeline);
 }
@@ -11040,7 +11373,7 @@ static const entry g_ours[] = {
     E(QueueSubmit),
     E(GetPhysicalDeviceProperties),
     E(GetPhysicalDeviceProperties2),
-    E(GetPhysicalDeviceQueueFamilyProperties), E(GetDeviceQueue),
+    E(GetPhysicalDeviceQueueFamilyProperties), E(GetDeviceQueue), E(CmdSetVertexInputEXT),
     E(GetPhysicalDeviceFeatures), E(GetPhysicalDeviceFeatures2),
     { "vkGetPhysicalDeviceFeatures2KHR", (PFN_vkVoidFunction)klvk_GetPhysicalDeviceFeatures2 },
     E(GetPhysicalDeviceMemoryProperties),

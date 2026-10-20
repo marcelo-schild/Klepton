@@ -5719,6 +5719,29 @@ static void klxr_back_eye_images(klxr_swapchain *sc, int eye) {
 // the table, which is the stable per-swapchain identity the eye mirror keys on.
 static int klxr_layer_id(const klxr_swapchain *sc);
 
+// Every view of a projection layer read from view 0's image rect. A multiview
+// render pass draws all views through one viewport unless the device has
+// VK_QCOM_multiview_per_view_viewports / _render_areas, which MoltenVK does not.
+// HITMAN 3 VR: Reloaded asks for them and, without them, still reports where
+// they would have put each eye: the right eye at x 613 of its 2903-wide slice
+// (Mac, Vision Pro cones) while it was drawn at x 0, like the left. The
+// compositor then read the right eye from the wrong part of the slice — a
+// shifted, distorted right picture that would not fuse (headset, 2026-10-20).
+// On by default for that game only; KL_XR_VIEW0_RECT=1/0 forces it.
+static int klxr_view0_rect_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_XR_VIEW0_RECT", t && !strcmp(t, "x8012387035448196"));
+        if (on)
+            fprintf(stderr, "  [xr] every eye of a projection layer is read from view 0's "
+                            "image rect (no per-view viewports here; KL_XR_VIEW0_RECT=0 "
+                            "uses each view's own)\n");
+    }
+    return on;
+}
+
 static int klxr_eye_mirror_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -7475,6 +7498,21 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     // the image, which is not a rect anybody can sample.
                     {
                         const XrRect2Di *ir = &proj->views[v].subImage.imageRect;
+                        if (v > 0 && klxr_view0_rect_on() &&
+                            proj->views[0].subImage.swapchain == proj->views[v].subImage.swapchain) {
+                            const XrRect2Di *r0 = &proj->views[0].subImage.imageRect;
+                            static int said_shift;
+                            if (!said_shift && (r0->offset.x != ir->offset.x ||
+                                                r0->offset.y != ir->offset.y)) {
+                                said_shift = 1;
+                                fprintf(stderr, "  [xr] view %u says its picture is at %dx%d+%d+%d, "
+                                                "view 0's at %dx%d+%d+%d — read from view 0's "
+                                                "(KL_XR_VIEW0_RECT)\n", v,
+                                        ir->extent.width, ir->extent.height, ir->offset.x, ir->offset.y,
+                                        r0->extent.width, r0->extent.height, r0->offset.x, r0->offset.y);
+                            }
+                            ir = r0;
+                        }
                         float *pr = pl_cur->rect[v];
                         pr[0] = pr[1] = pr[2] = pr[3] = 0.0f;
                         if (sc->width > 0 && sc->height > 0 && ir->offset.x >= 0 &&

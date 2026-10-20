@@ -5727,6 +5727,10 @@ static int klxr_layer_id(const klxr_swapchain *sc);
 // (Mac, Vision Pro cones) while it was drawn at x 0, like the left. The
 // compositor then read the right eye from the wrong part of the slice — a
 // shifted, distorted right picture that would not fuse (headset, 2026-10-20).
+// Reading view 0's rect alone was not enough: the right eye's picture is drawn
+// with view 0's frustum too — the two Mac captures differ by 1..20 px of
+// parallax, where the right eye's own frustum would move everything ~613 px —
+// so that frustum is the one it is placed with; only the pose stays the view's.
 // On by default for that game only; KL_XR_VIEW0_RECT=1/0 forces it.
 static int klxr_view0_rect_on(void) {
     static int on = -1;
@@ -5736,7 +5740,7 @@ static int klxr_view0_rect_on(void) {
         on = kl_env_on("KL_XR_VIEW0_RECT", t && !strcmp(t, "x8012387035448196"));
         if (on)
             fprintf(stderr, "  [xr] every eye of a projection layer is read from view 0's "
-                            "image rect (no per-view viewports here; KL_XR_VIEW0_RECT=0 "
+                            "image rect with view 0's frustum (no per-view viewports here; KL_XR_VIEW0_RECT=0 "
                             "uses each view's own)\n");
     }
     return on;
@@ -7472,6 +7476,11 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     lsp ? klxr_space_pose(lsp, &fpred) : (XrPosef){{0,0,0,1},{0,0,0}},
                     proj->views[v].pose);
                 const XrFovf *f = &proj->views[v].fov;
+                // Drawn through view 0's viewport, the picture also carries view
+                // 0's frustum (klxr_view0_rect_on): only the pose is the view's.
+                if (v > 0 && klxr_view0_rect_on() &&
+                    proj->views[0].subImage.swapchain == proj->views[v].subImage.swapchain)
+                    f = &proj->views[0].fov;
 
                 // This layer's own record, which is the per-layer composite:
                 // its picture, its frustum, its pose, placed against the

@@ -4002,7 +4002,8 @@ static int klvk_fs_on(void) {
     }
     static int sct = -1;
     if (sct < 0) sct = kl_env_str("KL_VK_SCISSOR_TRACE", NULL) != NULL ||
-                       kl_env_str("KL_VK_NO_STENCIL_FS", NULL) != NULL;
+                       kl_env_str("KL_VK_NO_STENCIL_FS", NULL) != NULL ||
+                       kl_env_str("KL_VK_VI_TRACE_FS", NULL) != NULL;
     return g_fs_nskip > 0 || g_fs_stats > 0 || sct;
 }
 // KL_VK_DESC_TRACE=1: for a few frames well into a run, the order in which a
@@ -4172,6 +4173,9 @@ static void klvk_fs_tick(void) {
 
 #define KLVK_SUBPASS_SLOTS 4096u
 static uint64_t g_subpass_mod[KLVK_SUBPASS_SLOTS], g_subpass_pipe[KLVK_SUBPASS_SLOTS];
+// Vertex shader modules of Scaleform (their uniform block is named
+// SCALEFORM_CONSTANTS_BLOCK): see klvk_vi_norm.
+static uint64_t g_sf_mod[KLVK_SUBPASS_SLOTS];
 // 1x1 images and the views of them: what a guest binds where it has to bind
 // SOMETHING (klvk_input_att_fix). A set of their own, because the general image
 // and view tables of this file are full after a few thousand entries — which a
@@ -6228,6 +6232,26 @@ static int klvk_vi_same(const klvk_vi_layout *x, const klvk_vi_layout *y) {
 // shader (Metal converts uchar/ushort to float). 32-bit integers have no SCALED
 // format and are left as they are. HITMAN 3 VR: Reloaded, headset 2026-10-20:
 // nine pipelines of its world refused this way.
+// Integer formats as the normalized ones of the same layout. Scaleform's vertex
+// shaders read their per-vertex factor (R8G8B8A8_UINT in HITMAN 3 VR: Reloaded's
+// batches) as a float, use .z * 255.01 as the index of the batch's matrix and .w
+// as an alpha factor: 0..1, i.e. what the Quest's driver gave them. Made SCALED
+// (0..255) the index ran far past the matrix table and the batch was not drawn —
+// a board in the tutorial missing in blocks (headset, 2026-10-21).
+static VkFormat klvk_vi_norm(VkFormat f) {
+    switch ((int)f) {
+    case VK_FORMAT_R8_UINT: return VK_FORMAT_R8_UNORM;              case VK_FORMAT_R8_SINT: return VK_FORMAT_R8_SNORM;
+    case VK_FORMAT_R8G8_UINT: return VK_FORMAT_R8G8_UNORM;          case VK_FORMAT_R8G8_SINT: return VK_FORMAT_R8G8_SNORM;
+    case VK_FORMAT_R8G8B8_UINT: return VK_FORMAT_R8G8B8_UNORM;      case VK_FORMAT_R8G8B8_SINT: return VK_FORMAT_R8G8B8_SNORM;
+    case VK_FORMAT_R8G8B8A8_UINT: return VK_FORMAT_R8G8B8A8_UNORM;  case VK_FORMAT_R8G8B8A8_SINT: return VK_FORMAT_R8G8B8A8_SNORM;
+    case VK_FORMAT_B8G8R8A8_UINT: return VK_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case VK_FORMAT_R16_UINT: return VK_FORMAT_R16_UNORM;            case VK_FORMAT_R16_SINT: return VK_FORMAT_R16_SNORM;
+    case VK_FORMAT_R16G16_UINT: return VK_FORMAT_R16G16_UNORM;      case VK_FORMAT_R16G16_SINT: return VK_FORMAT_R16G16_SNORM;
+    case VK_FORMAT_R16G16B16A16_UINT: return VK_FORMAT_R16G16B16A16_UNORM; case VK_FORMAT_R16G16B16A16_SINT: return VK_FORMAT_R16G16B16A16_SNORM;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
 static VkFormat klvk_vi_scaled(VkFormat f) {
     switch ((int)f) {
     case VK_FORMAT_R8_UINT: return VK_FORMAT_R8_USCALED;            case VK_FORMAT_R8_SINT: return VK_FORMAT_R8_SSCALED;
@@ -6288,15 +6312,57 @@ static uint64_t klvk_vi_variant(klvk_vipipe *p, const klvk_vi_layout *l) {
     memcpy(attrs, l->a, l->na * sizeof *attrs);
     klvk_vin_ent in = {0};
     int have_in = klvk_vi_inputs(p, &in);
+    // KL_VK_VI_SF_NORM=0: Scaleform's integers read as floats are SCALED like any other.
+    static int sf_on = -1;
+    if (sf_on < 0) sf_on = kl_env_on("KL_VK_VI_SF_NORM", 1);
+    int sf = 0;
+    for (uint32_t k = 0; sf_on && k < p->ci.stageCount; k++)
+        if (p->ci.pStages[k].stage == VK_SHADER_STAGE_VERTEX_BIT &&
+            klvk_handle_set_has(g_sf_mod, (uint64_t)(uintptr_t)p->ci.pStages[k].module)) sf = 1;
     unsigned scaled = 0;
     for (uint32_t i = 0; have_in && i < l->na; i++) {
         if (attrs[i].location >= 32) continue;
         uint32_t bit = 1u << attrs[i].location;
         VkFormat sc = VK_FORMAT_UNDEFINED;
-        if (in.f & bit) sc = klvk_vi_scaled(attrs[i].format);
+        if (in.f & bit) sc = sf ? klvk_vi_norm(attrs[i].format) : klvk_vi_scaled(attrs[i].format);
         else if (in.u & bit) sc = klvk_vi_integer(attrs[i].format, 0);
         else if (in.i & bit) sc = klvk_vi_integer(attrs[i].format, 1);
         if (sc != VK_FORMAT_UNDEFINED) { attrs[i].format = sc; scaled++; }
+    }
+    // KL_VK_VI_TRACE_FS=<hash>,...: every variant of a pipeline with one of these
+    // fragment shaders says its layout — each attribute's location, binding,
+    // offset, the format the guest gave and the one compiled — and what its
+    // vertex shader reads as float/int/uint.
+    {
+        static uint32_t list[16];
+        static int ln = -1;
+        if (ln < 0) {
+            ln = 0;
+            const char *e = kl_env_str("KL_VK_VI_TRACE_FS", NULL);
+            while (e && *e && ln < 16) {
+                char *end = NULL;
+                unsigned long v = strtoul(e, &end, 16);
+                if (end == e) break;
+                list[ln++] = (uint32_t)v;
+                e = *end == ',' ? end + 1 : end;
+            }
+        }
+        uint32_t fh = 0;
+        for (uint32_t s = 0; ln && s < p->ci.stageCount; s++)
+            if (p->ci.pStages[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+                fh = klvk_fs_get(g_fs_mod, (uint64_t)(uintptr_t)p->ci.pStages[s].module);
+        for (int i = 0; fh && i < ln; i++)
+            if (list[i] == fh) {
+                char d[700]; size_t o = 0; d[0] = 0;
+                for (uint32_t k = 0; k < l->na && o + 64 < sizeof d; k++)
+                    o += (size_t)snprintf(d + o, sizeof d - o, " loc%u b%u+%u fmt %d->%d", l->a[k].location, l->a[k].binding,
+                                          l->a[k].offset, (int)l->a[k].format, (int)attrs[k].format);
+                char b[200]; size_t ob = 0; b[0] = 0;
+                for (uint32_t k = 0; k < l->nb && ob + 40 < sizeof b; k++)
+                    ob += (size_t)snprintf(b + ob, sizeof b - ob, " b%u stride %u rate %d", l->b[k].binding, l->b[k].stride, (int)l->b[k].inputRate);
+                VKI("vi trace %08x:%s |%s | reads float %#x int %#x uint %#x\n", fh, d, b, in.f, in.i, in.u);
+                break;
+            }
     }
     if (scaled) {
         static unsigned said;
@@ -9998,6 +10064,9 @@ static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
         klvk_vin_ent in;
         if (klvk_spirv_vertex_inputs(ci->pCode, ci->codeSize / 4, &in))
             klvk_vin_put(g_vin_mod, (uint64_t)(uintptr_t)*out, in.f, in.i, in.u);
+        static const char sfk[] = "SCALEFORM_CONSTANTS_BLOCK";
+        if (memmem(ci->pCode, ci->codeSize, sfk, sizeof sfk - 1))
+            klvk_handle_set_add(g_sf_mod, (uint64_t)(uintptr_t)*out);
     }
     if (r == VK_SUCCESS && out && ci && ci->pCode && klvk_fs_on())
         klvk_fs_put(g_fs_mod, (uint64_t)(uintptr_t)*out, klvk_fnv(ci->pCode, ci->codeSize));

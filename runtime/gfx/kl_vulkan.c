@@ -4001,7 +4001,8 @@ static int klvk_fs_on(void) {
         if (n) fprintf(stderr, "  [vk] KL_VK_SKIP_FS: draws of %d fragment shader(s) are dropped\n", n);
     }
     static int sct = -1;
-    if (sct < 0) sct = kl_env_str("KL_VK_SCISSOR_TRACE", NULL) != NULL;
+    if (sct < 0) sct = kl_env_str("KL_VK_SCISSOR_TRACE", NULL) != NULL ||
+                       kl_env_str("KL_VK_NO_STENCIL_FS", NULL) != NULL;
     return g_fs_nskip > 0 || g_fs_stats > 0 || sct;
 }
 // KL_VK_DESC_TRACE=1: for a few frames well into a run, the order in which a
@@ -5270,6 +5271,19 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
                     !!c->pTessellationState, !!c->pViewportState, !!c->pRasterizationState,
                     !!c->pMultisampleState, !!c->pDepthStencilState, !!c->pColorBlendState,
                     !!c->pDynamicState, (void *)c->renderPass, c->subpass, (unsigned)c->flags);
+            if (c->pDepthStencilState) {
+                const VkPipelineDepthStencilStateCreateInfo *d = c->pDepthStencilState;
+                fprintf(stderr, " ds.test %u write %u cmp %d bounds %u stencil %u f(%d/%d/%d cmp %d rm %#x wm %#x ref %u)",
+                        d->depthTestEnable, d->depthWriteEnable, (int)d->depthCompareOp, d->depthBoundsTestEnable,
+                        d->stencilTestEnable, (int)d->front.failOp, (int)d->front.passOp, (int)d->front.depthFailOp,
+                        (int)d->front.compareOp, d->front.compareMask, d->front.writeMask, d->front.reference);
+            }
+            if (c->pRasterizationState)
+                fprintf(stderr, " rs.bias %u %.3f/%.3f/%.3f cull %d",
+                        c->pRasterizationState->depthBiasEnable, (double)c->pRasterizationState->depthBiasConstantFactor,
+                        (double)c->pRasterizationState->depthBiasSlopeFactor, (double)c->pRasterizationState->depthBiasClamp,
+                        (int)c->pRasterizationState->cullMode);
+            if (c->pViewportState) fprintf(stderr, " vp.n %u sc.n %u", c->pViewportState->viewportCount, c->pViewportState->scissorCount);
             if (c->pColorBlendState) fprintf(stderr, " cb.att %u logicop %u/%d blend0 %d wmask0 %#x", c->pColorBlendState->attachmentCount,
                                              c->pColorBlendState->logicOpEnable, (int)c->pColorBlendState->logicOp,
                                              c->pColorBlendState->attachmentCount && c->pColorBlendState->pAttachments ? (int)c->pColorBlendState->pAttachments[0].blendEnable : -1,
@@ -6297,6 +6311,41 @@ static uint64_t klvk_vi_variant(klvk_vipipe *p, const klvk_vi_layout *l) {
         .vertexAttributeDescriptionCount = l->na, .pVertexAttributeDescriptions = attrs };
     VkGraphicsPipelineCreateInfo c = p->ci;
     c.pVertexInputState = &vis;
+    // KL_VK_NO_STENCIL_FS=<hash>,...: variants of pipelines whose fragment shader
+    // has one of these hashes are compiled with the stencil test off. A test for
+    // HITMAN 3 VR: Reloaded's Scaleform board, drawn through a stencil mask and
+    // missing in screen-aligned blocks on the headset (2026-10-21).
+    VkPipelineDepthStencilStateCreateInfo ds_nost;
+    {
+        static uint32_t list[16];
+        static int ln = -1;
+        if (ln < 0) {
+            ln = 0;
+            const char *e = kl_env_str("KL_VK_NO_STENCIL_FS", NULL);
+            while (e && *e && ln < 16) {
+                char *end = NULL;
+                unsigned long v = strtoul(e, &end, 16);
+                if (end == e) break;
+                list[ln++] = (uint32_t)v;
+                e = *end == ',' ? end + 1 : end;
+            }
+        }
+        if (ln && c.pDepthStencilState && c.pDepthStencilState->stencilTestEnable) {
+            uint32_t fh = 0;
+            for (uint32_t s = 0; s < c.stageCount; s++)
+                if (c.pStages[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+                    fh = klvk_fs_get(g_fs_mod, (uint64_t)(uintptr_t)c.pStages[s].module);
+            for (int i = 0; i < ln; i++)
+                if (fh && list[i] == fh) {
+                    ds_nost = *c.pDepthStencilState;
+                    ds_nost.stencilTestEnable = VK_FALSE;
+                    c.pDepthStencilState = &ds_nost;
+                    static int said;
+                    if (said++ < 4) VKI("KL_VK_NO_STENCIL_FS: a variant of %08x without its stencil test\n", fh);
+                    break;
+                }
+        }
+    }
     VkPipeline real = VK_NULL_HANDLE;
     double t0 = kl_pipe_ms();
     // Behind the frame when KL_VK_ASYNC_PIPES asks for it: this is where such a

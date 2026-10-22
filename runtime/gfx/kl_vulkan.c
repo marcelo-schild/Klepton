@@ -8291,12 +8291,54 @@ static void VKAPI_CALL klvk_CmdBindIndexBuffer(void *cb, uint64_t buffer,
 #define KLVK_REAL(name) \
     static void *real; \
     if (!real && real_gdpa) real = (void *)real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, name)
+// KL_VK_GRID_DILATE (default on for HITMAN 3 VR: Reloaded): conservative
+// rasterization for draws through a 100x60 viewport, made of five draws — the
+// draw, then four more with the viewport moved by just under half a pixel each
+// way, so that every pixel a primitive touches gets a fragment. The game sorts
+// the gates between its rooms (6114aaf2) and its lights (8653a979) into two
+// screen grids of 100x60 cells by drawing their volumes into such a viewport, and
+// a lighting shader takes a pixel's room and lights from its cell. A cell at a
+// slanted edge whose centre a volume misses was left out here but not on the
+// Quest, and was lit as the wrong room: lighter steps along the window in the VR
+// tutorial's third room and along shadow edges (headset, 2026-10-22). Both shaders
+// keep an index once (an atomic list, a logic OR), so the repeats add nothing
+// twice. klvk_grid_dilate says how many repeats a draw gets (0 or 4).
+static int klvk_grid_dilate(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_VK_GRID_DILATE", t && !strcmp(t, "x8012387035448196"));
+        if (on) VKI("KL_VK_GRID_DILATE: draws through a 100x60 viewport are repeated with it moved by "
+                    "+-0.49 pixel (conservative rasterization)\n");
+    }
+    if (!on || !t_vp_n) return 0;
+    float h = t_vp[0].height < 0 ? -t_vp[0].height : t_vp[0].height;
+    return t_vp[0].width == 100.0f && h == 60.0f ? 4 : 0;
+}
+// Repeat k (0..3) moves the viewports set last on this thread; -1 puts them back.
+static void klvk_grid_dilate_vp(void *cb, int k) {
+    static void (*setvp)(void *, uint32_t, uint32_t, const VkViewport *);
+    if (!setvp && real_gdpa) setvp = (void (*)(void *, uint32_t, uint32_t, const VkViewport *))
+        real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdSetViewport");
+    if (!setvp || !t_vp_n) return;
+    if (k < 0) { setvp(cb, t_vp_first, t_vp_n, t_vp); return; }
+    static const float o[4][2] = { { -0.49f, -0.49f }, { 0.49f, -0.49f }, { -0.49f, 0.49f }, { 0.49f, 0.49f } };
+    VkViewport v[4];
+    for (uint32_t i = 0; i < t_vp_n; i++) { v[i] = t_vp[i]; v[i].x += o[k][0]; v[i].y += o[k][1]; }
+    setvp(cb, t_vp_first, t_vp_n, v);
+}
 static void VKAPI_CALL klvk_CmdDraw(void *cb, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
     KLVK_REAL("vkCmdDraw");
     if (klvk_ap_skip(cb)) return;
     __atomic_add_fetch(&g_prof_nonindexed, 1, __ATOMIC_RELAXED);
     if (klvk_fs_draw()) return;
     if (real) ((void (*)(void *, uint32_t, uint32_t, uint32_t, uint32_t))real)(cb, a, b, c, d);
+    for (int k = 0, n = real ? klvk_grid_dilate() : 0; k < n; k++) {
+        klvk_grid_dilate_vp(cb, k);
+        ((void (*)(void *, uint32_t, uint32_t, uint32_t, uint32_t))real)(cb, a, b, c, d);
+        if (k == n - 1) klvk_grid_dilate_vp(cb, -1);
+    }
 }
 static void VKAPI_CALL klvk_CmdDrawIndirect(void *cb, VkBuffer buf, VkDeviceSize off,
         uint32_t count, uint32_t stride) {
@@ -8304,6 +8346,11 @@ static void VKAPI_CALL klvk_CmdDrawIndirect(void *cb, VkBuffer buf, VkDeviceSize
     if (klvk_ap_skip(cb)) return;
     __atomic_add_fetch(&g_prof_indirect, 1, __ATOMIC_RELAXED);
     if (real) ((void (*)(void *, VkBuffer, VkDeviceSize, uint32_t, uint32_t))real)(cb, buf, off, count, stride);
+    for (int k = 0, n = real ? klvk_grid_dilate() : 0; k < n; k++) {
+        klvk_grid_dilate_vp(cb, k);
+        ((void (*)(void *, VkBuffer, VkDeviceSize, uint32_t, uint32_t))real)(cb, buf, off, count, stride);
+        if (k == n - 1) klvk_grid_dilate_vp(cb, -1);
+    }
 }
 static void VKAPI_CALL klvk_CmdDrawIndexedIndirect(void *cb, VkBuffer buf, VkDeviceSize off,
         uint32_t count, uint32_t stride) {
@@ -8311,6 +8358,11 @@ static void VKAPI_CALL klvk_CmdDrawIndexedIndirect(void *cb, VkBuffer buf, VkDev
     if (klvk_ap_skip(cb)) return;
     __atomic_add_fetch(&g_prof_indirect, 1, __ATOMIC_RELAXED);
     if (real) ((void (*)(void *, VkBuffer, VkDeviceSize, uint32_t, uint32_t))real)(cb, buf, off, count, stride);
+    for (int k = 0, n = real ? klvk_grid_dilate() : 0; k < n; k++) {
+        klvk_grid_dilate_vp(cb, k);
+        ((void (*)(void *, VkBuffer, VkDeviceSize, uint32_t, uint32_t))real)(cb, buf, off, count, stride);
+        if (k == n - 1) klvk_grid_dilate_vp(cb, -1);
+    }
 }
 static void VKAPI_CALL klvk_CmdClearAttachments(void *cb, uint32_t na, const VkClearAttachment *a,
         uint32_t nr, const VkClearRect *r) {
@@ -8495,6 +8547,11 @@ static void VKAPI_CALL klvk_CmdDrawIndexed(void *cb, uint32_t indexCount,
         }
     }
     if (real) real(cb, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+    for (int k = 0, n = real ? klvk_grid_dilate() : 0; k < n; k++) {
+        klvk_grid_dilate_vp(cb, k);
+        real(cb, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+        if (k == n - 1) klvk_grid_dilate_vp(cb, -1);
+    }
 }
 static void VKAPI_CALL klvk_CmdBindPipeline(void *cb, uint32_t bindPoint, uint64_t pipeline) {
     static void (*real)(void *, uint32_t, uint64_t);

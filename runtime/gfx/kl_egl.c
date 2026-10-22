@@ -401,13 +401,16 @@ extern const char *kl_driver_target_name(void);
 // XR SDK: told none of the three names, every frame logged "GL_INVALID_FRAMEBUFFER_
 // OPERATION: Framebuffer is not complete" and nothing reached its array swapchain —
 // a black eye picture, or only the room behind its passthrough (2026-10-16).
+// Fluid (x6946182742093178, Unity 6000.3 + OpenXR) is the same again: ~1450
+// incomplete-framebuffer errors a run and a black picture (2026-10-21).
 static int klgl_want_msrtt(void) {
     static int v = -1;
     if (v < 0) {
         extern int kl_guest_beatsaber_openxr(void);
         const char *t = kl_driver_target_name();
         v = kl_env_on("KL_GL_MSRTT", kl_guest_beatsaber_openxr() ||
-                                     (t && strcmp(t, "x9449316705178989") == 0));
+                                     (t && (strcmp(t, "x9449316705178989") == 0 ||
+                                            strcmp(t, "x6946182742093178") == 0)));
     }
     return v;
 }

@@ -223,7 +223,8 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   its OVRPlugin version (1.106.0), its eye-size cap (4000) and `.full`. Also on
   by default for DreamSpace (`x9449316705178989`, Unity 6 + OpenXR, the same
   case), which is told OVRPlugin 1.203.0 and gets the GLES 3.0 capability
-  profile (as Space Channel does) so Unity does not skin on the GPU.
+  profile (as Space Channel does) so Unity does not skin on the GPU. On by
+  default for Fluid (`x6946182742093178`, Unity 6000.3 + OpenXR) as well.
 - `KL_NET_NO_META=0|1` — (`runtime/libc/kl_shim.c`) names under oculus.com,
   oculuscdn.com, facebook.com, facebook.net, fbcdn.net and meta.com do not
   resolve (`EAI_NONAME`, as on a headset without a network); every other host
@@ -813,7 +814,9 @@ every time they fire, with the address and the instruction each replaces.
   stops on its "Under Construction" screen exactly as it did before.
 - `KL_GUEST_PATCH_OFF=<name>[,<name>]` — turn off one by name. The names are
   `vrchat-under-construction`, `vrchat-min-client-version`, `vrchat-multipass`
-  and `vrchat-fbo-context-guard`. `vrchat-min-client-version` is the one to
+  and `vrchat-fbo-context-guard`; `fluid-keyboard-warmup` (Fluid,
+  `x6946182742093178`) lets its startup keyboard warmup complete without the
+  Java keyboard's surface. `vrchat-min-client-version` is the one to
   reach for, because it is a real version check against VRChat's own API (the
   tree's APK is build 1862 and the service asks for 1865) and the honest fix for
   it is a newer APK, not a patch. `vrchat-fbo-context-guard` is the A/B for
@@ -2143,6 +2146,17 @@ puts the camera on the ground with its hands underneath it.
   overlay leaves the published set alone instead of emptying it (which blinked
   AC Nexus's cards off every few seconds). Default 1 for `x5812519008825194`,
   else 0.
+- `KL_OVRP_ENQ_WITH_XR=0|1` — (`kl_ovrp.c`) a Unity OpenXR guest whose
+  OVRPlugin still files OVROverlay panels through `ovrp_EnqueueSubmitLayer2`:
+  keep that set and publish it with each `xrEndFrame`'s own quads instead of
+  letting the OpenXR frame replace it. Default 1 for Mission: ISS
+  (`x2094303753986147`) and Fluid (`x6946182742093178`), whose panels were
+  black between frames, else 0.
+- `KL_OVRP_ENQ_MIRROR_XR=0|1` — (`kl_ovrp.c`, `kl_ovrp_openxr_frame_end`) with
+  `KL_OVRP_ENQ_WITH_XR` on a GLES guest, copy the enqueued panels' images for
+  the compositor at each `xrEndFrame`, as `ovrp_EndFrame` does on the OVRPlugin
+  path; without it they arrive with no MTLTexture and are not composited.
+  Default 1 for Fluid (`x6946182742093178`), else 0.
 - `KL_OVRP_ENQ_RETIRE=0|1` — a panel the guest destroys (`ovrp_DestroyLayer`,
   or `ovrp_EnqueueDestroyLayer` with the id behind a pointer, as Ghost Town's
   plugin passes it) is taken out of the visible set and the batch being
@@ -3266,8 +3280,9 @@ front door is a knob, not a build. `build_run_host.sh`'s flags map onto these:
   set (its Quest controller models sat above PSVR2 Sense controllers).
 - `KL_XR_LOCAL_FLOOR=0|1` — (`kl_openxr.c`) offer the LOCAL_FLOOR reference
   space (core in OpenXR 1.1; here the pose STAGE has) to an instance created
-  with apiVersion >= 1.1. Default 1 for DreamSpace (`x9449316705178989`),
-  which never began its session without it, else 0.
+  with apiVersion >= 1.1. Default 1 for DreamSpace (`x9449316705178989`) and
+  Fluid (`x6946182742093178`), which never began their sessions without it,
+  else 0.
 
   **A pitch alone rotates where the controller points and not where it PIVOTS.**
   The frame turns about the origin the platform gave us, so the point that

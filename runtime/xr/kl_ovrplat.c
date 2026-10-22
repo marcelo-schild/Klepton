@@ -2998,8 +2998,16 @@ static const char *const g_plat_request[] = {
 //     the invite/roster panels read. Ownership does not enter into it, and the
 //     trailing underscore keeps this clear of ovr_GroupPresenceOptions_* below,
 //     which is a different shape entirely.
+//   ovr_Party_* — Meta system parties. All entry points return an ovrRequest.
+//     Ownership does not enter into it; with no platform service the request
+//     cannot be made (0). Warplanes: WW1 Fighters (x3922378427824210) and
+//     Warplanes: Battles over Pacific (x3984056454948095) call
+//     ovr_Party_GetCurrent at start.
+//   ovr_Matchmaking_* — multiplayer matchmaking queues and rooms.
+//   ovr_RichPresence_* — destination and activity presence.
 static const char *const g_plat_request_prefix[] = {
-    "ovr_Achievements_", "ovr_GroupPresence_",
+    "ovr_Achievements_", "ovr_GroupPresence_", "ovr_Party_",
+    "ovr_Matchmaking_", "ovr_RichPresence_",
 };
 
 // ---------------------------------------------------------------------------

@@ -851,7 +851,9 @@ int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
         // ...and for one whose read-only storage buffers kl_glfb reads through
         // textures (Garden of the Sea).
         if (es31_any || kl_glfb_compute_tf() || kl_glfb_ssbo_tex() || (t && (strcmp(t, "x2544573735586536") == 0
-                                                       || strcmp(t, "x2436558143118760") == 0))) {
+                                                       || strcmp(t, "x2436558143118760") == 0
+                                                       || strcmp(t, "x3922378427824210") == 0
+                                                       || strcmp(t, "x3984056454948095") == 0))) {
             static const struct { uint32_t pname; int32_t value; } es31[] = {
                 {0x8F38 /* MAX_IMAGE_UNITS                     */, 4},
                 {0x90D6 /* MAX_VERTEX_SHADER_STORAGE_BLOCKS    */, 4},
@@ -861,6 +863,9 @@ int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
                 {0x90DD /* MAX_SHADER_STORAGE_BUFFER_BINDINGS  */, 8},
                 {0x92DC /* MAX_ATOMIC_COUNTER_BUFFER_BINDINGS  */, 1},
                 {0x90EB /* MAX_COMPUTE_WORK_GROUP_INVOCATIONS  */, 128},
+                {0x90D7 /* MAX_COMPUTE_UNIFORM_BLOCKS          */, 14},
+                {0x90D8 /* MAX_COMPUTE_TEXTURE_IMAGE_UNITS     */, 16},
+                {0x90D9 /* MAX_COMPUTE_IMAGE_UNIFORMS          */, 4},
             };
             for (size_t i = 0; i < sizeof es31 / sizeof es31[0]; i++)
                 if (es31[i].pname == pname) { params[0] = es31[i].value; return 1; }

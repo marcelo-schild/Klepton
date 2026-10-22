@@ -2237,14 +2237,16 @@ static void (*g_real_BindBuffer)(uint32_t, uint32_t);
 // 1.45 (kl_guest_beatsaber_openxr), the one guest it was seen with.
 #define KLFB_GL_COMPUTE_SHADER 0x91B9
 #define KLFB_GL_SSBO           0x90D2
-#define KLFB_CS_MAX            8
+#define KLFB_CS_MAX            128
 #define KLFB_CS_BINDINGS       8
 typedef struct {
     uint32_t name;                       // shader, then (in g_cs_progs) program
     uint32_t fs;                         // program only: the fragment stage we add
+    int group_x, group_y, group_z;       // local_size_x, y, z
     int group, in_words, out_words;      // local_size_x; uints per element read / written
     int in_binding, out_binding;         // the kernel's shader-storage binding points
     int ready;                           // program only
+    int is_tf;                           // 1 if transform feedback kernel
 } klfb_cs_obj;
 static klfb_cs_obj g_cs_shaders[KLFB_CS_MAX], g_cs_progs[KLFB_CS_MAX];
 static struct { uint32_t buf; intptr_t off, size; } g_cs_ssbo[KLFB_CS_BINDINGS];
@@ -2266,6 +2268,24 @@ int kl_glfb_compute_tf(void) {
             if (!g && !g_ready) return 0;
             on = g;
         }
+    }
+    return on;
+}
+// Compute kernels that cannot run here, stubbed (community fixes 62/64): a
+// guest whose compute shaders ANGLE's ES 3.0 refuses (glCreateShader(0x91b9)
+// -> 0) and whose Unity shader compiler then reads metadata off the missing
+// object. The kernel becomes a dummy vertex shader that keeps its local size
+// for COMPUTE_WORK_GROUP_SIZE, and its dispatches do nothing. Warplanes: WW1
+// Fighters (x3922378427824210) and Warplanes: Battles over Pacific
+// (x3984056454948095) crashed while their scenes loaded without it.
+//   KL_GLFB_COMPUTE_STUB=0|1 — default 1 for those two titles, else 0.
+int kl_glfb_compute_stub(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_GLFB_COMPUTE_STUB", t && (strcmp(t, "x3922378427824210") == 0 ||
+                                                     strcmp(t, "x3984056454948095") == 0));
     }
     return on;
 }
@@ -2462,24 +2482,26 @@ static void klfb_AttachShader(uint32_t program, uint32_t shader) {
     pr->name = program;
     static const char *const fsrc =
         "#version 300 es\nprecision mediump float;\nout vec4 kl_c;\nvoid main() { kl_c = vec4(0.0); }\n";
-    char names[14][8];
-    const char *cap[14];
-    int rows = pr->out_words / 4;
-    for (int i = 0; i < rows && i < 14; i++) { snprintf(names[i], sizeof names[i], "kl_o%d", i); cap[i] = names[i]; }
     void (*compile)(uint32_t) = asym("glCompileShader");
     void (*source)(uint32_t, int32_t, const char *const *, const int32_t *) = asym("glShaderSource");
-    void (*tfv)(uint32_t, int32_t, const char *const *, uint32_t) = asym("glTransformFeedbackVaryings");
     pr->fs = g_real_CreateShader ? g_real_CreateShader(0x8B30 /* FRAGMENT_SHADER */) : 0;
-    if (pr->fs && source && compile && tfv && g_real_AttachShader) {
+    if (pr->fs && source && compile && g_real_AttachShader) {
         source(pr->fs, 1, &fsrc, NULL);
         compile(pr->fs);
         g_real_AttachShader(program, pr->fs);
-        tfv(program, rows, cap, 0x8C8C /* INTERLEAVED_ATTRIBS */);
-        void (*bindattr)(uint32_t, uint32_t, const char *) = asym("glBindAttribLocation");
-        for (int i = 0; bindattr && i < pr->in_words / 4; i++) {
-            char a[8];
-            snprintf(a, sizeof a, "kl_a%d", i);
-            bindattr(program, (uint32_t)i, a);
+        if (pr->is_tf && pr->out_words > 0) {
+            void (*tfv)(uint32_t, int32_t, const char *const *, uint32_t) = asym("glTransformFeedbackVaryings");
+            char names[14][8];
+            const char *cap[14];
+            int rows = pr->out_words / 4;
+            for (int i = 0; i < rows && i < 14; i++) { snprintf(names[i], sizeof names[i], "kl_o%d", i); cap[i] = names[i]; }
+            if (tfv) tfv(program, rows, cap, 0x8C8C /* INTERLEAVED_ATTRIBS */);
+            void (*bindattr)(uint32_t, uint32_t, const char *) = asym("glBindAttribLocation");
+            for (int i = 0; bindattr && i < pr->in_words / 4; i++) {
+                char a[8];
+                snprintf(a, sizeof a, "kl_a%d", i);
+                bindattr(program, (uint32_t)i, a);
+            }
         }
     }
 }
@@ -2497,10 +2519,10 @@ static void klfb_cs_linked(uint32_t program) {
         char log[1024]; log[0] = 0;
         void (*ilog)(uint32_t, int32_t, int32_t *, char *) = asym("glGetProgramInfoLog");
         if (ilog) ilog(program, sizeof log, NULL, log);
-        fprintf(stderr, "  [glfb] compute-tf: program %u did NOT link: %s\n", program, log);
+        fprintf(stderr, "  [glfb] compute program %u did NOT link: %s\n", program, log);
     } else {
-        fprintf(stderr, "  [glfb] compute-tf: program %u linked\n", program);
-        if (kl_env_on("KL_GLFB_COMPUTE_TF_SELFTEST", 0)) klfb_cs_selftest(pr);
+        fprintf(stderr, "  [glfb] compute program %u linked (tf=%d)\n", program, pr->is_tf);
+        if (pr->is_tf && kl_env_on("KL_GLFB_COMPUTE_TF_SELFTEST", 0)) klfb_cs_selftest(pr);
     }
 }
 // glGetProgramiv: ANGLE's answer, except the one question only a compute
@@ -2510,7 +2532,12 @@ static void (*g_real_GetProgramiv)(uint32_t, uint32_t, int32_t *);
 static void klfb_GetProgramiv(uint32_t program, uint32_t pname, int32_t *params) {
     if (pname == 0x8267 /* COMPUTE_WORK_GROUP_SIZE */) {
         klfb_cs_obj *pr = klfb_cs_find(g_cs_progs, program);
-        if (pr && params) { params[0] = pr->group; params[1] = 1; params[2] = 1; return; }
+        if (pr && params) {
+            params[0] = pr->group_x ? pr->group_x : (pr->group ? pr->group : 1);
+            params[1] = pr->group_y ? pr->group_y : 1;
+            params[2] = pr->group_z ? pr->group_z : 1;
+            return;
+        }
     }
     if (g_real_GetProgramiv) g_real_GetProgramiv(program, pname, params);
 }
@@ -2528,7 +2555,7 @@ static void klfb_cs_forget(klfb_cs_obj *tab, uint32_t name) {
 static void (*g_real_BindBufferBase)(uint32_t, uint32_t, uint32_t);
 static void (*g_real_BindBufferRange)(uint32_t, uint32_t, uint32_t, intptr_t, intptr_t);
 static void klfb_BindBufferBase(uint32_t target, uint32_t index, uint32_t buffer) {
-    if (target == KLFB_GL_SSBO && (kl_glfb_compute_tf() || kl_glfb_ssbo_tex())) {
+    if (target == KLFB_GL_SSBO && (kl_glfb_compute_tf() || kl_glfb_ssbo_tex() || kl_glfb_compute_stub())) {
         g_cs_generic = buffer;
         if (kl_glfb_ssbo_tex()) klfb_tbm_want(buffer);
         if (index < KLFB_CS_BINDINGS) { g_cs_ssbo[index].buf = buffer; g_cs_ssbo[index].off = 0; g_cs_ssbo[index].size = -1; }
@@ -2537,7 +2564,7 @@ static void klfb_BindBufferBase(uint32_t target, uint32_t index, uint32_t buffer
     if (g_real_BindBufferBase) g_real_BindBufferBase(target, index, buffer);
 }
 static void klfb_BindBufferRange(uint32_t target, uint32_t index, uint32_t buffer, intptr_t off, intptr_t size) {
-    if (target == KLFB_GL_SSBO && (kl_glfb_compute_tf() || kl_glfb_ssbo_tex())) {
+    if (target == KLFB_GL_SSBO && (kl_glfb_compute_tf() || kl_glfb_ssbo_tex() || kl_glfb_compute_stub())) {
         g_cs_generic = buffer;
         if (kl_glfb_ssbo_tex()) klfb_tbm_want(buffer);
         if (index < KLFB_CS_BINDINGS) { g_cs_ssbo[index].buf = buffer; g_cs_ssbo[index].off = off; g_cs_ssbo[index].size = size; }
@@ -2565,10 +2592,10 @@ static void klfb_DispatchCompute(uint32_t gx, uint32_t gy, uint32_t gz) {
     int32_t cur = 0;
     if (a_glGetIntegerv) a_glGetIntegerv(0x8B8D /* CURRENT_PROGRAM */, &cur);
     klfb_cs_obj *pr = klfb_cs_find(g_cs_progs, (uint32_t)cur);
-    if (!pr || !pr->ready || gy != 1 || gz != 1) {
-        if (said++ < 4)
-            fprintf(stderr, "  [glfb] glDispatchCompute(%u,%u,%u): program %d is not a kernel we run — nothing done\n",
-                    gx, gy, gz, cur);
+    if (!pr || !pr->ready || !pr->is_tf || gy != 1 || gz != 1) {
+        if (said++ < 8)
+            fprintf(stderr, "  [glfb] glDispatchCompute(%u,%u,%u): program %d (tf=%d) — nothing done\n",
+                    gx, gy, gz, cur, pr ? pr->is_tf : 0);
         return;
     }
     uint32_t in = g_cs_ssbo[pr->in_binding].buf, out = g_cs_ssbo[pr->out_binding].buf;
@@ -2762,7 +2789,7 @@ static void klfb_MemoryBarrier(uint32_t barriers) {
         g_tb_bound_buf[5] = slot_;                                                \
         klfb_cs_giveback(was_);                                                   \
     } while (0)
-#define KLFB_CS_GENERIC(target) ((target) == KLFB_GL_SSBO && (kl_glfb_compute_tf() || kl_glfb_ssbo_tex()))
+#define KLFB_CS_GENERIC(target) ((target) == KLFB_GL_SSBO && (kl_glfb_compute_tf() || kl_glfb_ssbo_tex() || kl_glfb_compute_stub()))
 
 static void klfb_ShaderSource(uint32_t shader, int32_t count,
                               const char *const *strings, const int32_t *lengths) {
@@ -2895,7 +2922,35 @@ static void klfb_ShaderSource(uint32_t shader, int32_t count,
             {
                 klfb_cs_obj *cs = klfb_cs_find(g_cs_shaders, shader);
                 if (cs) {
-                    if (!klfb_cs_rewrite(buf, cap, cs)) cs->group = 0;
+                    int rewritten = kl_glfb_compute_tf() && klfb_cs_rewrite(buf, cap, cs);
+                    if (rewritten) {
+                        cs->is_tf = 1;
+                        cs->group_x = cs->group;
+                        cs->group_y = 1;
+                        cs->group_z = 1;
+                    } else if (!kl_glfb_compute_stub()) {
+                        cs->group = 0;
+                    } else {
+                        cs->is_tf = 0;
+                        cs->group_x = 1; cs->group_y = 1; cs->group_z = 1;
+                        char *p = strstr(buf, "layout(local_size_x = ");
+                        if (p) sscanf(p, "layout(local_size_x = %d, local_size_y = %d, local_size_z = %d)",
+                                      &cs->group_x, &cs->group_y, &cs->group_z);
+                        else {
+                            p = strstr(buf, "local_size_x = ");
+                            if (p) sscanf(p, "local_size_x = %d", &cs->group_x);
+                        }
+                        cs->group = cs->group_x;
+                        static const char dummy_vs[] =
+                            "#version 300 es\n"
+                            "void main()\n"
+                            "{\n"
+                            "    gl_Position = vec4(0.0);\n"
+                            "}\n";
+                        strcpy(buf, dummy_vs);
+                        fprintf(stderr, "  [glfb] compute shader %u (group %d,%d,%d) stubbed as dummy vertex shader\n",
+                                shader, cs->group_x, cs->group_y, cs->group_z);
+                    }
                     off = strlen(buf);
                     dbg_modified = 1;
                 }
@@ -3746,7 +3801,7 @@ static uint32_t klfb_CreateShader(uint32_t type) {
     kl_glfb_make_current();
     // A compute shader is a vertex shader here; its source is rewritten to match.
     uint32_t asked = type;
-    int cs = type == KLFB_GL_COMPUTE_SHADER && kl_glfb_compute_tf();
+    int cs = type == KLFB_GL_COMPUTE_SHADER && (kl_glfb_compute_tf() || kl_glfb_compute_stub());
     if (cs) type = 0x8B31 /* GL_VERTEX_SHADER */;
     uint32_t name = g_real_CreateShader ? g_real_CreateShader(type) : 0;
     // Say so when ANGLE makes nothing: the guest goes on to source, compile

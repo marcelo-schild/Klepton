@@ -3749,7 +3749,8 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
             const char *t = kl_driver_target_name();
             dflt = kl_env_on("KL_OVRP_EYELEVEL_DEFAULT",
                              t && (strcmp(t, "x2897337400373711") == 0 ||
-                                   strcmp(t, "x3882524545155280") == 0));
+                                   strcmp(t, "x3882524545155280") == 0 ||
+                                   strcmp(t, "x2371757336252737") == 0));
         }
         if (dflt) klovrp_eye_origin_capture(py, "KL_OVRP_EYELEVEL_DEFAULT: the guest starts "
                                                 "EyeLevel, as Unreal does");
@@ -6456,6 +6457,9 @@ static klovrp_vec3 klovrp_GetBoundaryDimensions(void) {
 // to the controllers that are present.
 #define OVRP_CTRL_LTOUCH 0x1u
 #define OVRP_CTRL_RTOUCH 0x2u
+#ifndef OVRP_CTRL_TOUCH
+#define OVRP_CTRL_TOUCH (OVRP_CTRL_LTOUCH | OVRP_CTRL_RTOUCH)
+#endif
 #define OVRP_CTRL_ACTIVE 0x80000000u
 
 // ovrpControllerState prefix, shared by all three versions (field order from
@@ -6543,7 +6547,13 @@ static void fill_controller_state(int mask, void *out, int version) {
         in[0].buttons |= KL_OVRP_RAW_START;
         in[0].touches |= KL_OVRP_RAW_START;
     }
-    w[0] = conn;                                        // ConnectedControllers
+    static int all_connected = -1;
+    if (all_connected < 0) {
+        const char *t = kl_driver_target_name();
+        all_connected = kl_env_on("KL_OVRP_CONNECTED_CONTROLLERS_ALL",
+                                  t && strcmp(t, "x2371757336252737") == 0);
+    }
+    w[0] = all_connected ? (uint32_t)OVRP_CTRL_TOUCH : conn; // ConnectedControllers
     if (conn & OVRP_CTRL_LTOUCH) {
         w[1] |= in[0].buttons;                          // Buttons
         w[2] |= in[0].touches;                          // Touches
@@ -6563,6 +6573,10 @@ static void fill_controller_state(int mask, void *out, int version) {
         f[10] = in[1].stick_x; f[11] = in[1].stick_y;
         if (version >= 2) { f[14] = in[1].stick_x; f[15] = in[1].stick_y; }
         if (version >= 4) b[0x41] = 100;                // RBatteryPercentRemaining
+    }
+    if (all_connected && version >= 4) {
+        b[0x40] = 100;                                  // LBatteryPercentRemaining
+        b[0x41] = 100;                                  // RBatteryPercentRemaining
     }
     // Thumbstick values, logged when non-zero (no flag) so a turning problem is
     // visible: the guest reads the RIGHT stick (f[10]=x, f[11]=y) for turning.

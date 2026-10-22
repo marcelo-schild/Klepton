@@ -1670,8 +1670,11 @@ puts the camera on the ground with its hands underneath it.
   Vulkan) submits one loading quad alone while a level loads, and its eyes
   differed there: no stage is observed on Vulkan, so the stages went round by
   frame counter under the last eye viewport, at the different sizes its
-  dynamic resolution had left them. Default 1 for `x5767635983306831`,
-  `wrath2` and `x24882487241367228`, else 0. While the eye pass is off this way the compositor draws black behind
+  dynamic resolution had left them. Into The Radius 2
+  (`x6605328856182465`, Vulkan) submits three quads alone from its second
+  frame on while it loads, and its picture flickered. Default 1 for
+  `x5767635983306831`, `wrath2`, `x24882487241367228` and
+  `x6605328856182465`, else 0. While the eye pass is off this way the compositor draws black behind
   the frame's quads (a mixed space shows the room wherever no depth was
   written).
 - `KL_OVRP_GL_EYE_FENCE=0|1` — a GL guest's `ovrp_EndFrame4` with an eye layer
@@ -1797,7 +1800,8 @@ puts the camera on the ground with its hands underneath it.
   after the seam reads undefined tile memory, which shows as a picture drawn in
   32x32 tiles, each all there or all missing. Costs the memory of the
   multisampled scene targets. Default 1 for `x5767635983306831` (Skydance's
-  BEHEMOTH), else 0.
+  BEHEMOTH) and `x6605328856182465` (Into The Radius 2, whose main menu showed
+  blocks of garbage, different per eye and per frame, without it), else 0.
 - `KL_VK_PASS_BARRIERS=0|1|2` — what happens to a `vkCmdPipelineBarrier`
   recorded INSIDE a dynamic-rendering pass that only makes colour attachments
   readable as input attachments. MoltenVK answers one by ending the Metal pass

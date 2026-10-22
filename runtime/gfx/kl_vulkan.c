@@ -4314,12 +4314,20 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
     // captures). Without the bit MoltenVK offers only real memory for the image,
     // so what a split pass stores is there when it loads. The cost is the
     // memory a tiler did not need — the multisampled scene targets at eye size.
-    //   default 1 for that title, else 0
+    // Into The Radius 2 (x6605328856182465, UE 5.5 mobile, 4x MSAA, a
+    // subpass-input reader) the same way: from its main menu on, both eyes
+    // showed the picture in blocks of garbage — other passes' contents, noise —
+    // different per eye and per frame, read as flicker even holding still
+    // (2026-10-20, eye captures). With the bit dropped (its 3840x2464 two-layer
+    // colour and depth) the menu was clean on the headset, 4.7 GB still free.
+    //   default 1 for those two titles, else 0
     static int no_transient = -1;
     if (no_transient < 0) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
-        no_transient = kl_env_on("KL_VK_NO_TRANSIENT", t && !strcmp(t, "x5767635983306831"));
+        no_transient = kl_env_on("KL_VK_NO_TRANSIENT",
+                                 t && (!strcmp(t, "x5767635983306831") ||
+                                       !strcmp(t, "x6605328856182465")));
     }
     if (ci && (ci->usage & 0x40u) && no_transient) {
         mod = *ci;

@@ -4917,16 +4917,21 @@ static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submit
     // behind that quad the stages went round by frame counter, under the last
     // eye viewport — and its dynamic resolution had left the three stages at
     // different sizes (2271x2400 in one, 1589x1680 in the others).
-    //   default 1 for x5767635983306831, wrath2 and x24882487241367228, else 0
-    //   (every other OVRPlugin guest is left with the eye pass always on, as
-    //   before)
+    // Into The Radius 2 (x6605328856182465, UE 5.5, Vulkan) too: one frame
+    // with its eye layer, then three quads alone (layers 2-4, a 4096x4096 at
+    // 600 m and two 256x256 at 150 m) from the next frame on while it loads,
+    // and the picture flickered (2026-10-20).
+    //   default 1 for x5767635983306831, wrath2, x24882487241367228 and
+    //   x6605328856182465, else 0 (every other OVRPlugin guest is left with the
+    //   eye pass always on, as before)
     static int eyeless = -1;
     if (eyeless < 0) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
         eyeless = kl_env_on("KL_OVRP_EYELESS_FRAMES",
                             t && (!strcmp(t, "x5767635983306831") || !strcmp(t, "wrath2") ||
-                                  !strcmp(t, "x24882487241367228")));
+                                  !strcmp(t, "x24882487241367228") ||
+                                  !strcmp(t, "x6605328856182465")));
     }
     if (eyeless && layer_submits && layer_submit_count > 0) {
         kl_ovrp_eye_layer_external(named >= 0);

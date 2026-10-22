@@ -3144,10 +3144,20 @@ static int plat_is_launch_field(const char *name) {
 // elements, which is an array we did not produce, so it keeps the fail-closed
 // default and would stop the run by name rather than hand back a User the guest
 // would then read fields off.
+//
+// HasNextPage / HasPreviousPage are the native SDK's spelling of GetNextUrl:
+// UE's OnlineSubsystemOculus reads GetSize and then asks HasNextPage before it
+// completes the query. Every list we hand out is the whole list, so "no other
+// page" is the true answer. Into The Radius 2 (x6605328856182465, UE 5.5) asks
+// ovr_AchievementProgressArray_HasNextPage on the empty progress array of
+// Achievements_GetAllProgress on its first frame; without this the name had no
+// answer and ended the run. Purchase arrays never reach here: plat_is_drm runs
+// first and keeps ovr_PurchaseArray_HasNextPage refused.
 static int plat_is_empty_array(const char *name) {
-    const char *p = strstr(name, "Array_Get");
+    const char *p = strstr(name, "Array_");
     if (!p) return 0;
-    return strcmp(p, "Array_GetSize") == 0 || strcmp(p, "Array_GetNextUrl") == 0;
+    return strcmp(p, "Array_GetSize") == 0 || strcmp(p, "Array_GetNextUrl") == 0 ||
+           strcmp(p, "Array_HasNextPage") == 0 || strcmp(p, "Array_HasPreviousPage") == 0;
 }
 
 static uint64_t klplat_empty_array(const char *name) {

@@ -28,6 +28,14 @@ int main(void) {
                  kl_ovrplat_offline_user_for(NULL) == 0;
     printf("%s: the offline user is offered to listed titles only\n", listed ? "PASS" : "FAIL");
     ok = ok && listed;
+    // An empty list has no other page: UE asks HasNextPage after GetSize (Into
+    // The Radius 2).
+    typedef int (*has_page_fn)(const void *);
+    has_page_fn next = (has_page_fn)kl_ovrplat_sym("ovr_AchievementProgressArray_HasNextPage");
+    has_page_fn prev = (has_page_fn)kl_ovrplat_sym("ovr_LeaderboardEntryArray_HasPreviousPage");
+    int paged = next && prev && next(NULL) == 0 && prev(NULL) == 0;
+    printf("%s: an empty list has no next or previous page\n", paged ? "PASS" : "FAIL");
+    ok = ok && paged;
     printf("%s: no completion lost, no held message rewritten, no slot torn, pool bounded\n",
            ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

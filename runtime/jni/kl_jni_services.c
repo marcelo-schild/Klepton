@@ -1533,8 +1533,37 @@ static klj_val klj_PackageInfo_getLongVersionCode(void *env, void *self,
 }
 
 // PackageInfo, like ApplicationInfo, is read field-by-field.
+// Packages other than the guest itself (such as Meta Quest system packages like
+// com.oculus.shellenv or com.oculus.vrshell) are queried by games like Warplanes: WW1
+// Fighters to check the Quest system version (GetQuestSystemVersion). When handed the
+// guest's own versionCode/versionName instead, it sees version 4 (< minRequiredQuestSystemVersion)
+// and aborts loading on a black screen.
 static klj_val klj_PM_getPackageInfo(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
+    (void)env; (void)self;
+    const char *pkg = (n > 0 && a[0].l) ? klj_str(a[0].l) : NULL;
+    if (pkg && (strcmp(pkg, "com.oculus.shellenv") == 0 ||
+                strcmp(pkg, "com.oculus.vrshell") == 0 ||
+                strcmp(pkg, "com.oculus.systemux") == 0)) {
+        static void *shell_pi;
+        if (!shell_pi) {
+            shell_pi = kl_jni_new_object("android/content/pm/PackageInfo");
+            klj_as_object(shell_pi)->pinned = 1;
+            void *cls = klj_class_object("android/content/pm/PackageInfo");
+            void *jname = kl_jni_new_string("60.0.0.0");
+            klj_as_object(jname)->pinned = 1;
+            void *jpkg = kl_jni_new_string(pkg);
+            klj_as_object(jpkg)->pinned = 1;
+            klj_field_store(shell_pi, klj_want(cls, "versionName", "Ljava/lang/String;", 'f'),
+                            (klj_val){.l = jname});
+            klj_field_store(shell_pi, klj_want(cls, "versionCode", "I", 'f'),
+                            (klj_val){.j = 600000000});
+            klj_field_store(shell_pi, klj_want(cls, "packageName", "Ljava/lang/String;", 'f'),
+                            (klj_val){.l = jpkg});
+        }
+        KLJ_LOG("PackageManager.getPackageInfo(\"%s\") -> shell PackageInfo (versionName=60.0.0.0 versionCode=600000000)", pkg);
+        return (klj_val){.l = shell_pi};
+    }
+    KLJ_LOG("PackageManager.getPackageInfo(\"%s\") -> guest PackageInfo", pkg ? pkg : "");
     static void *pi;
     return klj_singleton("android/content/pm/PackageInfo", &pi);
 }

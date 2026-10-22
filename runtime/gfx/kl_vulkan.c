@@ -193,6 +193,7 @@ static void *mvk_open(void) {
 static void *g_mvk;
 static PFN_vkGetInstanceProcAddr real_gipa;
 static PFN_vkGetDeviceProcAddr   real_gdpa;
+static int klvk_logic_op_on(void);   // KL_VK_LOGIC_OP, defined with klvk_feature_surgery
 
 // Pipeline-object hooks (kl_vk_pipe_hooks.h): an add-on records every sampler,
 // layout, shader module, render pass and pipeline the guest creates, and
@@ -249,6 +250,7 @@ static void vk_init(void) {
         if (kl_env_on("KL_MVK_COMPILE_TIMEOUT", def))
             setenv("MVK_CONFIG_METAL_COMPILE_TIMEOUT", "10000000000", 0); // 10 s
     }
+
 
     // wanderer black world: a MoltenVK/SPIRV-Cross argument-buffer codegen bug. A
     // fragment material referencing TWO Material Parameter Collections (two dynamic
@@ -333,6 +335,7 @@ typedef struct {
     VkPhysicalDevice  phys;
     uint32_t          queue_family;
     VkQueue           queue;          // for the acquire signal + the capture submit
+    uint32_t          spread;         // queues of family 0 spread over families 0..n-1 (klvk_queue_spread)
     PFN_vkGetDeviceQueue              GetDeviceQueue;
     PFN_vkCreateImage                 CreateImage;
     PFN_vkDestroyImage                DestroyImage;
@@ -442,6 +445,28 @@ static klvk_device *dev_find(VkDevice d) {
     for (int i = 0; i < g_ndev; i++) if (g_devs[i]->dev == d) return g_devs[i];
     return NULL;
 }
+// Queue spread, for HITMAN 3 VR: Reloaded (x8012387035448196). Its engine
+// (SVulkan::selectVulkanPhysicalDevice) takes only a queue family with graphics
+// and compute AND more than two queues, and asks for three of them. MoltenVK
+// offers four identical families of ONE queue each, so the engine found "No
+// capable Vulkan physical device", went on with the OpenXR device anyway and
+// fetched queue 1 of family 0, which does not exist: SIGSEGV in MoltenVK's
+// vkGetDeviceQueue (Mac run 2026-10-20). With the spread on, family 0 reports
+// as many queues as there are families like it, a request for k queues of
+// family 0 becomes one queue in each of families 0..k-1, and queue i of family
+// 0 is family i's queue. MoltenVK's families are all the same Metal device and
+// command buffers are bound to a queue only at submit, so the work lands where
+// it would have. KL_VK_QUEUE_SPREAD overrides.
+static int klvk_queue_spread_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_VK_QUEUE_SPREAD", t && !strcmp(t, "x8012387035448196"));
+    }
+    return on;
+}
+
 static klvk_device *dev_of_queue(VkQueue q) {
     // Queues are opaque; the guest may use one we never fetched. With a single
     // device — which is every case here — the answer is unambiguous.
@@ -971,6 +996,22 @@ static void dev_resolve(klvk_device *d) {
 // however many leading fields it overwrites is how many flags the struct has.
 #define KLVK_FEAT_SENTINEL 0xA5A5A5A5u
 #define KLVK_FEAT_WORDS    256
+// KL_VK_LOGIC_OP (default on for HITMAN 3 VR: Reloaded): its light culling
+// (lightculling.frag) ORs each light's bit into a tile mask with VK_LOGIC_OP_OR
+// on a uint target. Without logic ops every light overwrote the tile, tiles kept
+// only their last light, and the level showed dark regions with stepped edges
+// (Mac, 2026-10-20). MoltenVK reports no logicOp (it is built without private
+// API), so the operation is set on the Metal pipeline underneath it
+// (kl_mtl_logic_op_next, kl_mtl_busy.m) while the Vulkan pipeline is created.
+static int klvk_logic_op_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_VK_LOGIC_OP", t && !strcmp(t, "x8012387035448196"));
+    }
+    return on;
+}
 static void klvk_feature_surgery(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci) {
     PFN_vkGetPhysicalDeviceFeatures2 get = (PFN_vkGetPhysicalDeviceFeatures2)
         real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2");
@@ -1069,6 +1110,38 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
 
     VkDeviceCreateInfo mine = ci ? *ci : (VkDeviceCreateInfo){
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
+    // Queue spread (klvk_queue_spread_on): k queues of family 0 become one
+    // queue in each of families 0..k-1, unless the guest names one of those
+    // families itself.
+    VkDeviceQueueCreateInfo spread_qci[16];
+    uint32_t spread = 0;
+    if (ci && klvk_queue_spread_on()) {
+        for (uint32_t i = 0; i < ci->queueCreateInfoCount; i++) {
+            const VkDeviceQueueCreateInfo *q = &ci->pQueueCreateInfos[i];
+            if (q->queueFamilyIndex == 0 && q->queueCount > 1) spread = q->queueCount;
+        }
+        for (uint32_t i = 0; spread && i < ci->queueCreateInfoCount; i++) {
+            uint32_t f = ci->pQueueCreateInfos[i].queueFamilyIndex;
+            if (f != 0 && f < spread) spread = 0;
+        }
+        if (spread && spread + ci->queueCreateInfoCount <= 16) {
+            uint32_t n = 0;
+            for (uint32_t i = 0; i < ci->queueCreateInfoCount; i++) {
+                const VkDeviceQueueCreateInfo *q = &ci->pQueueCreateInfos[i];
+                if (q->queueFamilyIndex != 0) { spread_qci[n++] = *q; continue; }
+                for (uint32_t k = 0; k < spread; k++) {
+                    spread_qci[n] = *q;
+                    spread_qci[n].queueFamilyIndex = k;
+                    spread_qci[n].queueCount = 1;
+                    spread_qci[n].pQueuePriorities = q->pQueuePriorities ? &q->pQueuePriorities[k] : NULL;
+                    n++;
+                }
+            }
+            mine.queueCreateInfoCount = n;
+            mine.pQueueCreateInfos = spread_qci;
+            VKI("queue spread: %u queues of family 0 -> one in each of families 0..%u\n", spread, spread - 1);
+        } else spread = 0;
+    }
     mine.enabledExtensionCount = keep.n;
     mine.ppEnabledExtensionNames = keep.names;
     mine.enabledLayerCount = 0;
@@ -1083,6 +1156,7 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     d->dev = *out;
     d->phys = phys;
     d->queue_family = ci && ci->queueCreateInfoCount ? ci->pQueueCreateInfos[0].queueFamilyIndex : 0;
+    d->spread = spread;
     dev_resolve(d);
     // Foveation of the guest's scene pass, underneath MoltenVK (KL_VK_FOVEATE;
     // kl_mtl_foveate.m). Nothing happens unless it is asked for.
@@ -1458,7 +1532,24 @@ static int cap_prepare(klvk_device *d, VkDeviceSize need) {
     return 1;
 }
 
-static const char *cap_dir(void) { return kl_env_str("KL_VK_OUT", NULL); }
+// "~/..." is taken from $HOME: on a headset the app's container, whose path
+// changes with every install, so a launch can name its Documents folder
+// without knowing it (KL_VK_OUT=~/Documents/vkout).
+static const char *cap_dir(void) {
+    static char buf[1024];
+    static int done;
+    static const char *dir;
+    if (!done) {
+        done = 1;
+        dir = kl_env_str("KL_VK_OUT", NULL);
+        const char *home = getenv("HOME");
+        if (dir && dir[0] == '~' && dir[1] == '/' && home && *home) {
+            snprintf(buf, sizeof buf, "%s%s", home, dir + 1);
+            dir = buf;
+        }
+    }
+    return dir;
+}
 
 // Copy any image out and write it as a PNG.
 //
@@ -3866,7 +3957,7 @@ static unsigned g_prof_pass_barriers, g_prof_pass_barriers_dropped;
 #define KLVK_FS_SLOTS 8192u
 static struct { uint64_t key; uint32_t hash; } g_fs_mod[KLVK_FS_SLOTS], g_fs_pipe[KLVK_FS_SLOTS];
 static struct { uint32_t hash; uint32_t draws; } g_fs_count[2048];
-static uint32_t g_fs_skip[512];
+static uint32_t g_fs_skip[2048];
 static int g_fs_nskip = -1, g_fs_stats = -1;
 static __thread uint32_t t_fs_hash;
 static __thread int t_fs_skip;
@@ -3909,7 +4000,11 @@ static int klvk_fs_on(void) {
         g_fs_nskip = n;
         if (n) fprintf(stderr, "  [vk] KL_VK_SKIP_FS: draws of %d fragment shader(s) are dropped\n", n);
     }
-    return g_fs_nskip > 0 || g_fs_stats > 0;
+    static int sct = -1;
+    if (sct < 0) sct = kl_env_str("KL_VK_SCISSOR_TRACE", NULL) != NULL ||
+                       kl_env_str("KL_VK_NO_STENCIL_FS", NULL) != NULL ||
+                       kl_env_str("KL_VK_VI_TRACE_FS", NULL) != NULL;
+    return g_fs_nskip > 0 || g_fs_stats > 0 || sct;
 }
 // KL_VK_DESC_TRACE=1: for a few frames well into a run, the order in which a
 // recording thread updates descriptor sets, binds them and draws, from the
@@ -3959,12 +4054,95 @@ static void klvk_after_note(uint32_t hash, int start) {
     }
     if (t_after_n >= 0 && t_after_n < 24) t_after_seq[t_after_n++] = hash;
 }
+// KL_VK_SCISSOR_TRACE=<hash>,...: for draws whose fragment shader has one of
+// these hashes (KL_VK_FS_STATS's), the scissor and viewport set last on the
+// recording thread, for the first 80 such draws (after KL_VK_FS_FROM). Written
+// for HITMAN 3 VR: Reloaded's Scaleform board, which a headset showed cut into
+// screen-aligned steps (2026-10-21).
+static __thread VkRect2D t_sc[4];
+static __thread uint32_t t_sc_first, t_sc_n;
+static __thread VkViewport t_vp[4];
+static __thread uint32_t t_vp_first, t_vp_n;
+static void VKAPI_CALL klvk_CmdSetScissor(void *cb, uint32_t first, uint32_t n, const VkRect2D *r) {
+    static void (*real)(void *, uint32_t, uint32_t, const VkRect2D *);
+    if (!real && real_gdpa) real = (void (*)(void *, uint32_t, uint32_t, const VkRect2D *))
+        real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdSetScissor");
+    t_sc_first = first; t_sc_n = n < 4 ? n : 4;
+    for (uint32_t i = 0; r && i < t_sc_n; i++) t_sc[i] = r[i];
+    if (real) real(cb, first, n, r);
+}
+static void VKAPI_CALL klvk_CmdSetViewport(void *cb, uint32_t first, uint32_t n, const VkViewport *v) {
+    static void (*real)(void *, uint32_t, uint32_t, const VkViewport *);
+    if (!real && real_gdpa) real = (void (*)(void *, uint32_t, uint32_t, const VkViewport *))
+        real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdSetViewport");
+    t_vp_first = first; t_vp_n = n < 4 ? n : 4;
+    for (uint32_t i = 0; v && i < t_vp_n; i++) t_vp[i] = v[i];
+    if (real) real(cb, first, n, v);
+}
+static void klvk_scissor_trace(uint32_t hash) {
+    static uint32_t list[32];
+    static int n = -1;
+    static unsigned said;
+    if (n < 0) {
+        n = 0;
+        const char *e = kl_env_str("KL_VK_SCISSOR_TRACE", NULL);
+        while (e && *e && n < 32) {
+            char *end = NULL;
+            unsigned long v = strtoul(e, &end, 16);
+            if (end == e) break;
+            list[n++] = (uint32_t)v;
+            e = *end == ',' ? end + 1 : end;
+        }
+    }
+    if (!n || said >= 80) return;
+    int hit = 0;
+    for (int i = 0; i < n; i++) if (list[i] == hash) hit = 1;
+    if (!hit) return;
+    // Only scissors that cut something: a full-frame one says nothing.
+    int cut = 0;
+    for (uint32_t i = 0; i < t_sc_n && i < t_vp_n; i++) {
+        int vw = (int)(t_vp[i].width < 0 ? -t_vp[i].width : t_vp[i].width);
+        int vh = (int)(t_vp[i].height < 0 ? -t_vp[i].height : t_vp[i].height);
+        if ((int)t_sc[i].extent.width < vw || (int)t_sc[i].extent.height < vh || t_sc[i].offset.x || t_sc[i].offset.y) cut = 1;
+    }
+    if (!cut) return;
+    said++;
+    char sc[256] = "", vp[256] = "";
+    size_t o = 0;
+    for (uint32_t i = 0; i < t_sc_n && o + 48 < sizeof sc; i++)
+        o += (size_t)snprintf(sc + o, sizeof sc - o, " [%u] %dx%d+%d+%d", t_sc_first + i, (int)t_sc[i].extent.width,
+                              (int)t_sc[i].extent.height, t_sc[i].offset.x, t_sc[i].offset.y);
+    o = 0;
+    for (uint32_t i = 0; i < t_vp_n && o + 48 < sizeof vp; i++)
+        o += (size_t)snprintf(vp + o, sizeof vp - o, " [%u] %.0fx%.0f+%.0f+%.0f", t_vp_first + i, (double)t_vp[i].width,
+                              (double)t_vp[i].height, (double)t_vp[i].x, (double)t_vp[i].y);
+    VKI("scissor trace %08x: scissor%s | viewport%s\n", hash, sc[0] ? sc : " (none set)", vp[0] ? vp : " (none set)");
+}
+
+// KL_VK_FS_FROM=<seconds>: both of the knobs above start that long after the
+// first draw — so a player can walk to the place in question with every shader
+// there, and the count is of that place alone. HITMAN 3 VR: Reloaded's window
+// in its tutorial's third room, found on the headset (2026-10-21).
+static int klvk_fs_armed(void) {
+    static int armed = -1;
+    static double from, t0;
+    if (armed > 0) return 1;
+    if (armed < 0) { from = kl_env_float("KL_VK_FS_FROM", 0.0f); armed = from > 0 ? 0 : 1; if (armed) return 1; }
+    double now = klvk_prof_now();
+    if (t0 == 0) t0 = now;
+    if (now - t0 < from) return 0;
+    armed = 1;
+    VKI("KL_VK_FS_FROM: counting and dropping fragment shaders from %.0f s on\n", from);
+    return 1;
+}
 // At a draw: 1 if it is to be dropped.
 static int klvk_fs_draw(void) {
     KFE(KFE_DRAW);
     klvk_after_note(t_fs_hash, 0);
     klvk_ev(" D%08llx", t_fs_hash, 0);
     if (!klvk_fs_on()) return 0;
+    if (!klvk_fs_armed()) return 0;
+    klvk_scissor_trace(t_fs_hash);
     if (g_fs_stats > 0) {
         if (!t_fs_hash) t_fs_hash = 0xffffffffu;        // a pipeline whose fragment shader is not known
         for (unsigned i = 0; i < sizeof g_fs_count / sizeof *g_fs_count; i++) {
@@ -3995,6 +4173,9 @@ static void klvk_fs_tick(void) {
 
 #define KLVK_SUBPASS_SLOTS 4096u
 static uint64_t g_subpass_mod[KLVK_SUBPASS_SLOTS], g_subpass_pipe[KLVK_SUBPASS_SLOTS];
+// Vertex shader modules of Scaleform (their uniform block is named
+// SCALEFORM_CONSTANTS_BLOCK): see klvk_vi_norm.
+static uint64_t g_sf_mod[KLVK_SUBPASS_SLOTS];
 // 1x1 images and the views of them: what a guest binds where it has to bind
 // SOMETHING (klvk_input_att_fix). A set of their own, because the general image
 // and view tables of this file are full after a few thousand entries — which a
@@ -4647,6 +4828,10 @@ static void kl_pipe_report(const char *kind, unsigned n, double dt_ms) {
 static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
         VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *ci,
         const VkAllocationCallbacks *alloc, VkPipeline *out);
+// The dynamic-vertex-input emulation, defined after the async-pipeline block it borrows from.
+static int klvk_vi_on(void);
+static int klvk_vi_dynamic(const VkGraphicsPipelineCreateInfo *ci);
+static VkResult klvk_vi_defer(VkDevice dev, const VkGraphicsPipelineCreateInfo *ci, VkPipeline *out);
 static unsigned g_subpass_pipes;
 static VkResult klvk_ap_create(VkDevice dev, VkPipelineCache cache, uint32_t n,
         const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *alloc, VkPipeline *out);
@@ -4807,8 +4992,11 @@ static int klvk_vin_on(void) {
     if (on < 0) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
+        // HITMAN 3 VR: Reloaded's title screen has one (in_pos at location 2 of a
+        // two-attribute layout set with vkCmdSetVertexInputEXT, Mac 2026-10-20).
         on = kl_env_on("KL_VK_VIN_FILL", t && (!strcmp(t, "x24882487241367228") ||
-                                              !strcmp(t, "x5245041552210029")));
+                                              !strcmp(t, "x5245041552210029") ||
+                                              !strcmp(t, "x8012387035448196")));
     }
     return on;
 }
@@ -5076,6 +5264,61 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
     if (!real && real_gdpa)
         real = (PFN_vkCreateGraphicsPipelines)real_gdpa(dev, "vkCreateGraphicsPipelines");
 
+    // KL_VK_PIPE_DESCRIBE=1: which parts of each create info are absent, its
+    // dynamic states and its pNext types — what to look at when MoltenVK faults
+    // inside newMTLRenderPipelineDescriptor on a NULL member.
+    if (ci && kl_env_on("KL_VK_PIPE_DESCRIBE", 0)) {
+        for (uint32_t i = 0; i < n; i++) {
+            const VkGraphicsPipelineCreateInfo *c = &ci[i];
+            fprintf(stderr, "  [vk] pipeline %u/%u: stages %u vi %d ia %d tess %d vp %d rs %d ms %d ds %d cb %d dyn %d rp %p sub %u flags %#x",
+                    i, n, c->stageCount, !!c->pVertexInputState, !!c->pInputAssemblyState,
+                    !!c->pTessellationState, !!c->pViewportState, !!c->pRasterizationState,
+                    !!c->pMultisampleState, !!c->pDepthStencilState, !!c->pColorBlendState,
+                    !!c->pDynamicState, (void *)c->renderPass, c->subpass, (unsigned)c->flags);
+            if (c->pDepthStencilState) {
+                const VkPipelineDepthStencilStateCreateInfo *d = c->pDepthStencilState;
+                fprintf(stderr, " ds.test %u write %u cmp %d bounds %u stencil %u f(%d/%d/%d cmp %d rm %#x wm %#x ref %u)",
+                        d->depthTestEnable, d->depthWriteEnable, (int)d->depthCompareOp, d->depthBoundsTestEnable,
+                        d->stencilTestEnable, (int)d->front.failOp, (int)d->front.passOp, (int)d->front.depthFailOp,
+                        (int)d->front.compareOp, d->front.compareMask, d->front.writeMask, d->front.reference);
+            }
+            if (c->pRasterizationState)
+                fprintf(stderr, " rs.bias %u %.3f/%.3f/%.3f cull %d",
+                        c->pRasterizationState->depthBiasEnable, (double)c->pRasterizationState->depthBiasConstantFactor,
+                        (double)c->pRasterizationState->depthBiasSlopeFactor, (double)c->pRasterizationState->depthBiasClamp,
+                        (int)c->pRasterizationState->cullMode);
+            if (c->pViewportState) fprintf(stderr, " vp.n %u sc.n %u", c->pViewportState->viewportCount, c->pViewportState->scissorCount);
+            if (c->pColorBlendState) fprintf(stderr, " cb.att %u logicop %u/%d blend0 %d wmask0 %#x", c->pColorBlendState->attachmentCount,
+                                             c->pColorBlendState->logicOpEnable, (int)c->pColorBlendState->logicOp,
+                                             c->pColorBlendState->attachmentCount && c->pColorBlendState->pAttachments ? (int)c->pColorBlendState->pAttachments[0].blendEnable : -1,
+                                             c->pColorBlendState->attachmentCount && c->pColorBlendState->pAttachments ? (unsigned)c->pColorBlendState->pAttachments[0].colorWriteMask : 0);
+            for (uint32_t k = 0; c->pDynamicState && k < c->pDynamicState->dynamicStateCount; k++)
+                fprintf(stderr, "%s%d", k ? "," : " dyn=", (int)c->pDynamicState->pDynamicStates[k]);
+            for (const VkBaseInStructure *x = c->pNext; x; x = x->pNext) fprintf(stderr, " next=%d", (int)x->sType);
+            for (uint32_t k = 0; k < c->stageCount && c->pStages; k++)
+                if (c->pStages[k].stage == VK_SHADER_STAGE_FRAGMENT_BIT && klvk_fs_on())
+                    fprintf(stderr, " fs %08x", klvk_fs_get(g_fs_mod, (uint64_t)(uintptr_t)c->pStages[k].module));
+            fprintf(stderr, "\n");
+        }
+    }
+
+    // A pipeline whose vertex input is dynamic (VK_EXT_vertex_input_dynamic_state,
+    // which MoltenVK does not have) is not compiled here: it becomes a handle of
+    // ours, compiled once per vertex layout when the guest sets one (klvk_vi_*).
+    if (ci && klvk_vi_on()) {
+        int any = 0;
+        for (uint32_t i = 0; i < n; i++) any |= klvk_vi_dynamic(&ci[i]);
+        if (any) {
+            VkResult first = VK_SUCCESS;
+            for (uint32_t i = 0; i < n; i++) {
+                VkResult r = klvk_vi_dynamic(&ci[i]) ? klvk_vi_defer(dev, &ci[i], &out[i])
+                                                     : klvk_CreateGraphicsPipelines0(dev, cache, 1, &ci[i], alloc, &out[i]);
+                if (r != VK_SUCCESS && first == VK_SUCCESS) first = r;
+            }
+            return first;
+        }
+    }
+
     // KL_VK_FIX_PRIMRESTART (default ON): Metal cannot DISABLE primitive restart
     // for strip/fan topologies, so MoltenVK rejects a strip pipeline that sets
     // primitiveRestartEnable=FALSE with VK_ERROR_FEATURE_NOT_PRESENT and leaves a
@@ -5198,6 +5441,25 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
         fflush(stderr);
     }
     double t0 = kl_pipe_ms();
+    // A logic operation MoltenVK would drop (KL_VK_LOGIC_OP): set on the Metal
+    // pipeline it is about to create, from underneath (kl_mtl_logic_op_next).
+    int logic = -1;
+    if (n == 1 && use && use[0].pColorBlendState && use[0].pColorBlendState->logicOpEnable && klvk_logic_op_on()) {
+        // Vulkan's order -> Apple's (see kl_mtl_busy.m)
+        static const int vk2mtl[16] = { 0 /*CLEAR*/, 6 /*AND*/, 12 /*AND_REVERSE*/, 2 /*COPY*/, 13 /*AND_INVERTED*/,
+                                        4 /*NO_OP*/, 10 /*XOR*/, 8 /*OR*/, 9 /*NOR*/, 11 /*EQUIVALENT*/, 5 /*INVERT*/,
+                                        14 /*OR_REVERSE*/, 3 /*COPY_INVERTED*/, 15 /*OR_INVERTED*/, 7 /*NAND*/, 1 /*SET*/ };
+        unsigned vop = (unsigned)use[0].pColorBlendState->logicOp;
+        if (vop < 16) {
+            static int installed;
+            if (!installed) { installed = 1; extern int kl_mtl_busy_install(void); kl_mtl_busy_install(); }
+            logic = vk2mtl[vop];
+            extern void kl_mtl_logic_op_next(int);
+            kl_mtl_logic_op_next(logic);
+            static int said;
+            if (said++ < 3) VKI("logic op %u (Metal %d) for a pipeline being created (KL_VK_LOGIC_OP)\n", vop, logic);
+        }
+    }
     VkResult r = real ? real(dev, cache, n, use, alloc, out)
                       : VK_ERROR_INITIALIZATION_FAILED;
     if (r < 0 && real && use && out && klvk_vin_on()) {
@@ -5208,6 +5470,7 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
         }
         if (!left) r = VK_SUCCESS;
     }
+    if (logic >= 0) { extern void kl_mtl_logic_op_next(int); kl_mtl_logic_op_next(-1); }
     if (pipe_trace) { VKI("pipe-trace: DONE through #%llu (r=%d)\n", g_pipe_enter, (int)r); fflush(stderr); }
     free(mod); free(ias); free(mss); free(masks);
     if (fixed) { static int said; if (said < 8) { said++;
@@ -5523,8 +5786,24 @@ static int klvk_ap_clone(klvk_ap_arena *a, const VkGraphicsPipelineCreateInfo *c
         o->field = klvk_ap_dup(a, ci->field, sizeof *ci->field); \
     }
     KLVK_AP_POD(pInputAssemblyState, "input assembly state")
-    KLVK_AP_POD(pRasterizationState, "rasterization state")
     KLVK_AP_POD(pDepthStencilState, "depth/stencil state")
+    if (ci->pRasterizationState) {
+        // Its one known chain member: depth clip (VK_EXT_depth_clip_enable, plain
+        // values) — HITMAN 3 VR: Reloaded chains it on every pipeline.
+        VkPipelineRasterizationStateCreateInfo *rs = klvk_ap_dup(a, ci->pRasterizationState, sizeof *rs);
+        if (!rs) return 0;
+        rs->pNext = NULL;
+        const void **rtail = &rs->pNext;
+        for (const VkBaseInStructure *x = ci->pRasterizationState->pNext; x; x = x->pNext) {
+            if (x->sType != VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT) {
+                klvk_ap_unknown("rasterization state", x); return 0; }
+            VkPipelineRasterizationDepthClipStateCreateInfoEXT *dc = klvk_ap_dup(a, x, sizeof *dc);
+            if (!dc) return 0;
+            dc->pNext = NULL;
+            *rtail = dc; rtail = &dc->pNext;
+        }
+        o->pRasterizationState = rs;
+    }
     o->pTessellationState = NULL;
     if (stages & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)) {
         KLVK_AP_POD(pTessellationState, "tessellation state")
@@ -5793,6 +6072,493 @@ static uint64_t klvk_ap_bind(void *cb, uint32_t bindPoint, uint64_t pipeline, in
     *drop = 1;
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// VK_EXT_vertex_input_dynamic_state, emulated (KL_VK_VI_EMU, default on; it only
+// ever touches pipelines that name VK_DYNAMIC_STATE_VERTEX_INPUT_EXT).
+//
+// HITMAN 3 VR: Reloaded (x8012387035448196, IOI's Glacier on a Quest) creates
+// every graphics pipeline WITHOUT a vertex input state and sets the layout per
+// draw with vkCmdSetVertexInputEXT — without even enabling the extension, which
+// the Quest's driver has and MoltenVK does not. MoltenVK built the Metal
+// pipeline descriptor from the missing state and faulted
+// (MVKGraphicsPipeline::initShaderConversionConfig, Mac run 2026-10-20).
+//
+// So such a pipeline is not compiled when it is created. The guest gets a
+// handle of ours holding a copy of the create info (klvk_ap_clone, the async
+// layer's deep copy) with the vertex-input dynamic state taken out; each layout
+// the guest sets while it is bound is compiled once into a real pipeline (a
+// variant) and bound in its place. A command buffer remembers the deferred
+// pipeline and the last layout, so the variant is bound on whichever of the two
+// calls comes second, and draws in between are left out (klvk_ap_mark), as for
+// a pipeline still compiling. The fragment-shading-rate dynamic state goes out
+// with it: MoltenVK has no shading rates either, and the guest's
+// vkCmdSetFragmentShadingRateKHR is already a no-op here. Binding divisors
+// other than 1 are not applied (said once). Shader modules a deferred pipeline
+// uses outlive the guest's vkDestroyShaderModule until the pipeline goes, since
+// a variant may be compiled long after the guest is done with its modules.
+// Costs: a Metal compile on the recording thread the first time a layout meets
+// a pipeline.
+#define KLVK_VI_MAX   32768u
+#define KLVK_VI_MAXB  16u
+#define KLVK_VI_MAXA  32u
+typedef struct { uint32_t nb, na, hash;
+                 VkVertexInputBindingDescription b[KLVK_VI_MAXB];
+                 VkVertexInputAttributeDescription a[KLVK_VI_MAXA]; } klvk_vi_layout;
+typedef struct klvk_vi_var { klvk_vi_layout l; uint64_t real; struct klvk_vi_var *next; } klvk_vi_var;
+typedef struct {
+    VkDevice dev;
+    VkGraphicsPipelineCreateInfo ci;   // owns what it points to (mem)
+    klvk_ap_arena mem;
+    klvk_vi_var *vars;
+    unsigned nvars;
+    pthread_mutex_t mu;
+} klvk_vipipe;
+static klvk_vipipe *g_vi_slot[KLVK_VI_MAX];
+static unsigned g_vi_next, g_vi_live;
+static pthread_mutex_t g_vi_mu = PTHREAD_MUTEX_INITIALIZER;
+static __thread int t_vi_internal;     // klvk_CmdBindPipeline called by the emulation itself
+
+static int klvk_vi_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_VK_VI_EMU", 1);
+    return on;
+}
+static int klvk_vi_dynamic(const VkGraphicsPipelineCreateInfo *ci) {
+    if (!ci->pDynamicState) return 0;
+    for (uint32_t k = 0; k < ci->pDynamicState->dynamicStateCount; k++)
+        if (ci->pDynamicState->pDynamicStates[k] == VK_DYNAMIC_STATE_VERTEX_INPUT_EXT) return 1;
+    return 0;
+}
+static klvk_vipipe *klvk_vi_from(uint64_t h) {
+    uintptr_t p = (uintptr_t)h, b = (uintptr_t)g_vi_slot;
+    if (p < b || p >= b + sizeof g_vi_slot || (p - b) % sizeof *g_vi_slot) return NULL;
+    return *(klvk_vipipe **)p;
+}
+
+// Shader modules held for deferred pipelines: count, and whether the guest has
+// already destroyed it (then it goes with its last pipeline).
+#define KLVK_VI_MODS 8192u
+static struct { uint64_t mod; unsigned refs; int dead; VkDevice dev; } g_vi_mod[KLVK_VI_MODS];
+static void klvk_vi_mod_ref(VkDevice dev, uint64_t mod, int delta) {
+    if (!mod) return;
+    uint64_t gone = 0;
+    pthread_mutex_lock(&g_vi_mu);
+    uint32_t i = (uint32_t)((mod >> 4) * 2654435761u) % KLVK_VI_MODS, free_at = KLVK_VI_MODS;
+    for (uint32_t n = 0; n < KLVK_VI_MODS; n++, i = (i + 1) % KLVK_VI_MODS) {
+        if (g_vi_mod[i].mod == mod) { free_at = i; break; }
+        if (!g_vi_mod[i].mod) { if (delta > 0) free_at = i; break; }
+    }
+    if (free_at < KLVK_VI_MODS) {
+        if (!g_vi_mod[free_at].mod) { g_vi_mod[free_at].mod = mod; g_vi_mod[free_at].dev = dev; }
+        if (delta > 0) g_vi_mod[free_at].refs++;
+        else if (g_vi_mod[free_at].refs && !--g_vi_mod[free_at].refs && g_vi_mod[free_at].dead) {
+            gone = mod; dev = g_vi_mod[free_at].dev;
+            g_vi_mod[free_at].dead = 0;   // the slot stays (probe chains), refs 0 and not dead
+        }
+    }
+    pthread_mutex_unlock(&g_vi_mu);
+    if (gone && real_gdpa) {
+        PFN_vkDestroyShaderModule d = (PFN_vkDestroyShaderModule)real_gdpa(dev, "vkDestroyShaderModule");
+        if (d) d(dev, (VkShaderModule)(uintptr_t)gone, NULL);
+    }
+}
+// 1 if the module is held: the guest's destroy is put off.
+static int klvk_vi_mod_hold(uint64_t mod) {
+    if (!mod || !__atomic_load_n(&g_vi_live, __ATOMIC_RELAXED)) return 0;
+    int held = 0;
+    pthread_mutex_lock(&g_vi_mu);
+    uint32_t i = (uint32_t)((mod >> 4) * 2654435761u) % KLVK_VI_MODS;
+    for (uint32_t n = 0; n < KLVK_VI_MODS && g_vi_mod[i].mod; n++, i = (i + 1) % KLVK_VI_MODS)
+        if (g_vi_mod[i].mod == mod) { if (g_vi_mod[i].refs) { g_vi_mod[i].dead = 1; held = 1; } break; }
+    pthread_mutex_unlock(&g_vi_mu);
+    return held;
+}
+
+static VkResult klvk_vi_defer(VkDevice dev, const VkGraphicsPipelineCreateInfo *ci, VkPipeline *out) {
+    klvk_vipipe *p = calloc(1, sizeof *p);
+    if (!p) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (!klvk_ap_clone(&p->mem, ci, &p->ci)) {
+        klvk_ap_free(&p->mem); free(p);
+        static int said;
+        if (said++ < 8) VKI("dynamic vertex input: a pipeline carries something the copy does not know — "
+                            "it is compiled as it is and will likely fail\n");
+        return klvk_CreateGraphicsPipelines0(dev, VK_NULL_HANDLE, 1, ci, NULL, out);
+    }
+    // Out with the two dynamic states nothing here can honour.
+    VkPipelineDynamicStateCreateInfo *d = (VkPipelineDynamicStateCreateInfo *)p->ci.pDynamicState;
+    if (d && d->pDynamicStates) {
+        VkDynamicState *ds = (VkDynamicState *)d->pDynamicStates;
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < d->dynamicStateCount; i++)
+            if (ds[i] != VK_DYNAMIC_STATE_VERTEX_INPUT_EXT &&
+                ds[i] != VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR) ds[k++] = ds[i];
+        d->dynamicStateCount = k;
+    }
+    p->ci.pVertexInputState = NULL;
+    p->dev = dev;
+    pthread_mutex_init(&p->mu, NULL);
+    pthread_mutex_lock(&g_vi_mu);
+    unsigned i, n;
+    for (n = 0, i = g_vi_next; n < KLVK_VI_MAX && g_vi_slot[i]; n++) i = (i + 1) % KLVK_VI_MAX;
+    if (n < KLVK_VI_MAX) { g_vi_slot[i] = p; g_vi_next = (i + 1) % KLVK_VI_MAX; g_vi_live++; }
+    unsigned live = g_vi_live;
+    pthread_mutex_unlock(&g_vi_mu);
+    if (n == KLVK_VI_MAX) {
+        klvk_ap_free(&p->mem); free(p);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    for (uint32_t s = 0; s < p->ci.stageCount; s++)
+        klvk_vi_mod_ref(dev, (uint64_t)(uintptr_t)p->ci.pStages[s].module, +1);
+    *out = (VkPipeline)(uintptr_t)&g_vi_slot[i];
+    if (live == 1 || !(live % 500))
+        VKI("dynamic vertex input: %u pipeline(s) waiting for their vertex layout "
+            "(VK_EXT_vertex_input_dynamic_state, emulated)\n", live);
+    return VK_SUCCESS;
+}
+
+static uint32_t klvk_vi_hash(const klvk_vi_layout *l) {
+    uint32_t h = klvk_fnv(l->b, l->nb * sizeof *l->b);
+    return h ^ (klvk_fnv(l->a, l->na * sizeof *l->a) * 16777619u) ^ (l->nb << 8) ^ l->na;
+}
+static int klvk_vi_same(const klvk_vi_layout *x, const klvk_vi_layout *y) {
+    return x->hash == y->hash && x->nb == y->nb && x->na == y->na &&
+           !memcmp(x->b, y->b, x->nb * sizeof *x->b) && !memcmp(x->a, y->a, x->na * sizeof *x->a);
+}
+// An integer vertex format the vertex shader reads as float: its SCALED twin.
+// SPIRV-Cross refuses the pair outright ("Vertex attribute type mismatch
+// between host and shader"); Vulkan calls it undefined, and a GL-minded engine
+// means the integer value as a number — which is what a SCALED format hands the
+// shader (Metal converts uchar/ushort to float). 32-bit integers have no SCALED
+// format and are left as they are. HITMAN 3 VR: Reloaded, headset 2026-10-20:
+// nine pipelines of its world refused this way.
+// Integer formats as the normalized ones of the same layout. Scaleform's vertex
+// shaders read their per-vertex factor (R8G8B8A8_UINT in HITMAN 3 VR: Reloaded's
+// batches) as a float, use .z * 255.01 as the index of the batch's matrix and .w
+// as an alpha factor: 0..1, i.e. what the Quest's driver gave them. Made SCALED
+// (0..255) the index ran far past the matrix table and the batch was not drawn —
+// a board in the tutorial missing in blocks (headset, 2026-10-21).
+static VkFormat klvk_vi_norm(VkFormat f) {
+    switch ((int)f) {
+    case VK_FORMAT_R8_UINT: return VK_FORMAT_R8_UNORM;              case VK_FORMAT_R8_SINT: return VK_FORMAT_R8_SNORM;
+    case VK_FORMAT_R8G8_UINT: return VK_FORMAT_R8G8_UNORM;          case VK_FORMAT_R8G8_SINT: return VK_FORMAT_R8G8_SNORM;
+    case VK_FORMAT_R8G8B8_UINT: return VK_FORMAT_R8G8B8_UNORM;      case VK_FORMAT_R8G8B8_SINT: return VK_FORMAT_R8G8B8_SNORM;
+    case VK_FORMAT_R8G8B8A8_UINT: return VK_FORMAT_R8G8B8A8_UNORM;  case VK_FORMAT_R8G8B8A8_SINT: return VK_FORMAT_R8G8B8A8_SNORM;
+    case VK_FORMAT_B8G8R8A8_UINT: return VK_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case VK_FORMAT_R16_UINT: return VK_FORMAT_R16_UNORM;            case VK_FORMAT_R16_SINT: return VK_FORMAT_R16_SNORM;
+    case VK_FORMAT_R16G16_UINT: return VK_FORMAT_R16G16_UNORM;      case VK_FORMAT_R16G16_SINT: return VK_FORMAT_R16G16_SNORM;
+    case VK_FORMAT_R16G16B16A16_UINT: return VK_FORMAT_R16G16B16A16_UNORM; case VK_FORMAT_R16G16B16A16_SINT: return VK_FORMAT_R16G16B16A16_SNORM;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+static VkFormat klvk_vi_scaled(VkFormat f) {
+    switch ((int)f) {
+    case VK_FORMAT_R8_UINT: return VK_FORMAT_R8_USCALED;            case VK_FORMAT_R8_SINT: return VK_FORMAT_R8_SSCALED;
+    case VK_FORMAT_R8G8_UINT: return VK_FORMAT_R8G8_USCALED;        case VK_FORMAT_R8G8_SINT: return VK_FORMAT_R8G8_SSCALED;
+    case VK_FORMAT_R8G8B8_UINT: return VK_FORMAT_R8G8B8_USCALED;    case VK_FORMAT_R8G8B8_SINT: return VK_FORMAT_R8G8B8_SSCALED;
+    case VK_FORMAT_R8G8B8A8_UINT: return VK_FORMAT_R8G8B8A8_USCALED; case VK_FORMAT_R8G8B8A8_SINT: return VK_FORMAT_R8G8B8A8_SSCALED;
+    case VK_FORMAT_B8G8R8A8_UINT: return VK_FORMAT_B8G8R8A8_USCALED; case VK_FORMAT_B8G8R8A8_SINT: return VK_FORMAT_B8G8R8A8_SSCALED;
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: return VK_FORMAT_A2B10G10R10_USCALED_PACK32;
+    case VK_FORMAT_A2B10G10R10_SINT_PACK32: return VK_FORMAT_A2B10G10R10_SSCALED_PACK32;
+    case VK_FORMAT_R16_UINT: return VK_FORMAT_R16_USCALED;          case VK_FORMAT_R16_SINT: return VK_FORMAT_R16_SSCALED;
+    case VK_FORMAT_R16G16_UINT: return VK_FORMAT_R16G16_USCALED;    case VK_FORMAT_R16G16_SINT: return VK_FORMAT_R16G16_SSCALED;
+    case VK_FORMAT_R16G16B16_UINT: return VK_FORMAT_R16G16B16_USCALED; case VK_FORMAT_R16G16B16_SINT: return VK_FORMAT_R16G16B16_SSCALED;
+    case VK_FORMAT_R16G16B16A16_UINT: return VK_FORMAT_R16G16B16A16_USCALED; case VK_FORMAT_R16G16B16A16_SINT: return VK_FORMAT_R16G16B16A16_SSCALED;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+// ...and the other way round: a float, normalized or scaled format the shader
+// reads as int or uint gets the integer format of the same size, which hands
+// the shader the stored bits — what a Quest's vertex fetch does (the reasoning
+// of KL_VK_VIN_INT). HITMAN 3 VR: Reloaded's skinned meshes read their bone
+// indices (in_weightIndices, uint4) from R8G8B8A8_UNORM; Metal refused
+// "uint4 cannot be read using MTLAttributeFormatUChar4Normalized" (Mac 2026-10-20).
+static VkFormat klvk_vi_integer(VkFormat f, int sint) {
+#define KLVK_VI_I(a, b, c, d, ui, si) case a: case b: case c: case d: return sint ? si : ui;
+    switch ((int)f) {
+    KLVK_VI_I(VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SNORM, VK_FORMAT_R8_USCALED, VK_FORMAT_R8_SSCALED, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT)
+    KLVK_VI_I(VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_SNORM, VK_FORMAT_R8G8_USCALED, VK_FORMAT_R8G8_SSCALED, VK_FORMAT_R8G8_UINT, VK_FORMAT_R8G8_SINT)
+    KLVK_VI_I(VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SNORM, VK_FORMAT_R8G8B8A8_USCALED, VK_FORMAT_R8G8B8A8_SSCALED, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_SINT)
+    KLVK_VI_I(VK_FORMAT_R16_UNORM, VK_FORMAT_R16_SNORM, VK_FORMAT_R16_USCALED, VK_FORMAT_R16_SSCALED, VK_FORMAT_R16_UINT, VK_FORMAT_R16_SINT)
+    KLVK_VI_I(VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16_SNORM, VK_FORMAT_R16G16_USCALED, VK_FORMAT_R16G16_SSCALED, VK_FORMAT_R16G16_UINT, VK_FORMAT_R16G16_SINT)
+    KLVK_VI_I(VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_SNORM, VK_FORMAT_R16G16B16A16_USCALED, VK_FORMAT_R16G16B16A16_SSCALED, VK_FORMAT_R16G16B16A16_UINT, VK_FORMAT_R16G16B16A16_SINT)
+    case VK_FORMAT_R16_SFLOAT:          return sint ? VK_FORMAT_R16_SINT : VK_FORMAT_R16_UINT;
+    case VK_FORMAT_R16G16_SFLOAT:       return sint ? VK_FORMAT_R16G16_SINT : VK_FORMAT_R16G16_UINT;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return sint ? VK_FORMAT_R16G16B16A16_SINT : VK_FORMAT_R16G16B16A16_UINT;
+    case VK_FORMAT_R32_SFLOAT:          return sint ? VK_FORMAT_R32_SINT : VK_FORMAT_R32_UINT;
+    case VK_FORMAT_R32G32_SFLOAT:       return sint ? VK_FORMAT_R32G32_SINT : VK_FORMAT_R32G32_UINT;
+    case VK_FORMAT_R32G32B32_SFLOAT:    return sint ? VK_FORMAT_R32G32B32_SINT : VK_FORMAT_R32G32B32_UINT;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return sint ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_UINT;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+#undef KLVK_VI_I
+}
+// The vertex stage's input types (klvk_vin_*; recorded while KL_VK_VIN_FILL is on).
+static int klvk_vi_inputs(const klvk_vipipe *p, klvk_vin_ent *in) {
+    for (uint32_t k = 0; k < p->ci.stageCount; k++)
+        if (p->ci.pStages[k].stage == VK_SHADER_STAGE_VERTEX_BIT)
+            return klvk_vin_get(g_vin_mod, (uint64_t)(uintptr_t)p->ci.pStages[k].module, in);
+    return 0;
+}
+
+// The variant of a deferred pipeline for one layout, compiled on first use.
+static uint64_t klvk_vi_variant(klvk_vipipe *p, const klvk_vi_layout *l) {
+    pthread_mutex_lock(&p->mu);
+    for (klvk_vi_var *v = p->vars; v; v = v->next)
+        if (klvk_vi_same(&v->l, l)) { uint64_t r = v->real; pthread_mutex_unlock(&p->mu); return r; }
+    // The layout as compiled: integer formats the shader reads as float made SCALED.
+    VkVertexInputAttributeDescription attrs[KLVK_VI_MAXA];
+    memcpy(attrs, l->a, l->na * sizeof *attrs);
+    klvk_vin_ent in = {0};
+    int have_in = klvk_vi_inputs(p, &in);
+    // KL_VK_VI_SF_NORM=0: Scaleform's integers read as floats are SCALED like any other.
+    static int sf_on = -1;
+    if (sf_on < 0) sf_on = kl_env_on("KL_VK_VI_SF_NORM", 1);
+    int sf = 0;
+    for (uint32_t k = 0; sf_on && k < p->ci.stageCount; k++)
+        if (p->ci.pStages[k].stage == VK_SHADER_STAGE_VERTEX_BIT &&
+            klvk_handle_set_has(g_sf_mod, (uint64_t)(uintptr_t)p->ci.pStages[k].module)) sf = 1;
+    unsigned scaled = 0;
+    for (uint32_t i = 0; have_in && i < l->na; i++) {
+        if (attrs[i].location >= 32) continue;
+        uint32_t bit = 1u << attrs[i].location;
+        VkFormat sc = VK_FORMAT_UNDEFINED;
+        if (in.f & bit) sc = sf ? klvk_vi_norm(attrs[i].format) : klvk_vi_scaled(attrs[i].format);
+        else if (in.u & bit) sc = klvk_vi_integer(attrs[i].format, 0);
+        else if (in.i & bit) sc = klvk_vi_integer(attrs[i].format, 1);
+        if (sc != VK_FORMAT_UNDEFINED) { attrs[i].format = sc; scaled++; }
+    }
+    // KL_VK_VI_TRACE_FS=<hash>,...: every variant of a pipeline with one of these
+    // fragment shaders says its layout — each attribute's location, binding,
+    // offset, the format the guest gave and the one compiled — and what its
+    // vertex shader reads as float/int/uint.
+    {
+        static uint32_t list[16];
+        static int ln = -1;
+        if (ln < 0) {
+            ln = 0;
+            const char *e = kl_env_str("KL_VK_VI_TRACE_FS", NULL);
+            while (e && *e && ln < 16) {
+                char *end = NULL;
+                unsigned long v = strtoul(e, &end, 16);
+                if (end == e) break;
+                list[ln++] = (uint32_t)v;
+                e = *end == ',' ? end + 1 : end;
+            }
+        }
+        uint32_t fh = 0;
+        for (uint32_t s = 0; ln && s < p->ci.stageCount; s++)
+            if (p->ci.pStages[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+                fh = klvk_fs_get(g_fs_mod, (uint64_t)(uintptr_t)p->ci.pStages[s].module);
+        for (int i = 0; fh && i < ln; i++)
+            if (list[i] == fh) {
+                char d[700]; size_t o = 0; d[0] = 0;
+                for (uint32_t k = 0; k < l->na && o + 64 < sizeof d; k++)
+                    o += (size_t)snprintf(d + o, sizeof d - o, " loc%u b%u+%u fmt %d->%d", l->a[k].location, l->a[k].binding,
+                                          l->a[k].offset, (int)l->a[k].format, (int)attrs[k].format);
+                char b[200]; size_t ob = 0; b[0] = 0;
+                for (uint32_t k = 0; k < l->nb && ob + 40 < sizeof b; k++)
+                    ob += (size_t)snprintf(b + ob, sizeof b - ob, " b%u stride %u rate %d", l->b[k].binding, l->b[k].stride, (int)l->b[k].inputRate);
+                VKI("vi trace %08x:%s |%s | reads float %#x int %#x uint %#x\n", fh, d, b, in.f, in.i, in.u);
+                break;
+            }
+    }
+    if (scaled) {
+        static unsigned said;
+        if (said++ < 4 || !(said % 100))
+            VKI("dynamic vertex input: %u attribute(s) given in the format the shader reads them as "
+                "(integer read as float: SCALED; float/normalized read as integer: the integer format) "
+                "(%u variant(s) so far)\n", scaled, said);
+    }
+    VkPipelineVertexInputStateCreateInfo vis = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = l->nb, .pVertexBindingDescriptions = l->b,
+        .vertexAttributeDescriptionCount = l->na, .pVertexAttributeDescriptions = attrs };
+    VkGraphicsPipelineCreateInfo c = p->ci;
+    c.pVertexInputState = &vis;
+    // KL_VK_NO_STENCIL_FS=<hash>,...: variants of pipelines whose fragment shader
+    // has one of these hashes are compiled with the stencil test off. A test for
+    // HITMAN 3 VR: Reloaded's Scaleform board, drawn through a stencil mask and
+    // missing in screen-aligned blocks on the headset (2026-10-21).
+    VkPipelineDepthStencilStateCreateInfo ds_nost;
+    {
+        static uint32_t list[16];
+        static int ln = -1;
+        if (ln < 0) {
+            ln = 0;
+            const char *e = kl_env_str("KL_VK_NO_STENCIL_FS", NULL);
+            while (e && *e && ln < 16) {
+                char *end = NULL;
+                unsigned long v = strtoul(e, &end, 16);
+                if (end == e) break;
+                list[ln++] = (uint32_t)v;
+                e = *end == ',' ? end + 1 : end;
+            }
+        }
+        if (ln && c.pDepthStencilState && c.pDepthStencilState->stencilTestEnable) {
+            uint32_t fh = 0;
+            for (uint32_t s = 0; s < c.stageCount; s++)
+                if (c.pStages[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+                    fh = klvk_fs_get(g_fs_mod, (uint64_t)(uintptr_t)c.pStages[s].module);
+            for (int i = 0; i < ln; i++)
+                if (fh && list[i] == fh) {
+                    ds_nost = *c.pDepthStencilState;
+                    ds_nost.stencilTestEnable = VK_FALSE;
+                    c.pDepthStencilState = &ds_nost;
+                    static int said;
+                    if (said++ < 4) VKI("KL_VK_NO_STENCIL_FS: a variant of %08x without its stencil test\n", fh);
+                    break;
+                }
+        }
+    }
+    VkPipeline real = VK_NULL_HANDLE;
+    double t0 = kl_pipe_ms();
+    // Behind the frame when KL_VK_ASYNC_PIPES asks for it: this is where such a
+    // guest's compiles really happen — its vkCreateGraphicsPipelines only made
+    // the handle above — so the switch never reached them, and on the headset
+    // each new variant held the picture 0.3-0.9 s (HITMAN 3 VR: Reloaded,
+    // 2026-10-20). klvk_ap_create answers with the pipeline, or with a handle of
+    // its own that klvk_ap_bind resolves (dropping the draws until it is there),
+    // and applies its own rule of which pipelines qualify. A pipeline with a
+    // logic op stays in place: that op reaches Metal through one flag set around
+    // the compile (kl_mtl_logic_op_next), which compiles on other threads would
+    // share.
+    int lop = c.pColorBlendState && c.pColorBlendState->logicOpEnable;
+    VkResult r = klvk_ap_mode() && !lop
+        ? klvk_ap_create(p->dev, VK_NULL_HANDLE, 1, &c, NULL, &real)
+        : klvk_CreateGraphicsPipelines0(p->dev, VK_NULL_HANDLE, 1, &c, NULL, &real);
+    double ms = kl_pipe_ms() - t0;
+    klvk_vi_var *v = calloc(1, sizeof *v);
+    if (v) { v->l = *l; v->real = r == VK_SUCCESS ? (uint64_t)(uintptr_t)real : 0; v->next = p->vars; p->vars = v; p->nvars++; }
+    pthread_mutex_unlock(&p->mu);
+    static unsigned made, failed;
+    unsigned m = __atomic_add_fetch(&made, 1, __ATOMIC_RELAXED);
+    if (r != VK_SUCCESS) {
+        unsigned f = __atomic_add_fetch(&failed, 1, __ATOMIC_RELAXED);
+        if (f <= 12) {
+            char desc[512]; size_t o = 0; desc[0] = 0;
+            for (uint32_t i = 0; i < l->na && o + 40 < sizeof desc; i++)
+                o += (size_t)snprintf(desc + o, sizeof desc - o, " loc%u:fmt%d@b%u+%u",
+                                      attrs[i].location, (int)attrs[i].format, attrs[i].binding, attrs[i].offset);
+            VKI("dynamic vertex input: a variant (%u bindings, %u attributes) was refused (%d);%s; "
+                "shader reads float %#x int %#x uint %#x%s\n", l->nb, l->na, (int)r, desc,
+                in.f, in.i, in.u, have_in ? "" : " (types unknown)");
+        }
+    }
+    if (m <= 3 || !(m % 200))
+        VKI("dynamic vertex input: %u variant(s) compiled so far (this one %.1f ms, %u bindings, %u attributes)\n",
+            m, ms, l->nb, l->na);
+    return v ? v->real : 0;
+}
+
+// Per command buffer: the deferred pipeline bound and the last layout set.
+#define KLVK_VI_CBS 4096u
+typedef struct { uint64_t cb; klvk_vipipe *pipe; int have; klvk_vi_layout l; } klvk_vi_cb;
+static klvk_vi_cb g_vi_cb[KLVK_VI_CBS];
+static klvk_vi_cb *klvk_vi_cb_of(void *cb, int add) {
+    uint64_t h = (uint64_t)(uintptr_t)cb;
+    uint32_t i = (uint32_t)((h >> 4) * 2654435761u) % KLVK_VI_CBS;
+    for (uint32_t n = 0; n < KLVK_VI_CBS; n++, i = (i + 1) % KLVK_VI_CBS) {
+        uint64_t v = __atomic_load_n(&g_vi_cb[i].cb, __ATOMIC_ACQUIRE);
+        if (v == h) return &g_vi_cb[i];
+        if (!v) {
+            if (!add) return NULL;
+            uint64_t none = 0;
+            if (__atomic_compare_exchange_n(&g_vi_cb[i].cb, &none, h, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                return &g_vi_cb[i];
+            if (none == h) return &g_vi_cb[i];
+        }
+    }
+    static int said;
+    if (!said++) VKI("dynamic vertex input: the command-buffer table is full — draws on further "
+                     "command buffers are left out\n");
+    return NULL;
+}
+static void klvk_vi_begin(void *cb) {
+    klvk_vi_cb *e = klvk_vi_cb_of(cb, 0);
+    if (e) { e->pipe = NULL; e->have = 0; }
+}
+static void VKAPI_CALL klvk_CmdBindPipeline(void *cb, uint32_t bindPoint, uint64_t pipeline);
+// Bind the variant for what this command buffer has, if it has both.
+static void klvk_vi_settle(void *cb, klvk_vi_cb *e) {
+    if (!e || !e->pipe) return;
+    if (!e->have) { klvk_ap_mark(cb, 1); return; }    // no layout yet: its draws are left out
+    uint64_t real = klvk_vi_variant(e->pipe, &e->l);
+    if (!real) { klvk_ap_mark(cb, 1); return; }
+    t_vi_internal = 1;
+    klvk_CmdBindPipeline(cb, 0 /* graphics */, real);
+    t_vi_internal = 0;
+}
+static void VKAPI_CALL klvk_CmdSetVertexInputEXT(void *cb,
+        uint32_t nb, const VkVertexInputBindingDescription2EXT *b,
+        uint32_t na, const VkVertexInputAttributeDescription2EXT *a) {
+    klvk_vi_cb *e = klvk_vi_cb_of(cb, 1);
+    if (!e) return;
+    if (nb > KLVK_VI_MAXB || na > KLVK_VI_MAXA) {
+        static int said;
+        if (!said++) VKI("dynamic vertex input: a layout of %u bindings / %u attributes is beyond %u / %u — "
+                         "its draws are left out\n", nb, na, KLVK_VI_MAXB, KLVK_VI_MAXA);
+        e->have = 0;
+        klvk_ap_mark(cb, 1);
+        return;
+    }
+    klvk_vi_layout l;
+    memset(&l, 0, sizeof l);
+    l.nb = nb; l.na = na;
+    for (uint32_t i = 0; i < nb; i++) {
+        l.b[i].binding = b[i].binding; l.b[i].stride = b[i].stride; l.b[i].inputRate = b[i].inputRate;
+        if (b[i].divisor != 1) { static int said; if (!said++)
+            VKI("dynamic vertex input: binding divisor %u is not applied\n", b[i].divisor); }
+    }
+    for (uint32_t i = 0; i < na; i++) {
+        l.a[i].location = a[i].location; l.a[i].binding = a[i].binding;
+        l.a[i].format = a[i].format; l.a[i].offset = a[i].offset;
+    }
+    l.hash = klvk_vi_hash(&l);
+    if (e->have && klvk_vi_same(&e->l, &l)) return;    // the same again: nothing changes
+    e->l = l; e->have = 1;
+    klvk_vi_settle(cb, e);
+}
+// From klvk_CmdBindPipeline: 1 if the pipeline was one of ours (handled here).
+static int klvk_vi_bind(void *cb, uint32_t bindPoint, uint64_t pipeline) {
+    if (t_vi_internal || bindPoint != 0) return 0;
+    klvk_vipipe *p = __atomic_load_n(&g_vi_live, __ATOMIC_RELAXED) ? klvk_vi_from(pipeline) : NULL;
+    if (!p) {
+        klvk_vi_cb *e = __atomic_load_n(&g_vi_live, __ATOMIC_RELAXED) ? klvk_vi_cb_of(cb, 0) : NULL;
+        if (e) e->pipe = NULL;
+        return 0;
+    }
+    klvk_vi_cb *e = klvk_vi_cb_of(cb, 1);
+    if (!e) { klvk_ap_mark(cb, 1); return 1; }
+    e->pipe = p;
+    klvk_vi_settle(cb, e);
+    return 1;
+}
+// From klvk_DestroyPipeline: 1 if it was one of ours (its variants are destroyed).
+static void VKAPI_CALL klvk_DestroyPipeline(VkDevice dev, uint64_t pipeline, const VkAllocationCallbacks *alloc);
+static int klvk_vi_destroy(VkDevice dev, uint64_t pipeline,
+                           void (*real)(VkDevice, uint64_t, const VkAllocationCallbacks *)) {
+    klvk_vipipe *p = klvk_vi_from(pipeline);
+    if (!p) return 0;
+    pthread_mutex_lock(&g_vi_mu);
+    *(klvk_vipipe **)(uintptr_t)pipeline = NULL;
+    g_vi_live--;
+    pthread_mutex_unlock(&g_vi_mu);
+    for (klvk_vi_var *v = p->vars, *nx; v; v = nx) {
+        nx = v->next;
+        if (v->real && klvk_ap_from(v->real)) klvk_DestroyPipeline(dev, v->real, NULL);   // compiled behind the frame
+        else if (v->real && real) real(dev, v->real, NULL);
+        free(v);
+    }
+    for (uint32_t s = 0; s < p->ci.stageCount; s++)
+        klvk_vi_mod_ref(dev, (uint64_t)(uintptr_t)p->ci.pStages[s].module, -1);
+    klvk_ap_free(&p->mem);
+    pthread_mutex_destroy(&p->mu);
+    free(p);
+    return 1;
+}
+
 static void VKAPI_CALL klvk_DestroyPipeline(VkDevice dev, uint64_t pipeline, const VkAllocationCallbacks *alloc) {
     static void (*real)(VkDevice, uint64_t, const VkAllocationCallbacks *);
     if (!real && real_gdpa) real = (void (*)(VkDevice, uint64_t, const VkAllocationCallbacks *))
@@ -5805,6 +6571,7 @@ static void VKAPI_CALL klvk_DestroyPipeline(VkDevice dev, uint64_t pipeline, con
         pthread_mutex_unlock(&g_ap_mu);
         if (!pipeline) return;
     }
+    if (klvk_vi_destroy(dev, pipeline, real)) return;
     if (__atomic_load_n(&g_vin_pipes, __ATOMIC_RELAXED)) klvk_vin_del(g_vin_pipe, pipeline);
     if (real) real(dev, pipeline, alloc);
 }
@@ -5813,6 +6580,7 @@ static void VKAPI_CALL klvk_DestroyShaderModule(VkDevice dev, uint64_t mod, cons
     if (!real && real_gdpa) real = (void (*)(VkDevice, uint64_t, const VkAllocationCallbacks *))
         real_gdpa(dev, "vkDestroyShaderModule");
     klvk_ap_drain();
+    if (klvk_vi_mod_hold(mod)) return;   // a deferred pipeline still needs it, and its input types (klvk_vi_*)
     if (klvk_vin_on()) klvk_vin_del(g_vin_mod, mod);
     if (real) real(dev, mod, alloc);
 }
@@ -7091,6 +7859,27 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceQueueFamilyProperties(
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceQueueFamilyProperties");
     if (real) real(pd, count, props);
     else if (count) *count = 0;
+    // Queue spread: family 0 reports one queue for each family like it.
+    if (props && count && *count > 1 && klvk_queue_spread_on()) {
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < *count; i++)
+            if (props[i].queueFlags == props[0].queueFlags && props[i].queueCount >= 1) n++; else break;
+        if (n > props[0].queueCount) {
+            static int said;
+            if (!said) { said = 1; VKI("queue spread: family 0 reported with %u queues (MoltenVK: %u)\n", n, props[0].queueCount); }
+            props[0].queueCount = n;
+        }
+    }
+}
+
+// Queue i of family 0 under the spread is family i's only queue.
+static void VKAPI_CALL klvk_GetDeviceQueue(VkDevice dev, uint32_t family, uint32_t index, VkQueue *queue) {
+    static PFN_vkGetDeviceQueue real;
+    if (!real && real_gdpa) real = (PFN_vkGetDeviceQueue)real_gdpa(dev, "vkGetDeviceQueue");
+    klvk_device *d = dev_find(dev);
+    if (d && d->spread && family == 0 && index > 0 && index < d->spread) { family = index; index = 0; }
+    if (real) real(dev, family, index, queue);
+    else if (queue) *queue = VK_NULL_HANDLE;
 }
 
 // The rest of the vkGetPhysicalDevice* family Unity's device init queries on the
@@ -7374,8 +8163,19 @@ static VkResult VKAPI_CALL klvk_EnumeratePhysicalDevices(
                     VkQueueFamilyProperties qf[16];
                     unsigned gv = nq < 16 ? nq : 16;
                     gq(tmp[i], &gv, qf);
-                    for (unsigned k = 0; k < gv; k++)
+                    for (unsigned k = 0; k < gv; k++) {
                         if (qf[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) gfx = 1;
+                        VKI("    family %u: flags %#x, %u queue(s)\n", k,
+                            (unsigned)qf[k].queueFlags, qf[k].queueCount);
+                    }
+                }
+                {
+                    PFN_vkGetPhysicalDeviceFeatures gf =
+                        (PFN_vkGetPhysicalDeviceFeatures)real_gipa(inst, "vkGetPhysicalDeviceFeatures");
+                    VkPhysicalDeviceFeatures pf; memset(&pf, 0, sizeof pf);
+                    if (gf) gf(tmp[i], &pf);
+                    VKI("  phys[%u] logicOp %u dualSrcBlend %u (MVK_CONFIG_USE_METAL_PRIVATE_API=%s)\n", i,
+                        pf.logicOp, pf.dualSrcBlend, getenv("MVK_CONFIG_USE_METAL_PRIVATE_API") ? getenv("MVK_CONFIG_USE_METAL_PRIVATE_API") : "unset");
                 }
                 VKI("  phys[%u] '%s' api %u.%u.%u type %d vendor %#x device %#x "
                     "queueFamilies %u graphics %d\n", i, p.deviceName,
@@ -7454,6 +8254,7 @@ static VkResult VKAPI_CALL klvk_BeginCommandBuffer(void *cb, const void *bi) {
         real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkBeginCommandBuffer");
     klvk_cb_set_idx(cb, 0);
     klvk_vin_begin(cb);
+    klvk_vi_begin(cb);
     fove_sec_begin((VkCommandBuffer)cb);   // a re-recorded secondary no longer carries its old indirect draw
     return real ? real(cb, bi) : VK_ERROR_INITIALIZATION_FAILED;
 }
@@ -7490,12 +8291,54 @@ static void VKAPI_CALL klvk_CmdBindIndexBuffer(void *cb, uint64_t buffer,
 #define KLVK_REAL(name) \
     static void *real; \
     if (!real && real_gdpa) real = (void *)real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, name)
+// KL_VK_GRID_DILATE (default on for HITMAN 3 VR: Reloaded): conservative
+// rasterization for draws through a 100x60 viewport, made of five draws — the
+// draw, then four more with the viewport moved by just under half a pixel each
+// way, so that every pixel a primitive touches gets a fragment. The game sorts
+// the gates between its rooms (6114aaf2) and its lights (8653a979) into two
+// screen grids of 100x60 cells by drawing their volumes into such a viewport, and
+// a lighting shader takes a pixel's room and lights from its cell. A cell at a
+// slanted edge whose centre a volume misses was left out here but not on the
+// Quest, and was lit as the wrong room: lighter steps along the window in the VR
+// tutorial's third room and along shadow edges (headset, 2026-10-22). Both shaders
+// keep an index once (an atomic list, a logic OR), so the repeats add nothing
+// twice. klvk_grid_dilate says how many repeats a draw gets (0 or 4).
+static int klvk_grid_dilate(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_VK_GRID_DILATE", t && !strcmp(t, "x8012387035448196"));
+        if (on) VKI("KL_VK_GRID_DILATE: draws through a 100x60 viewport are repeated with it moved by "
+                    "+-0.49 pixel (conservative rasterization)\n");
+    }
+    if (!on || !t_vp_n) return 0;
+    float h = t_vp[0].height < 0 ? -t_vp[0].height : t_vp[0].height;
+    return t_vp[0].width == 100.0f && h == 60.0f ? 4 : 0;
+}
+// Repeat k (0..3) moves the viewports set last on this thread; -1 puts them back.
+static void klvk_grid_dilate_vp(void *cb, int k) {
+    static void (*setvp)(void *, uint32_t, uint32_t, const VkViewport *);
+    if (!setvp && real_gdpa) setvp = (void (*)(void *, uint32_t, uint32_t, const VkViewport *))
+        real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdSetViewport");
+    if (!setvp || !t_vp_n) return;
+    if (k < 0) { setvp(cb, t_vp_first, t_vp_n, t_vp); return; }
+    static const float o[4][2] = { { -0.49f, -0.49f }, { 0.49f, -0.49f }, { -0.49f, 0.49f }, { 0.49f, 0.49f } };
+    VkViewport v[4];
+    for (uint32_t i = 0; i < t_vp_n; i++) { v[i] = t_vp[i]; v[i].x += o[k][0]; v[i].y += o[k][1]; }
+    setvp(cb, t_vp_first, t_vp_n, v);
+}
 static void VKAPI_CALL klvk_CmdDraw(void *cb, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
     KLVK_REAL("vkCmdDraw");
     if (klvk_ap_skip(cb)) return;
     __atomic_add_fetch(&g_prof_nonindexed, 1, __ATOMIC_RELAXED);
     if (klvk_fs_draw()) return;
     if (real) ((void (*)(void *, uint32_t, uint32_t, uint32_t, uint32_t))real)(cb, a, b, c, d);
+    for (int k = 0, n = real ? klvk_grid_dilate() : 0; k < n; k++) {
+        klvk_grid_dilate_vp(cb, k);
+        ((void (*)(void *, uint32_t, uint32_t, uint32_t, uint32_t))real)(cb, a, b, c, d);
+        if (k == n - 1) klvk_grid_dilate_vp(cb, -1);
+    }
 }
 static void VKAPI_CALL klvk_CmdDrawIndirect(void *cb, VkBuffer buf, VkDeviceSize off,
         uint32_t count, uint32_t stride) {
@@ -7503,6 +8346,11 @@ static void VKAPI_CALL klvk_CmdDrawIndirect(void *cb, VkBuffer buf, VkDeviceSize
     if (klvk_ap_skip(cb)) return;
     __atomic_add_fetch(&g_prof_indirect, 1, __ATOMIC_RELAXED);
     if (real) ((void (*)(void *, VkBuffer, VkDeviceSize, uint32_t, uint32_t))real)(cb, buf, off, count, stride);
+    for (int k = 0, n = real ? klvk_grid_dilate() : 0; k < n; k++) {
+        klvk_grid_dilate_vp(cb, k);
+        ((void (*)(void *, VkBuffer, VkDeviceSize, uint32_t, uint32_t))real)(cb, buf, off, count, stride);
+        if (k == n - 1) klvk_grid_dilate_vp(cb, -1);
+    }
 }
 static void VKAPI_CALL klvk_CmdDrawIndexedIndirect(void *cb, VkBuffer buf, VkDeviceSize off,
         uint32_t count, uint32_t stride) {
@@ -7510,6 +8358,11 @@ static void VKAPI_CALL klvk_CmdDrawIndexedIndirect(void *cb, VkBuffer buf, VkDev
     if (klvk_ap_skip(cb)) return;
     __atomic_add_fetch(&g_prof_indirect, 1, __ATOMIC_RELAXED);
     if (real) ((void (*)(void *, VkBuffer, VkDeviceSize, uint32_t, uint32_t))real)(cb, buf, off, count, stride);
+    for (int k = 0, n = real ? klvk_grid_dilate() : 0; k < n; k++) {
+        klvk_grid_dilate_vp(cb, k);
+        ((void (*)(void *, VkBuffer, VkDeviceSize, uint32_t, uint32_t))real)(cb, buf, off, count, stride);
+        if (k == n - 1) klvk_grid_dilate_vp(cb, -1);
+    }
 }
 static void VKAPI_CALL klvk_CmdClearAttachments(void *cb, uint32_t na, const VkClearAttachment *a,
         uint32_t nr, const VkClearRect *r) {
@@ -7694,6 +8547,11 @@ static void VKAPI_CALL klvk_CmdDrawIndexed(void *cb, uint32_t indexCount,
         }
     }
     if (real) real(cb, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+    for (int k = 0, n = real ? klvk_grid_dilate() : 0; k < n; k++) {
+        klvk_grid_dilate_vp(cb, k);
+        real(cb, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+        if (k == n - 1) klvk_grid_dilate_vp(cb, -1);
+    }
 }
 static void VKAPI_CALL klvk_CmdBindPipeline(void *cb, uint32_t bindPoint, uint64_t pipeline) {
     static void (*real)(void *, uint32_t, uint64_t);
@@ -7702,7 +8560,9 @@ static void VKAPI_CALL klvk_CmdBindPipeline(void *cb, uint32_t bindPoint, uint64
     if (!pipeline) { static int said; if (said < 8) { said++;
         VKI("vkCmdBindPipeline: NULL pipeline bound (bindPoint %u) — a following "
             "draw will dereference null in MoltenVK\n", bindPoint); } }
-    if (bindPoint == 0 /* graphics */ && klvk_fs_on()) {
+    // A variant bound by the dynamic-vertex-input emulation keeps the shader
+    // hash its deferred pipeline was bound with (klvk_vi_settle).
+    if (bindPoint == 0 /* graphics */ && klvk_fs_on() && !t_vi_internal) {
         t_fs_hash = klvk_fs_get(g_fs_pipe, pipeline);
         if (!t_fs_hash) t_fs_hash = 0xffffffffu;
         t_fs_skip = 0;
@@ -7718,6 +8578,7 @@ static void VKAPI_CALL klvk_CmdBindPipeline(void *cb, uint32_t bindPoint, uint64
     int drop = 0;
     pipeline = klvk_ap_bind(cb, bindPoint, pipeline, &drop);
     if (drop) return;
+    if (klvk_vi_bind(cb, bindPoint, pipeline)) return;   // dynamic vertex input: bound by the layout
     if (real) real(cb, bindPoint, pipeline);
     if (bindPoint == 0 /* graphics */) klvk_vin_pipeline_bound(cb, pipeline);
 }
@@ -8951,6 +9812,189 @@ static int klvk_eye_on(void) {
     }
     return on;
 }
+
+// ---------------------------------------------------------------------------
+// KL_VK_VRS_STRIP (default on): the shading-rate built-ins, made plain
+// variables. HITMAN 3 VR: Reloaded's fragment shaders read ShadingRateKHR (a
+// debug tint by the rate the Quest shaded at) and SPIRV-Cross has no Metal
+// type for it — "unsupported-built-in-type", and the whole shader fails, so
+// the world was black on the headset while the interface drew (2026-10-20).
+// Metal has no variable-rate shading, so the honest value is the full rate,
+// 0: each such variable (and a vertex shader's PrimitiveShadingRateKHR output,
+// whose writes nothing reads) becomes a Private variable initialised to null,
+// with its own pointer type; the decoration, the capability and the extension
+// go. Only modules that use one are touched. Returns a malloc'd module or NULL.
+static uint32_t *klvk_spirv_strip_vrs(const uint32_t *code, size_t nw, size_t *out_nw) {
+    if (!code || nw < 6 || code[0] != 0x07230203u) return NULL;
+    enum { MAXS = 8 };
+    uint32_t sid[MAXS]; int ns = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t len = code[i] >> 16, op = code[i] & 0xffffu;
+        if (!len || i + len > nw) return NULL;
+        if (op == 71 /* OpDecorate */ && len >= 4 && code[i + 2] == 11 /* BuiltIn */ &&
+            (code[i + 3] == 4444 /* ShadingRateKHR */ || code[i + 3] == 4432 /* PrimitiveShadingRateKHR */) && ns < MAXS)
+            sid[ns++] = code[i + 1];
+        i += len;
+    }
+    if (!ns) return NULL;
+    uint32_t bound = code[3];
+    // pointee of each pointer type, looked up as variables come
+    uint32_t *o = malloc((nw + 16 * ns) * 4);
+    if (!o) return NULL;
+    memcpy(o, code, 5 * 4);
+    size_t n = 5;
+    int old14 = code[1] < 0x00010400u;      // before 1.4 the interface lists only Input/Output
+    for (size_t i = 5; i < nw; ) {
+        uint32_t len = code[i] >> 16, op = code[i] & 0xffffu;
+        const uint32_t *w = &code[i];
+        int skip = 0;
+        if (op == 17 /* OpCapability */ && w[1] == 4422 /* FragmentShadingRateKHR */) skip = 1;
+        if (op == 10 /* OpExtension */ && !strcmp((const char *)&w[1], "SPV_KHR_fragment_shading_rate")) skip = 1;
+        if ((op == 71 /* OpDecorate */) && len >= 2)
+            for (int k = 0; k < ns; k++) if (w[1] == sid[k]) skip = 1;
+        if (op == 59 /* OpVariable */ && len >= 4) {
+            int hit = 0;
+            for (int k = 0; k < ns; k++) if (w[2] == sid[k]) hit = 1;
+            if (hit) {
+                uint32_t pointee = 0;
+                for (size_t j = 5; j < i; ) {     // its pointer type was declared before it
+                    uint32_t l2 = code[j] >> 16, o2 = code[j] & 0xffffu;
+                    if (!l2) break;
+                    if (o2 == 32 /* OpTypePointer */ && l2 == 4 && code[j + 1] == w[1]) pointee = code[j + 3];
+                    j += l2;
+                }
+                if (!pointee) { free(o); return NULL; }
+                uint32_t ptr = bound++, nul = bound++;
+                o[n++] = (4u << 16) | 32; o[n++] = ptr; o[n++] = 6 /* Private */; o[n++] = pointee;
+                o[n++] = (3u << 16) | 46 /* OpConstantNull */; o[n++] = pointee; o[n++] = nul;
+                o[n++] = (5u << 16) | 59; o[n++] = ptr; o[n++] = w[2]; o[n++] = 6; o[n++] = nul;
+                i += len;
+                continue;
+            }
+        }
+        if (op == 15 /* OpEntryPoint */ && old14 && len > 3) {
+            // the name runs from word 3 to the word holding its terminating zero
+            size_t j = 3;
+            while (j < len) { uint32_t x = w[j++]; if (!(x & 0xff000000u) || !(x & 0xff0000u) || !(x & 0xff00u) || !(x & 0xffu)) break; }
+            size_t start = n;
+            for (size_t k = 0; k < j; k++) o[n++] = w[k];
+            for (; j < len; j++) {
+                int drop = 0;
+                for (int k = 0; k < ns; k++) if (w[j] == sid[k]) drop = 1;
+                if (!drop) o[n++] = w[j];
+            }
+            o[start] = ((uint32_t)(n - start) << 16) | 15;
+            i += len;
+            continue;
+        }
+        if (!skip) { memcpy(&o[n], w, len * 4); n += len; }
+        i += len;
+    }
+    o[3] = bound;
+    *out_nw = n;
+    return o;
+}
+// KL_VK_VIEWINDEX_COPY (default on): a shader that hands the ViewIndex
+// built-in to a function by pointer. SPIRV-Cross makes gl_ViewIndex a const
+// local of main() for Metal and the function's parameter a `thread uint&`, and
+// Metal refuses the call ("no matching function ... would lose const
+// qualifier"). HITMAN 3 VR: Reloaded's level shaders do it in GetRoomIndex
+// (Mac, Guided Training, 2026-10-20: the world drew with pieces missing). So
+// the built-in is copied once, at the top of the entry point, into a Private
+// variable, and every use of it inside functions goes to the copy — which
+// SPIRV-Cross passes as an ordinary `thread uint&`. Only modules that pass the
+// built-in to a function are touched. Returns a malloc'd module or NULL.
+static uint32_t *klvk_spirv_viewindex_copy(const uint32_t *code, size_t nw, size_t *out_nw) {
+    if (!code || nw < 6 || code[0] != 0x07230203u) return NULL;
+    uint32_t v = 0, vptr = 0, pointee = 0, entry = 0;
+    int passed = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t len = code[i] >> 16, op = code[i] & 0xffffu;
+        if (!len || i + len > nw) return NULL;
+        if (op == 71 && len >= 4 && code[i + 2] == 11 && code[i + 3] == 4440 /* ViewIndex */) v = code[i + 1];
+        if (op == 15 && len >= 3 && !entry) entry = code[i + 2];
+        i += len;
+    }
+    if (!v || !entry) return NULL;
+    // Passed by pointer, or read inside a function other than the entry point —
+    // SPIRV-Cross then makes it a parameter of that function itself.
+    uint32_t fn = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t len = code[i] >> 16, op = code[i] & 0xffffu;
+        if (op == 54 && len >= 3) fn = code[i + 2];
+        if (op == 59 && len >= 4 && code[i + 2] == v) vptr = code[i + 1];
+        if (op == 57 /* OpFunctionCall */)
+            for (uint32_t k = 4; k < len; k++) if (code[i + k] == v) passed = 1;
+        if (fn && fn != entry && ((op == 61 && len >= 4 && code[i + 3] == v) ||
+                                  ((op == 65 || op == 66) && len >= 4 && code[i + 3] == v)))
+            passed = 1;
+        i += len;
+    }
+    if (!passed || !vptr) return NULL;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t len = code[i] >> 16, op = code[i] & 0xffffu;
+        if (op == 32 && len == 4 && code[i + 1] == vptr) pointee = code[i + 3];
+        i += len;
+    }
+    if (!pointee) return NULL;
+    uint32_t bound = code[3], tp = bound++, pv = bound++, tmp = bound++;
+    uint32_t *o = malloc((nw + 16) * 4);
+    if (!o) return NULL;
+    memcpy(o, code, 5 * 4);
+    size_t n = 5;
+    int in_funcs = 0, in_entry = 0, inserted = 0, after_label = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t len = code[i] >> 16, op = code[i] & 0xffffu;
+        const uint32_t *w = &code[i];
+        // the load and store go after the entry block's label and its OpVariables
+        if (in_entry && after_label && !inserted && op != 59 && op != 8 && op != 317) {
+            o[n++] = (4u << 16) | 61; o[n++] = pointee; o[n++] = tmp; o[n++] = v;
+            o[n++] = (3u << 16) | 62; o[n++] = pv; o[n++] = tmp;
+            inserted = 1;
+        }
+        size_t start = n;
+        memcpy(&o[n], w, len * 4); n += len;
+        // From SPIR-V 1.4 every global an entry point uses is in its interface.
+        if (op == 15 && code[1] >= 0x00010400u && w[2] == entry) {
+            o[n++] = pv;
+            o[start] = ((uint32_t)(n - start) << 16) | 15;
+        }
+        if (op == 54 /* OpFunction */) { in_funcs = 1; in_entry = w[2] == entry; after_label = 0; }
+        if (op == 248 /* OpLabel */ && in_entry) after_label = 1;
+        if (op == 59 && w[2] == v && !in_funcs) {
+            o[n++] = (4u << 16) | 32; o[n++] = tp; o[n++] = 6 /* Private */; o[n++] = pointee;
+            o[n++] = (4u << 16) | 59; o[n++] = tp; o[n++] = pv; o[n++] = 6;
+        }
+        if (in_funcs) {
+            uint32_t *x = &o[start];
+            switch (op) {
+            case 61: if (len >= 4 && x[3] == v) x[3] = pv; break;                  // OpLoad
+            case 62: if (len >= 3 && x[1] == v) x[1] = pv; break;                  // OpStore
+            case 63: for (uint32_t k = 1; k <= 2 && k < len; k++) if (x[k] == v) x[k] = pv; break;
+            case 65: case 66: case 67: if (len >= 4 && x[3] == v) x[3] = pv; break; // access chains
+            case 57: for (uint32_t k = 4; k < len; k++) if (x[k] == v) x[k] = pv; break;
+            default: break;
+            }
+        }
+        i += len;
+    }
+    if (!inserted) { free(o); return NULL; }
+    // the inserted load reads the built-in itself; it was written after the rewrite pass saw it
+    o[3] = bound;
+    *out_nw = n;
+    return o;
+}
+static int klvk_viewindex_copy_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_VK_VIEWINDEX_COPY", 1);
+    return on;
+}
+static int klvk_vrs_strip_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_VK_VRS_STRIP", 1);
+    return on;
+}
+
 static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
         const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *alloc,
         VkShaderModule *out) {
@@ -9050,11 +10094,36 @@ static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
             mf = *ci; mf.pCode = msfix; mf.codeSize = mw * 4; ci = &mf;
         }
     }
+    uint32_t *vrs = NULL;
+    VkShaderModuleCreateInfo vf;
+    if (ci && ci->pCode && !(ci->codeSize & 3u) && klvk_vrs_strip_on()) {
+        size_t vw = 0;
+        if ((vrs = klvk_spirv_strip_vrs(ci->pCode, ci->codeSize / 4, &vw))) {
+            vf = *ci; vf.pCode = vrs; vf.codeSize = vw * 4; ci = &vf;
+            static unsigned said;
+            if (said++ < 3 || !(said % 200))
+                VKI("shading-rate built-ins made plain variables (rate 0, the full rate) in %u module(s) so far\n", said);
+        }
+    }
+    uint32_t *vic = NULL;
+    VkShaderModuleCreateInfo vcf;
+    if (ci && ci->pCode && !(ci->codeSize & 3u) && klvk_viewindex_copy_on()) {
+        size_t vw = 0;
+        if ((vic = klvk_spirv_viewindex_copy(ci->pCode, ci->codeSize / 4, &vw))) {
+            vcf = *ci; vcf.pCode = vic; vcf.codeSize = vw * 4; ci = &vcf;
+            static unsigned said;
+            if (said++ < 3 || !(said % 200))
+                VKI("ViewIndex handed to a function: copied into a private variable in %u module(s) so far\n", said);
+        }
+    }
     VkResult r = klvk_CreateShaderModule0(dev, ci, alloc, out);
     if (r == VK_SUCCESS && out && ci && ci->pCode && !(ci->codeSize & 3u) && klvk_vin_on()) {
         klvk_vin_ent in;
         if (klvk_spirv_vertex_inputs(ci->pCode, ci->codeSize / 4, &in))
             klvk_vin_put(g_vin_mod, (uint64_t)(uintptr_t)*out, in.f, in.i, in.u);
+        static const char sfk[] = "SCALEFORM_CONSTANTS_BLOCK";
+        if (memmem(ci->pCode, ci->codeSize, sfk, sizeof sfk - 1))
+            klvk_handle_set_add(g_sf_mod, (uint64_t)(uintptr_t)*out);
     }
     if (r == VK_SUCCESS && out && ci && ci->pCode && klvk_fs_on())
         klvk_fs_put(g_fs_mod, (uint64_t)(uintptr_t)*out, klvk_fnv(ci->pCode, ci->codeSize));
@@ -9076,6 +10145,8 @@ static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
             if (f) { fwrite(ci->pCode, 1, ci->codeSize, f); fclose(f); }
         }
     }
+    free(vic);
+    free(vrs);
     free(msfix);
     free(sky);
     free(eye);
@@ -10134,6 +11205,7 @@ static void fove_xr_image(VkImage img, uint32_t layers, uint32_t w, uint32_t h) 
             "recognised as an eye (drawn unfoveated)\n", KLVK_XR_EYE_N, (void *)img, w, h);
 }
 
+static void fove_xr_reg_drop_locked(VkImage img);
 // An image going away (the guest's vkDestroyImage): every table drops it — a
 // guest that recreates its targets must not fill them, a VkImage handle reused
 // for an unrelated image must not be taken for an eye, and a confirmed
@@ -10154,6 +11226,7 @@ static void fove_image_gone(VkImage img) {
                 memset(&g_xr_col[i], 0, sizeof g_xr_col[i]);
                 __atomic_sub_fetch(&g_xr_col_n, 1, __ATOMIC_RELAXED);
             }
+        fove_xr_reg_drop_locked(img);
         pthread_mutex_unlock(&g_xr_col_lock);
     }
     pthread_mutex_lock(&g_gimg_lock);
@@ -10189,6 +11262,59 @@ static int fove_runtime_eye_wh(VkImage img, uint32_t *layers, int *eye, uint32_t
 }
 static int fove_runtime_eye(VkImage img, uint32_t *layers, int *eye) {
     return fove_runtime_eye_wh(img, layers, eye, NULL, NULL);
+}
+
+// A runtime image is taken for an eye from the moment it is made, because an
+// OpenXR swapchain does not say what it is for: only xrEndFrame shows a
+// projection layer or a flat one. HITMAN 3 VR: Reloaded draws its loading and
+// menu screens into a 1920x1080 swapchain it submits as a QUAD layer; foveated
+// around the eye's straight-ahead point, half of that panel was shaded at an
+// eighth of the rate and its text could not be read (headset, 2026-10-20;
+// Mac: "map 1920x1080 ... 47.5% of the fragments"). kl_openxr calls
+// kl_vulkan_xr_image_not_eye for such a swapchain's images: it stops being an
+// eye, and the eye targets a pass registered through it (its MSAA colour and
+// depth, which kl_fove marks by themselves) are dropped. g_xr_reg remembers
+// which those were.
+#define KLVK_XR_REG_N 64
+static struct { VkImage img; void *ct, *dt; } g_xr_reg[KLVK_XR_REG_N];
+static void fove_xr_reg_note(VkImage img, void *ct, void *dt) {   // under nothing; g_xr_col_lock taken here
+    if (!img) return;
+    pthread_mutex_lock(&g_xr_col_lock);
+    int free_i = -1;
+    for (int i = 0; i < KLVK_XR_REG_N; i++) {
+        if (g_xr_reg[i].img == img && g_xr_reg[i].ct == ct && g_xr_reg[i].dt == dt) { free_i = -2; break; }
+        if (!g_xr_reg[i].img && free_i == -1) free_i = i;
+    }
+    if (free_i >= 0) { g_xr_reg[free_i].img = img; g_xr_reg[free_i].ct = ct; g_xr_reg[free_i].dt = dt; }
+    pthread_mutex_unlock(&g_xr_col_lock);
+}
+static void fove_xr_reg_drop_locked(VkImage img) {        // under g_xr_col_lock
+    for (int i = 0; i < KLVK_XR_REG_N; i++)
+        if (g_xr_reg[i].img == img) memset(&g_xr_reg[i], 0, sizeof g_xr_reg[i]);
+}
+void kl_vulkan_xr_image_not_eye(unsigned long long image) {
+    VkImage img = (VkImage)(uintptr_t)image;
+    if (!img || !kl_fove_on()) return;
+    void *drop[2 * KLVK_XR_REG_N];
+    int nd = 0, was = 0;
+    pthread_mutex_lock(&g_xr_col_lock);
+    for (int i = 0; i < KLVK_XR_EYE_N; i++)
+        if (g_xr_col[i].img == img) {
+            memset(&g_xr_col[i], 0, sizeof g_xr_col[i]);
+            __atomic_sub_fetch(&g_xr_col_n, 1, __ATOMIC_RELAXED);
+            was = 1;
+        }
+    for (int i = 0; i < KLVK_XR_REG_N; i++)
+        if (g_xr_reg[i].img == img) {
+            if (g_xr_reg[i].ct) drop[nd++] = g_xr_reg[i].ct;
+            if (g_xr_reg[i].dt) drop[nd++] = g_xr_reg[i].dt;
+            memset(&g_xr_reg[i], 0, sizeof g_xr_reg[i]);
+        }
+    pthread_mutex_unlock(&g_xr_col_lock);
+    for (int i = 0; i < nd; i++) kl_fove_forget(drop[i]);
+    if (was)
+        VKI("[fove] swapchain image %p is a flat layer's, not an eye: drawn unfoveated "
+            "(%d eye target(s) registered through it dropped)\n", (void *)img, nd);
 }
 
 // Any kl_ovrp eye image of this extent? A target the size of a runtime eye
@@ -10647,7 +11773,10 @@ static int fove_rp(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi) {
                 VKI("[fove] intermediate %p: MSAA x%u scene with storeOp DONT_CARE, resolved by a later subpass into "
                     "attachment #%d (x1): its samples stay in physical layout through the pass, the resolve target "
                     "is what gets expanded\n", (void *)ci, cs, r.res_late);
-        } else kl_fove_note_eye_array(ct, dt, cw, ch, cs, (uint32_t)lay, one);
+        } else {
+            kl_fove_note_eye_array(ct, dt, cw, ch, cs, (uint32_t)lay, one);
+            fove_xr_reg_note(direct ? ci : ri, ct, dt);
+        }
     }
     // What this pass is, for an indirect draw recorded inside it.
     {
@@ -10941,7 +12070,7 @@ static const entry g_ours[] = {
     E(QueueSubmit),
     E(GetPhysicalDeviceProperties),
     E(GetPhysicalDeviceProperties2),
-    E(GetPhysicalDeviceQueueFamilyProperties),
+    E(GetPhysicalDeviceQueueFamilyProperties), E(GetDeviceQueue), E(CmdSetVertexInputEXT),
     E(GetPhysicalDeviceFeatures), E(GetPhysicalDeviceFeatures2),
     { "vkGetPhysicalDeviceFeatures2KHR", (PFN_vkVoidFunction)klvk_GetPhysicalDeviceFeatures2 },
     E(GetPhysicalDeviceMemoryProperties),
@@ -10960,7 +12089,7 @@ static const entry g_ours[] = {
     E(CmdBindIndexBuffer), E(CmdBindVertexBuffers), E(CmdDrawIndexed),
     E(CmdSetSampleLocationsEXT), E(CmdSetSampleLocationsEnableEXT), E(CmdSetBlendConstants),
     E(CmdDraw), E(CmdDrawIndirect), E(CmdDrawIndexedIndirect), E(CmdClearAttachments), E(CmdBeginQuery), E(CmdEndQuery), E(CreateQueryPool), E(GetQueryPoolResults),
-    E(CmdBindPipeline), E(CmdBindDescriptorSets),
+    E(CmdBindPipeline), E(CmdBindDescriptorSets), E(CmdSetScissor), E(CmdSetViewport),
     E(GetImageMemoryRequirements), E(CreateBufferView),
     R(CreateShaderModule), R(CreateDescriptorSetLayout), E(CreateDescriptorPool),
     R(CreateSampler), R(CreatePipelineLayout),

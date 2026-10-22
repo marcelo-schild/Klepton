@@ -370,6 +370,25 @@ static const kl_gp_word k_wrath2_forcevk[] = {
     { 0xc319348, 0xa9025ff8, 0xd65f03c0, "ret" },
 };
 
+// HITMAN 3 VR: Reloaded (libengine.so, Glacier, store target x8012387035448196,
+// build 3641): the main loop caps itself at 36 frames a second.
+//
+// ZApplicationEngineQuest::MainLoop loads one float before its loop, 27.8 (ms),
+// and after each frame, while GetVRRenderMode() is 1 and the OpenXR session
+// runs, Sleep()s whatever is left of it. On the Quest that is the space-warp
+// rate, 36 drawn for 72 shown. Here nobody fills in the frames between, and a
+// 27.8 ms frame waits for the third 10 ms refresh: 33 fps at 100 Hz. Measured
+// on the Mac (sample, 2026-10-20): the main thread spent 89% of its time in
+// usleep under MainLoop, the render thread idled polling its command ring, the
+// GPU took about 7 ms a frame.
+//
+// 14 ms instead: more than one refresh and less than two at both 100 and 120
+// Hz, so the next xrWaitFrame takes the frame to the second refresh — 50 fps
+// at 100 Hz, 60 at 120, the half rate the game was built for.
+static const kl_gp_word k_hitman3_frame_cap[] = {
+    { 0x31c0350, 0xbd41b108, 0x1e259008, "ldr s8, [x8, #0x1b0] (27.8) -> fmov s8, #14.0" },
+};
+
 // The Walking Dead: Saints & Sinners - Chapter 2: Retribution (libUE4.so, UE
 // 4.27.2, version code 32342700, store target x5190288877703616): Niagara is
 // told there is no compute.
@@ -762,6 +781,10 @@ static const kl_gp_patch k_patches[] = {
     { "wrath2-force-vulkan-available", "libUE4.so",
       "FAndroidMisc::IsVulkanAvailable() always returns true (the RHI gate)",
       k_wrath2_forcevk, sizeof k_wrath2_forcevk / sizeof *k_wrath2_forcevk },
+
+    { "hitman3-frame-cap", "libengine.so",
+      "the main loop's own frame cap is 14 ms instead of 27.8 (half the refresh, not 36 fps)",
+      k_hitman3_frame_cap, sizeof k_hitman3_frame_cap / sizeof *k_hitman3_frame_cap },
 
     { "liminal-touch-connected", "libil2cpp.so",
       "the Touch controllers read as connected at the startup device check",

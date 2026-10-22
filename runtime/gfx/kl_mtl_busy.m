@@ -32,6 +32,8 @@
 // compiled before (klc_note).
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
+#include <stdio.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -97,7 +99,48 @@ static void klc_lib_cb(id self, SEL _cmd, id src, id opts, id handler) {
         if (h) h(lib, e);
     });
 }
+// Logic operations on the next render pipeline this thread asks Metal for
+// (kl_mtl_logic_op_next). Metal has them only behind private methods of
+// MTLRenderPipelineDescriptor, the ones MoltenVK calls when it is built to use
+// private API; this build is not, so a VkPipeline's logicOp never reached
+// Metal. HITMAN 3 VR: Reloaded ORs light bits into a tile mask with it
+// (lightculling.frag). The enumeration is Apple's as MoltenVK declares it:
+// Clear, Set, Copy, CopyInverted, Noop, Invert, And, Nand, Or, Nor, Xor,
+// Equivalence, AndReverse, AndInverted, OrReverse, OrInverted.
+// Not thread-local: MoltenVK may hand the descriptor to Metal from a thread of
+// its own. The pending operation is applied only to a descriptor whose first
+// colour attachment is an integer format, the only kind a logic operation is
+// for, and stays set until the Vulkan side clears it.
+static _Atomic int g_logic_op = -1;
+void kl_mtl_logic_op_next(int metal_op) { atomic_store(&g_logic_op, metal_op); }
+static int klc_int_format(MTLPixelFormat f) {
+    switch (f) {
+    case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint:
+    case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint: case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint:
+    case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint:
+    case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint:
+    case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint:
+        return 1;
+    default: return 0;
+    }
+}
+static void klc_logic(id desc) {
+    int t_logic_op = atomic_load(&g_logic_op);
+    if (t_logic_op < 0 || !desc || ![desc isKindOfClass:[MTLRenderPipelineDescriptor class]]) return;
+    if (!klc_int_format(((MTLRenderPipelineDescriptor *)desc).colorAttachments[0].pixelFormat)) return;
+    SEL en = NSSelectorFromString(@"setLogicOperationEnabled:"), op = NSSelectorFromString(@"setLogicOperation:");
+    static int said;
+    if ([desc respondsToSelector:en] && [desc respondsToSelector:op]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(desc, en, YES);
+        ((void (*)(id, SEL, NSUInteger))objc_msgSend)(desc, op, (NSUInteger)t_logic_op);
+        if (said++ < 3) fprintf(stderr, "  [mtl] logic operation %d set on a render pipeline (private Metal API)\n", t_logic_op);
+    } else if (!said++) {
+        fprintf(stderr, "  [mtl] this Metal has no logic operations — the pipeline draws without one\n");
+    }
+}
+
 static id klc_rps(id self, SEL _cmd, id desc, void *err) {
+    klc_logic(desc);
     double t0 = klc_now();
     t_compiling++;
     id r = ((id (*)(id, SEL, id, void *))g_o_rps)(self, _cmd, desc, err);
@@ -105,6 +148,7 @@ static id klc_rps(id self, SEL _cmd, id desc, void *err) {
     return r;
 }
 static id klc_rps_refl(id self, SEL _cmd, id desc, NSUInteger options, void *reflection, void *err) {
+    klc_logic(desc);
     double t0 = klc_now();
     t_compiling++;
     id r = ((id (*)(id, SEL, id, NSUInteger, void *, void *))g_o_rps_refl)(self, _cmd, desc, options, reflection, err);
@@ -112,6 +156,7 @@ static id klc_rps_refl(id self, SEL _cmd, id desc, NSUInteger options, void *ref
     return r;
 }
 static void klc_rps_cb(id self, SEL _cmd, id desc, id handler) {
+    klc_logic(desc);
     if (t_compiling) { ((void (*)(id, SEL, id, id))g_o_rps_cb)(self, _cmd, desc, handler); return; }
     double t0 = klc_now();
     void (^h)(id, NSError *) = handler;
@@ -121,6 +166,7 @@ static void klc_rps_cb(id self, SEL _cmd, id desc, id handler) {
     });
 }
 static void klc_rps_opt_cb(id self, SEL _cmd, id desc, NSUInteger options, id handler) {
+    klc_logic(desc);
     if (t_compiling) {
         ((void (*)(id, SEL, id, NSUInteger, id))g_o_rps_opt_cb)(self, _cmd, desc, options, handler);
         return;

@@ -36,6 +36,7 @@
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
@@ -855,7 +856,8 @@ enum { KLXR_GATE_ALWAYS = 0,      // unconditional
        KLXR_GATE_VULKAN = 2,      // ...only when MoltenVK is actually reachable
        KLXR_GATE_USER_PRESENCE = 3,    // ...missioniss only (see below)
        KLXR_GATE_PERF_METRICS = 4,     // ...not for Moss from Steam (see below)
-       KLXR_GATE_FRAME_CONTROLLER = 5 };   // ...Moss from Steam only (see below)
+       KLXR_GATE_FRAME_CONTROLLER = 5,     // ...Moss from Steam only (see below)
+       KLXR_GATE_HITMAN3 = 6 };            // ...HITMAN 3 VR: Reloaded only (see below)
 
 static const struct { const char *name; uint32_t version; int gate; } g_extensions[] = {
     { "XR_KHR_opengl_es_enable",       10, KLXR_GATE_ALWAYS },
@@ -976,6 +978,39 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
     { "XR_META_performance_metrics",          2, KLXR_GATE_PERF_METRICS },
     { "XR_EXT_user_presence",                 1, KLXR_GATE_USER_PRESENCE },
     { "XR_VALVE_frame_controller_interaction", 1, KLXR_GATE_FRAME_CONTROLLER },
+    // XR_FB_space_warp — HITMAN 3 VR: Reloaded (x8012387035448196, IOI's Glacier
+    // engine as "Anubis", OpenXR + Vulkan) REQUIRES it at xrCreateInstance,
+    // whether or not it was enumerated. Refused, it does not stop: it goes on
+    // without an instance, every call after that is XR_ERROR_HANDLE_INVALID,
+    // "No capable Vulkan physical device found", and it hands MoltenVK a NULL
+    // VkDevice in vkGetDeviceProcAddr — SIGSEGV in MVKDevice::getProcAddr on
+    // the headset (2026-10-20, toolchain 701, both launches).
+    //
+    // The extension has no entry points. It is one output struct on
+    // xrGetSystemProperties (the recommended motion-vector size, filled below)
+    // and one input struct chained onto each projection view (motion vectors
+    // and depth for the runtime to synthesise frames from). Nothing here
+    // synthesises frames: the chained info is named and not read, as before,
+    // and each frame the game submits is shown as it is. The motion-vector and
+    // depth swapchains are ordinary Vulkan swapchains (RGBA16F, D24S8/D32 are
+    // in the format list already). Gated to that one target, because a game
+    // that only PROBES for it would otherwise switch space warp on and may
+    // render at half rate, expecting the runtime to fill in; KL_XR_HITMAN3_EXTS
+    // overrides.
+    //
+    // The same game requires two more, also without entry points (a Mac run
+    // lists every name it asks for, see klxr_CreateInstance):
+    // XR_FB_foveation_vulkan — a fragment-density-map image chained onto
+    // xrEnumerateSwapchainImages for a swapchain created with the FB foveation
+    // flag; the chained struct is not filled, so the game is told no such
+    // image (VK_NULL_HANDLE), the same answer as "no foveation", and MoltenVK
+    // has no fragment density maps to offer anyway.
+    // XR_META_vulkan_swapchain_create_info — extra VkImage create/usage flags
+    // chained onto xrCreateSwapchain; named and not read, the images are
+    // created with kl_vulkan's own usage set.
+    { "XR_FB_space_warp",                     2, KLXR_GATE_HITMAN3 },
+    { "XR_FB_foveation_vulkan",               1, KLXR_GATE_HITMAN3 },
+    { "XR_META_vulkan_swapchain_create_info", 1, KLXR_GATE_HITMAN3 },
 };
 #define KLXR_EXT_ALL ((uint32_t)(sizeof g_extensions / sizeof g_extensions[0]))
 
@@ -1060,6 +1095,11 @@ static int klxr_ext_gate_open(int gate) {
         // path. The profile itself has been driveable here since VRChat. For that build only;
         // KL_XR_FRAME_CONTROLLER overrides.
         return kl_env_on("KL_XR_FRAME_CONTROLLER", klxr_moss_from_steam());
+    case KLXR_GATE_HITMAN3: {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        return kl_env_on("KL_XR_HITMAN3_EXTS", t && !strcmp(t, "x8012387035448196"));
+    }
     case KLXR_GATE_PERF_METRICS: {
         // XR_META_performance_metrics is in the list by name only: none of its
         // four entry points is served. A guest that asks xrGetInstanceProcAddr
@@ -1186,6 +1226,7 @@ static const char *klxr_chain_type_name(int32_t t) {
     case 1000122000: return "XrCompositionLayerDepthTestVARJO";
     case 1000135000: return "XrFrameEndInfoML";
     case 1000171000: return "XrCompositionLayerSpaceWarpInfoFB";
+    case 1000171001: return "XrSystemSpaceWarpPropertiesFB";
     case 1000204000: return "XrCompositionLayerSettingsFB";
     case 1000212000: return "XrCompositionLayerDepthTestFB";
     case 1000216000: return "XrLocalDimmingFrameEndInfoMETA";
@@ -1432,15 +1473,21 @@ static XrResult klxr_CreateInstance(const XrInstanceCreateInfo *info, void **ins
             (unsigned long long)(g_instance.api_version >> 48) & 0xffff,
             (unsigned long long)(g_instance.api_version >> 32) & 0xffff,
             (unsigned long long)(g_instance.api_version & 0xffffffff));
+    // Every name is listed before the refusal, not only the first missing one:
+    // a guest that asks for several it was never offered (HITMAN 3 VR: Reloaded
+    // asked for XR_FB_space_warp, then XR_FB_foveation_vulkan) otherwise costs
+    // one run per name.
+    int missing = 0;
     for (uint32_t i = 0; i < info->enabledExtensionCount; i++) {
         const char *name = info->enabledExtensionNames[i];
         int known = klxr_ext_advertised(name);
         fprintf(stderr, "  [xr]   extension: %-40s %s\n", name,
                 known ? "enabled" : "NOT PRESENT");
-        if (!known) { g_instance.magic = 0; KLXR_RET(KLXR_ERROR_EXTENSION_NOT_PRESENT); }
+        if (!known) { missing++; continue; }
         if (strcmp(name, "XR_KHR_opengl_es_enable") == 0) g_instance.ext_opengl_es = 1;
         if (strcmp(name, "XR_KHR_vulkan_enable") == 0)    g_instance.ext_vulkan = 1;
     }
+    if (missing) { g_instance.magic = 0; KLXR_RET(KLXR_ERROR_EXTENSION_NOT_PRESENT); }
 
     *instance = &g_instance;
     return KLXR_SUCCESS;
@@ -1484,6 +1531,35 @@ static XrResult klxr_GetSystem(void *instance, const XrSystemGetInfo *info,
         KLXR_RET(KLXR_ERROR_FORM_FACTOR_UNSUPPORTED);
     *system_id = KLXR_SYSTEM_ID;
     return KLXR_SUCCESS;
+}
+
+// XrSystemSpaceWarpPropertiesFB, for the one game that gets XR_FB_space_warp
+// (KLXR_GATE_HITMAN3). The exception to "we never fill chained structs":
+// that game sizes its motion-vector swapchain from these two numbers, and the
+// zero an unfilled struct leaves would be a swapchain of no size. The chain is
+// still not trusted — every node is read through vm_read_overwrite (see
+// klxr_note_chain_types) and the walk stops at 8 — and the struct is written
+// only after all of it read back. The size is a quarter of the eye in each
+// direction: motion vectors are a low-resolution image, and the number is a
+// recommendation the game may round or ignore.
+struct klxr_space_warp_props { int32_t type; int32_t pad; void *next; uint32_t w, h; };
+static void klxr_fill_space_warp_props(void *next, int ew, int eh) {
+    for (int depth = 0; next && depth < 8; depth++) {
+        struct klxr_space_warp_props node;
+        vm_size_t got = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)next, sizeof node,
+                              (vm_address_t)&node, &got) != KERN_SUCCESS || got != sizeof node) return;
+        if (node.type == 1000171001) {
+            uint32_t w = (uint32_t)((ew > 0 ? ew : 1832) / 4), h = (uint32_t)((eh > 0 ? eh : 1920) / 4);
+            uint32_t *size = (uint32_t *)((char *)next + offsetof(struct klxr_space_warp_props, w));
+            size[0] = w;
+            size[1] = h;
+            fprintf(stderr, "  [xr] XR_FB_space_warp: motion vectors %ux%u recommended (a quarter of the eye); "
+                            "frames are not synthesised here\n", w, h);
+            return;
+        }
+        next = node.next;
+    }
 }
 
 static XrResult klxr_GetSystemProperties(void *instance, XrSystemId system_id,
@@ -1541,6 +1617,7 @@ static XrResult klxr_GetSystemProperties(void *instance, XrSystemId system_id,
     props->graphicsProperties.maxLayerCount = 16;
     props->trackingProperties.orientationTracking = 1;
     props->trackingProperties.positionTracking = 1;
+    if (klxr_ext_gate_open(KLXR_GATE_HITMAN3)) klxr_fill_space_warp_props(props->next, ew, eh);
     return KLXR_SUCCESS;
 }
 
@@ -3351,6 +3428,11 @@ static float klxr_local_height(void) {
         // ~1.3 m above the seat and cockpit and menus lay deep in the floor (headset 2026-10-16:
         // `xrLocateViews in LOCAL: eye 0 at (-0.027 1.279 -0.036)`).
         if (t && strcmp(t, "x10048506838538799") == 0) on = 1;
+        // HITMAN 3 VR: Reloaded likewise: it places menus, tutorial hints and the
+        // inventory from LOCAL as OpenXR defines it. With LOCAL on the floor they
+        // hung about a metre low (headset 2026-10-20: `VIEW in LOCAL: (-0.006
+        // 1.085 -0.032)`; on the Mac the dialog's buttons were below the view).
+        if (t && strcmp(t, "x8012387035448196") == 0) on = 1;
     }
     if (!on) return kl_ovrp_eye_height();
     if (latched < 0.0f) {
@@ -4400,6 +4482,17 @@ static XrResult klxr_SuggestInteractionProfileBindings(
                 if (strcmp(suffix, "/input/y/click") == 0) { kind = KLXR_SRC_BUTTON_OTHER; bit = KL_OVRP_RAW_Y; }
                 if (strcmp(suffix, "/input/x/touch") == 0 || strcmp(suffix, "/input/y/touch") == 0) kind = KLXR_SRC_NONE;
             }
+            // A BOOLEAN action bound to the bare /input/thumbstick reads the
+            // stick's click: the spec has a boolean bound to an identifier take
+            // its click component. Served as the whole stick it read the X
+            // deflection, non-zero on every push — HITMAN 3 VR: Reloaded binds
+            // "thumbstick_click" that way, so each snap turn on the right stick
+            // toggled crouching and each step on the left one let go of a
+            // dragged body (headset, 2026-10-20).
+            if (kind == KLXR_SRC_STICK_VEC && a->type == KLXR_ACTION_TYPE_BOOLEAN) {
+                kind = KLXR_SRC_BUTTON;
+                bit  = hand ? KL_OVRP_RAW_RTHUMBSTICK : KL_OVRP_RAW_LTHUMBSTICK;
+            }
             // A row whose bit for THIS hand is zero names a control this hand
             // does not have (a/b on the left, x/y on the right). Not an error
             // — just not bound.
@@ -5117,6 +5210,7 @@ typedef struct {
     uint64_t usage;
     uint32_t tex[KLXR_SWAPCHAIN_IMAGES];       // GLES: texture names
     uint64_t vk_img[KLXR_SWAPCHAIN_IMAGES];    // Vulkan: VkImage handles
+    uint64_t vk_fdm[KLXR_SWAPCHAIN_IMAGES];    // Vulkan: XR_FB_foveation_vulkan density maps (klxr_fill_foveation_image)
     int      count;
     int      acquired;        // index the app currently holds, -1 when none
     int      last_released;   // ...and the last one it handed BACK, which is the
@@ -5146,6 +5240,10 @@ typedef struct {
     // are GL FBOs over tex[], reused to copy the default framebuffer in.
     void    *surface;
     uint32_t blit_fbo[KLXR_SWAPCHAIN_IMAGES];
+    // Vulkan: 1 + the first compositor stage this swapchain's images are filed
+    // under (klxr_vk_stage_base), 0 while none is assigned.
+    int      vk_stage1;
+    int      vk_flat;      // its images were told to kl_vulkan as a flat layer's (klxr_vk_flat)
 } klxr_swapchain;
 
 static klxr_swapchain g_swapchains[KLXR_SWAPCHAIN_MAX];
@@ -5481,6 +5579,45 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
 // through them and the frame record names the one it drew. Publishing only the
 // released image would leave the compositor sampling a stage that was never
 // filled on the two frames either side of it.
+// Where a Vulkan swapchain's images are filed in the compositor's eye table: a
+// block of its own per swapchain. They used to be filed under their image index
+// alone, so two projection layers from two swapchains — HITMAN 3 VR: Reloaded's
+// world and its interface — landed in the same entries: the interface replaced
+// the world in the compositor (a black world under the menus), and because one
+// swapchain at a time owned an eye the two re-published over each other every
+// frame (the world flashing up now and then; headset, 2026-10-20). The first
+// swapchain gets block 0, so a guest with one projection layer is filed as
+// before. A block is free when no live swapchain holds it.
+static int klxr_vk_stage_base(klxr_swapchain *sc) {
+    if (sc->vk_stage1) return sc->vk_stage1 - 1;
+    for (int b = 0; b + sc->count <= KL_MTL_MAX_STAGES; b += KLXR_SWAPCHAIN_IMAGES) {
+        int used = 0;
+        for (int i = 0; i < KLXR_SWAPCHAIN_MAX && !used; i++)
+            if (&g_swapchains[i] != sc && g_swapchains[i].magic == KLXR_MAGIC_SWAPCHAIN &&
+                g_swapchains[i].vk_stage1 == b + 1) used = 1;
+        if (!used) {
+            sc->vk_stage1 = b + 1;
+            if (b) fprintf(stderr, "  [xr] swapchain %ux%u filed under compositor stages %d..%d "
+                                   "(another projection swapchain holds 0..)\n",
+                           sc->width, sc->height, b, b + sc->count - 1);
+            return b;
+        }
+    }
+    sc->vk_stage1 = 1;
+    return 0;
+}
+
+// A Vulkan swapchain submitted as a flat layer (quad, cylinder, equirect) is
+// not an eye: kl_vulkan takes every swapchain image for one until told, and
+// foveation would shade a panel around the eye's straight-ahead point
+// (kl_vulkan_xr_image_not_eye — HITMAN 3 VR: Reloaded's loading screens).
+static void klxr_vk_flat(klxr_swapchain *sc) {
+    if (!sc || sc->vk_flat || !sc->session || sc->session->gfx != KLXR_GFX_VULKAN) return;
+    sc->vk_flat = 1;
+    for (int i = 0; i < sc->count; i++)
+        kl_vulkan_xr_image_not_eye((unsigned long long)(uintptr_t)sc->vk_img[i]);
+}
+
 static void klxr_publish_eye_vulkan(klxr_swapchain *sc, int eye, int slice) {
     if (sc->vk_pub & (1u << eye)) return;
     if (klxr_format_is_depth(sc->session, sc->format)) return;
@@ -5488,16 +5625,17 @@ static void klxr_publish_eye_vulkan(klxr_swapchain *sc, int eye, int slice) {
     for (int k = 0; k < sc->count; k++) {
         void *tex = kl_vulkan_xr_image_mtl(sc->vk_img[k]);
         if (!tex) continue;
-        kl_glfb_note_eye_mtl_texture(eye, k, tex, slice,
+        kl_glfb_note_eye_mtl_texture(eye, klxr_vk_stage_base(sc) + k, tex, slice,
                                      (int)sc->width, (int)sc->height);
         done++;
     }
     if (done == sc->count) {
-        // Same rule as the GL route: exactly one swapchain owns an eye at a
-        // time, and the guest rebuilds its eye swapchains across scenes with
-        // the OLD one destroyed after the new one is asserted.
+        // Same rule as the GL route, within a block of stages: one swapchain
+        // owns an eye's entries at a time, and the guest rebuilds its eye
+        // swapchains across scenes with the OLD one destroyed after the new one
+        // is asserted. A swapchain filed under other stages is left alone.
         for (int i = 0; i < KLXR_SWAPCHAIN_MAX; i++)
-            if (&g_swapchains[i] != sc) {
+            if (&g_swapchains[i] != sc && g_swapchains[i].vk_stage1 == sc->vk_stage1) {
                 if (g_swapchains[i].mtl_eye == eye) g_swapchains[i].mtl_eye = -1;
                 g_swapchains[i].vk_pub &= ~(1u << eye);
             }
@@ -5603,6 +5741,33 @@ static void klxr_back_eye_images(klxr_swapchain *sc, int eye) {
 // Defined below, beside the quad path that also uses it: a swapchain's index in
 // the table, which is the stable per-swapchain identity the eye mirror keys on.
 static int klxr_layer_id(const klxr_swapchain *sc);
+
+// Every view of a projection layer read from view 0's image rect. A multiview
+// render pass draws all views through one viewport unless the device has
+// VK_QCOM_multiview_per_view_viewports / _render_areas, which MoltenVK does not.
+// HITMAN 3 VR: Reloaded asks for them and, without them, still reports where
+// they would have put each eye: the right eye at x 613 of its 2903-wide slice
+// (Mac, Vision Pro cones) while it was drawn at x 0, like the left. The
+// compositor then read the right eye from the wrong part of the slice — a
+// shifted, distorted right picture that would not fuse (headset, 2026-10-20).
+// Reading view 0's rect alone was not enough: the right eye's picture is drawn
+// with view 0's frustum too — the two Mac captures differ by 1..20 px of
+// parallax, where the right eye's own frustum would move everything ~613 px —
+// so that frustum is the one it is placed with; only the pose stays the view's.
+// On by default for that game only; KL_XR_VIEW0_RECT=1/0 forces it.
+static int klxr_view0_rect_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_XR_VIEW0_RECT", t && !strcmp(t, "x8012387035448196"));
+        if (on)
+            fprintf(stderr, "  [xr] every eye of a projection layer is read from view 0's "
+                            "image rect with view 0's frustum (no per-view viewports here; KL_XR_VIEW0_RECT=0 "
+                            "uses each view's own)\n");
+    }
+    return on;
+}
 
 static int klxr_eye_mirror_on(void) {
     static int on = -1;
@@ -5995,9 +6160,10 @@ static XrResult klxr_DestroySwapchain(void *swapchain) {
     // double-counts in the object census, which is what that census exists to
     // be trusted for.
     if (sc->vk_pub) {
+        int base = sc->vk_stage1 ? sc->vk_stage1 - 1 : 0;
         for (int e = 0; e < 2; e++)
             if (sc->vk_pub & (1u << e))
-                for (int i = 0; i < sc->count; i++) kl_glfb_release_eye_texture(e, i);
+                for (int i = 0; i < sc->count; i++) kl_glfb_release_eye_texture(e, base + i);
     } else if (sc->mtl_eye >= 0) {
         for (int i = 0; i < sc->count; i++) kl_glfb_release_eye_texture(sc->mtl_eye, i);
     } else if (gl_DeleteTextures) {
@@ -6010,6 +6176,41 @@ static XrResult klxr_DestroySwapchain(void *swapchain) {
             if (sc->blit_fbo[i]) gl_DeleteFramebuffers(1, &sc->blit_fbo[i]);
     memset(sc, 0, sizeof *sc);
     return KLXR_SUCCESS;
+}
+
+// XR_FB_foveation_vulkan: an XrSwapchainImageFoveationVulkanFB chained onto an
+// element asks for the swapchain image's fragment density map. HITMAN 3 VR:
+// Reloaded creates a view on it without checking, and VK_NULL_HANDLE made that
+// a SIGSEGV inside MoltenVK's MVKImageView (Mac run 2026-10-20). So it gets a
+// real image: R8G8_UNORM, one texel per 32x32 pixels (the Quest's density
+// texel size), as many layers as the swapchain. MoltenVK has no fragment
+// density maps, so nothing reads it — the eye is shaded at full density, which
+// is what an unfoveated image is anyway. The chain is read through
+// vm_read_overwrite like every guest chain here and written only once it read
+// back. Made once per image, kept with the swapchain like its colour images.
+struct klxr_fov_vk { int32_t type; int32_t pad; void *next; uint64_t image; uint32_t width, height; };
+static void klxr_fill_foveation_image(klxr_swapchain *sc, int i, void *next) {
+    for (int depth = 0; next && depth < 8; depth++) {
+        struct klxr_fov_vk node;
+        vm_size_t got = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)next, sizeof node,
+                              (vm_address_t)&node, &got) != KERN_SUCCESS || got != sizeof node) return;
+        if (node.type == 1000160000) {   // XR_TYPE_SWAPCHAIN_IMAGE_FOVEATION_VULKAN_FB
+            uint32_t w = (sc->width + 31) / 32, h = (sc->height + 31) / 32;
+            if (!sc->vk_fdm[i])
+                sc->vk_fdm[i] = kl_vulkan_xr_image(w, h, sc->array_size, 1, 16 /* VK_FORMAT_R8G8_UNORM */, 0);
+            struct klxr_fov_vk *out = (struct klxr_fov_vk *)next;
+            out->image = sc->vk_fdm[i];
+            out->width = w;
+            out->height = h;
+            if (i == 0)
+                fprintf(stderr, "  [xr] XR_FB_foveation_vulkan: density map %ux%u x%u for swapchain %ux%u "
+                                "(not read: MoltenVK has no fragment density maps)\n",
+                        w, h, sc->array_size, sc->width, sc->height);
+            return;
+        }
+        next = node.next;
+    }
 }
 
 static XrResult klxr_EnumerateSwapchainImages(void *swapchain, uint32_t capacity,
@@ -6037,7 +6238,10 @@ static XrResult klxr_EnumerateSwapchainImages(void *swapchain, uint32_t capacity
             KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
         }
         XrSwapchainImageVulkanKHR *vk = (XrSwapchainImageVulkanKHR *)images;
-        for (int i = 0; i < sc->count; i++) vk[i].image = sc->vk_img[i];
+        for (int i = 0; i < sc->count; i++) {
+            vk[i].image = sc->vk_img[i];
+            klxr_fill_foveation_image(sc, i, vk[i].next);
+        }
         return KLXR_SUCCESS;
     }
     if (got != XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR) {
@@ -6923,6 +7127,7 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                 const XrCompositionLayerEquirect2KHR *eq =
                     (const XrCompositionLayerEquirect2KHR *)layer;
                 klxr_swapchain *sc = klxr_swapchain_of(eq->subImage.swapchain);
+                klxr_vk_flat(sc);
                 if (sc && sc->last_released >= 0 && sc->last_released < sc->count &&
                     nquads < (int)(sizeof quads / sizeof *quads)) {
                     kl_ovrp_overlay *o = &quads[nquads];
@@ -7034,6 +7239,7 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     q = &qbuf;
                 }
                 klxr_swapchain *sc = klxr_swapchain_of(q->subImage.swapchain);
+                klxr_vk_flat(sc);
                 if (sc && sc->last_released >= 0 &&
                     sc->last_released < sc->count) {
                     // eyeVisibility BOTH means one image for both eyes; LEFT
@@ -7081,6 +7287,7 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                 memset(pl_cur, 0, sizeof *pl_cur);
                 pl_cur->slot[0] = pl_cur->slot[1] = -1;
                 pl_cur->pose[6] = 1.0f;          // identity orientation
+                pl_cur->xr_flags = (int)proj->layerFlags;
             } else {
                 static int said;
                 if (!said++)
@@ -7247,7 +7454,7 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     // GL path's array-vs-2D split has no counterpart.
                     klxr_publish_eye_vulkan(sc, (int)v,
                                             (int)proj->views[v].subImage.imageArrayIndex);
-                    slot = sc->last_released;
+                    slot = klxr_vk_stage_base(sc) + sc->last_released;
                 } else if (klxr_eye_mirror_on() || sc->array_size > 1) {
                     slot = klxr_mirror_eye_image(sc, (int)v,
                                           (int)proj->views[v].subImage.imageArrayIndex);
@@ -7255,7 +7462,8 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     klxr_back_eye_images(sc, (int)v);
                     slot = sc->last_released;
                 }
-                if (layers_on && pl_cur && li > 0 && slot == sc->last_released) {
+                if (layers_on && pl_cur && li > 0 && slot == sc->last_released &&
+                    !(sc->session && sc->session->gfx == KLXR_GFX_VULKAN)) {
                     static int said;
                     if (!said++)
                         fprintf(stderr, "  [xr] projection layer %u reaches the "
@@ -7293,6 +7501,11 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     lsp ? klxr_space_pose(lsp, &fpred) : (XrPosef){{0,0,0,1},{0,0,0}},
                     proj->views[v].pose);
                 const XrFovf *f = &proj->views[v].fov;
+                // Drawn through view 0's viewport, the picture also carries view
+                // 0's frustum (klxr_view0_rect_on): only the pose is the view's.
+                if (v > 0 && klxr_view0_rect_on() &&
+                    proj->views[0].subImage.swapchain == proj->views[v].subImage.swapchain)
+                    f = &proj->views[0].fov;
 
                 // This layer's own record, which is the per-layer composite:
                 // its picture, its frustum, its pose, placed against the
@@ -7319,6 +7532,21 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     // the image, which is not a rect anybody can sample.
                     {
                         const XrRect2Di *ir = &proj->views[v].subImage.imageRect;
+                        if (v > 0 && klxr_view0_rect_on() &&
+                            proj->views[0].subImage.swapchain == proj->views[v].subImage.swapchain) {
+                            const XrRect2Di *r0 = &proj->views[0].subImage.imageRect;
+                            static int said_shift;
+                            if (!said_shift && (r0->offset.x != ir->offset.x ||
+                                                r0->offset.y != ir->offset.y)) {
+                                said_shift = 1;
+                                fprintf(stderr, "  [xr] view %u says its picture is at %dx%d+%d+%d, "
+                                                "view 0's at %dx%d+%d+%d — read from view 0's "
+                                                "(KL_XR_VIEW0_RECT)\n", v,
+                                        ir->extent.width, ir->extent.height, ir->offset.x, ir->offset.y,
+                                        r0->extent.width, r0->extent.height, r0->offset.x, r0->offset.y);
+                            }
+                            ir = r0;
+                        }
                         float *pr = pl_cur->rect[v];
                         pr[0] = pr[1] = pr[2] = pr[3] = 0.0f;
                         if (sc->width > 0 && sc->height > 0 && ir->offset.x >= 0 &&
@@ -8978,6 +9206,50 @@ int kl_openxr_input_selftest(FILE *f) {
         ok &= klxr_st_ok(f, "Valve: a source path has a display name",
                          lr == KLXR_SUCCESS &&
                          strstr(nb, "Right Controller") != NULL);
+    }
+
+    // A BOOLEAN bound to the bare /input/thumbstick is the stick's click, not
+    // its deflection — HITMAN 3 VR: Reloaded's "thumbstick_click" (crouch on
+    // the right, the drag release on the left) fired on every push before.
+    klxr_st_boot();
+    {
+        XrActionSetCreateInfo hsi; memset(&hsi, 0, sizeof hsi);
+        hsi.type = XR_TYPE_ACTION_SET_CREATE_INFO;
+        snprintf(hsi.actionSetName, sizeof hsi.actionSetName, "%s", "hitman");
+        void *hset = NULL;
+        klxr_CreateActionSet(&g_instance, &hsi, &hset);
+        void *hclick = klxr_st_action(hset, "thumbstick_click", KLXR_ACTION_TYPE_BOOLEAN);
+        void *hpos   = klxr_st_action(hset, "thumbstick_pos", KLXR_ACTION_TYPE_VECTOR2F);
+        const XrActionSuggestedBinding hitman_map[] = {
+            klxr_st_sb(hclick, "/user/hand/right/input/thumbstick"),
+            klxr_st_sb(hpos,   "/user/hand/right/input/thumbstick"),
+        };
+        klxr_st_bind_all(KLXR_ACTIVE_PROFILE, hitman_map, 2);
+        ok &= klxr_st_ok(f, "bare thumbstick: a boolean binds the click, a Vector2f the stick",
+                         ((klxr_action *)hclick)->kind[1] == KLXR_SRC_BUTTON &&
+                         ((klxr_action *)hclick)->bit[1] == KL_OVRP_RAW_RTHUMBSTICK &&
+                         ((klxr_action *)hpos)->kind[1] == KLXR_SRC_STICK_VEC);
+
+        XrActionStateGetInfo hgi; memset(&hgi, 0, sizeof hgi);
+        hgi.type = XR_TYPE_ACTION_STATE_GET_INFO;
+        hgi.action = hclick;
+        klxr_StringToPath(&g_instance, "/user/hand/right", &hgi.subactionPath);
+        XrActionStateBoolean hb;
+        kl_ovrp_set_hand_pose(1, 0.2f, 1.0f, -0.3f, 0, 0, 0, 1);
+        kl_ovrp_set_controller_input(1, 0, 0, 0, 0, 1.0f, 0.0f);
+        kl_ovrp_frame_latch();
+        klxr_st_sync();
+        memset(&hb, 0, sizeof hb);
+        klxr_GetActionStateBoolean(&g_session, &hgi, &hb);
+        ok &= klxr_st_ok(f, "bare thumbstick: a full push is not a click",
+                         hb.isActive && !hb.currentState);
+        kl_ovrp_set_controller_input(1, KL_OVRP_RAW_RTHUMBSTICK, 0, 0, 0, 0.0f, 0.0f);
+        kl_ovrp_frame_latch();
+        klxr_st_sync();
+        memset(&hb, 0, sizeof hb);
+        klxr_GetActionStateBoolean(&g_session, &hgi, &hb);
+        ok &= klxr_st_ok(f, "bare thumbstick: pressing the stick is",
+                         hb.isActive && hb.currentState);
     }
 
     memset(&g_session, 0, sizeof g_session);

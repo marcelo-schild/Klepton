@@ -1984,11 +1984,20 @@ const char *kl_guest_path(const char *path, char *buf, size_t cap) {
 // enough storage space to install required resources" for a failed extract), so
 // the only reliable way to find which call actually failed is to watch them all.
 // KL_TRACE_FS=fail narrows it to the failures.
+// HITMAN 3 VR: Reloaded reports a failed save in its own words only; until that
+// is understood its failures are traced without asking (2026-10-20). The
+// target is known only once the guest is set up, so before that this answers
+// "off" without deciding.
 static int kl_fs_trace_mode(void) {
     static int mode = -1;   // 0 off, 1 failures only, 2 everything
     if (mode < 0) {
         const char *e = kl_env_str("KL_TRACE_FS", NULL);
-        mode = !e ? 0 : (strcmp(e, "fail") == 0 ? 1 : 2);
+        if (!e) {
+            extern const char *kl_driver_target_name(void);
+            const char *t = kl_driver_target_name();
+            if (!t) return 0;
+            mode = strcmp(t, "x8012387035448196") == 0 ? 1 : 0;
+        } else mode = strcmp(e, "fail") == 0 ? 1 : 2;
     }
     return mode;
 }
@@ -2462,6 +2471,81 @@ void *klb_readdir(void *d) {
     snprintf(out.d_name, sizeof out.d_name, "%s", e->d_name);
     kl_fs_trace("readdir", out.d_name, NULL, 0);   // KL_TRACE_FS=all: names the index sees
     return &out;
+}
+
+// nftw — HITMAN 3 VR: Reloaded walks its save and cache folders with it (three
+// calls in its file system layer); unresolved, the game aborted on the Mac
+// (2026-10-20). Darwin's nftw does the walk on the translated path; the guest's
+// callback is handed what bionic would hand it: the path under the guest's own
+// name for the folder (so a prefix it strips still matches), a bionic stat, the
+// same type values (FTW_F..FTW_SLN agree) and struct FTW (two ints on both).
+// Only the flag bits differ: Linux FTW_CHDIR 4 / FTW_DEPTH 8 are Darwin's 8 / 4.
+#include <ftw.h>
+typedef int (*kl_nftw_fn)(const char *, const bionic_stat *, int, struct FTW *);
+static __thread kl_nftw_fn t_nftw_fn;
+static __thread const char *t_nftw_guest, *t_nftw_host;
+static __thread size_t t_nftw_hostlen;
+static int kl_nftw_cb(const char *path, const struct stat *st, int type, struct FTW *ftw) {
+    bionic_stat b; memset(&b, 0, sizeof b);
+    if (st) stat_to_bionic(st, &b);
+    char gp[1024];
+    const char *give = path;
+    if (t_nftw_hostlen && !strncmp(path, t_nftw_host, t_nftw_hostlen)) {
+        snprintf(gp, sizeof gp, "%s%s", t_nftw_guest, path + t_nftw_hostlen);
+        give = gp;
+        // FTW.base is an offset into the path the callback receives.
+        if (ftw) ftw->base += (int)strlen(t_nftw_guest) - (int)t_nftw_hostlen;
+    }
+    return t_nftw_fn(give, st ? &b : NULL, type, ftw);
+}
+int klb_nftw(const char *p, kl_nftw_fn fn, int fd_limit, int flags) {
+    char kp[1024];
+    const char *q = kl_guest_path(p, kp, sizeof kp);
+    int f = flags & 3;                    // FTW_PHYS 1, FTW_MOUNT 2: the same
+    if (flags & 4) f |= FTW_CHDIR;        // Linux 4
+    if (flags & 8) f |= FTW_DEPTH;        // Linux 8
+    kl_nftw_fn saved_fn = t_nftw_fn; const char *sg = t_nftw_guest, *sh = t_nftw_host; size_t sl = t_nftw_hostlen;
+    t_nftw_fn = fn; t_nftw_guest = p; t_nftw_host = q; t_nftw_hostlen = q != p ? strlen(q) : 0;
+    int r = nftw(q, kl_nftw_cb, fd_limit > 0 ? fd_limit : 1, f);
+    t_nftw_fn = saved_fn; t_nftw_guest = sg; t_nftw_host = sh; t_nftw_hostlen = sl;
+    return r;
+}
+
+// gethostbyname_r — the last unresolved import of HITMAN 3 VR: Reloaded (its
+// network layer). IPv4 through getaddrinfo, written into the caller's hostent
+// and buffer (struct hostent is the same 32 bytes on both sides); bionic's
+// h_errno values: HOST_NOT_FOUND 1, TRY_AGAIN 2, NO_RECOVERY 3.
+#include <netdb.h>
+#include <arpa/inet.h>
+int klb_gethostbyname_r(const char *name, struct hostent *ret, char *buf, size_t buflen,
+                        struct hostent **result, int *h_err) {
+    if (result) *result = NULL;
+    if (!name || !ret || !buf) { if (h_err) *h_err = 3; return EINVAL; }
+    // KL_NET_OFFLINE (kl_shim.c's getaddrinfo): a headset without network asks nobody.
+    if (kl_env_on("KL_NET_OFFLINE", 0)) { if (h_err) *h_err = 2; return 0; }
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM }, *ai = NULL;
+    int e = getaddrinfo(name, NULL, &hints, &ai);
+    if (e || !ai) { if (h_err) *h_err = e == EAI_AGAIN ? 2 : 1; return 0; }
+    size_t nlen = strlen(name) + 1, naddr = 0;
+    for (struct addrinfo *x = ai; x && naddr < 16; x = x->ai_next) naddr++;
+    size_t need = (naddr + 1) * sizeof(char *) + sizeof(char *) + naddr * 4 + nlen + 8;
+    if (buflen < need) { freeaddrinfo(ai); if (h_err) *h_err = 3; return ERANGE; }
+    char **list = (char **)(void *)(((uintptr_t)buf + 7) & ~(uintptr_t)7);
+    char **aliases = list + naddr + 1;
+    char *addrs = (char *)(aliases + 1), *nm = addrs + naddr * 4;
+    size_t k = 0;
+    for (struct addrinfo *x = ai; x && k < naddr; x = x->ai_next, k++) {
+        memcpy(addrs + k * 4, &((struct sockaddr_in *)(void *)x->ai_addr)->sin_addr, 4);
+        list[k] = addrs + k * 4;
+    }
+    list[k] = NULL; aliases[0] = NULL;
+    memcpy(nm, name, nlen);
+    freeaddrinfo(ai);
+    ret->h_name = nm; ret->h_aliases = aliases; ret->h_addrtype = AF_INET; ret->h_length = 4;
+    ret->h_addr_list = list;
+    if (result) *result = ret;
+    if (h_err) *h_err = 0;
+    return 0;
 }
 
 // scandir over the same bionic_dirent the guest's readdir hands back — NOT the

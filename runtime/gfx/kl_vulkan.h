@@ -266,6 +266,9 @@ unsigned long long kl_vulkan_xr_image(unsigned w, unsigned h, unsigned layers,
 // ...and the MTLTexture behind one, for the compositor seam. NULL when it cannot
 // be exported.
 void *kl_vulkan_xr_image_mtl(unsigned long long image);
+// This image from kl_vulkan_xr_image belongs to a flat (quad) layer, not to an
+// eye: foveation leaves it, and what it registered through it, alone.
+void kl_vulkan_xr_image_not_eye(unsigned long long image);
 // KL_VK_OUT: write one array layer of an image from kl_vulkan_xr_image to
 // <dir>/xr_f<frame>_layer<n>_eye<e>.png, every KL_VK_OUT_EVERY-th frame. A no-op
 // without KL_VK_OUT.

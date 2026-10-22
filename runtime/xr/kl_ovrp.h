@@ -594,6 +594,12 @@ typedef struct {
     // picture squeezed into that corner with stale frames around it. A fraction
     // rather than pixels for kl_ovrp_render_pose.viewport_of's reason.
     float rect[2][4];
+    // The layer's XrCompositionLayerFlags as submitted. 0x2 (BLEND_TEXTURE_SOURCE_ALPHA)
+    // asks for it to be blended over the layers before it by its alpha, 0x4
+    // (UNPREMULTIPLIED_ALPHA) says that colour is not premultiplied. HITMAN 3 VR:
+    // Reloaded's second layer is its interface: transparent but for the menus,
+    // and composited opaque it covered the whole world with black (2026-10-20).
+    int   xr_flags;
 } kl_ovrp_proj_layer;
 
 // How many projection layers the guest's most recent frame submitted, and what

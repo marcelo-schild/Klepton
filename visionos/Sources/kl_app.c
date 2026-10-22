@@ -1935,9 +1935,14 @@ int kl_app_guest_start(void) {
     // the app at half rate from the start – 50 and 60 Hz where the Quest build, paced, is shown at 100
     // and 120. Told apart from the Quest build of the same target by the Steam library it ships; the
     // OVRPlugin pacer below is installed as well and is simply never reached by this build.
+    // ...and HITMAN 3 VR: Reloaded, a NativeActivity that drives OpenXR from its own main loop. Without
+    // the clock its xrWaitFrame returned at once: the game drew as fast as its own frame cap let it (65
+    // a second at 100 Hz once that cap was lowered, kl_guestpatch.c hitman3-frame-cap), never on a
+    // refresh, and "every second picture" (KL_GUEST_PACE_DIV) was never read (headset, 2026-10-20).
     extern int kl_steamapi_shipped(void);
     if (kl_app_target_is_steamlink() || target_is_jkxr() || target_is_linux() ||
         (g_target->name && strcmp(g_target->name, "cs1") == 0) ||
+        (g_target->name && strcmp(g_target->name, "x8012387035448196") == 0) ||
         (g_target->kind == KL_GUEST_UE4 && kl_steamapi_shipped()))
         kl_openxr_set_frame_pacer(guest_pace_wait);
     // ...and the same clock on the OVRPlugin side, for the other guest that

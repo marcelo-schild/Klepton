@@ -1747,6 +1747,13 @@ static int klovrp_title_cap(const char *t) {
         // start window and asked for it as the default when it was verified,
         // 2026-10-18 (7-8 ms of GPU a frame at 60 a second there).
         if (t && strcmp(t, "x2401648309868679") == 0) cap_dflt = 4096;
+        // HITMAN 3 VR: Reloaded (Glacier on Vulkan, OpenXR): 3584, with 100 Hz, a
+        // frame on every second refresh and foveation at "high" (targets.py
+        // STORE_DEFAULTS). 4096 was its owner's first choice, and at it the game
+        // ended at level changes: 6.5 GB held in a level, 7.7 of the ~8.2 the
+        // app may have while the next one loaded. At 3072 it held 5.3-5.7 GB
+        // and did not (headset, 2026-10-20); he asked for one step down.
+        if (t && strcmp(t, "x8012387035448196") == 0) cap_dflt = 3584;
         // Star Wars Pinball VR (UE 4.25 on GLES): its owner chose 4608 in the
         // start window and asked for it as the default, 2026-10-19, with 120 Hz
         // and a frame on every second refresh (targets.py STORE_DEFAULTS). On
@@ -2041,7 +2048,16 @@ static int klovrp_unify_default(void) {
     // Ghost Town uses the same widened eye texture and full-width viewport
     // for both eyes (3936x2465, then 5088x3204 with its resolution scale).
     // Match the compositor's cones to that symmetric-projection rendering.
-    static const char *on[] = { "intotheradius", "x5817243991680545", "walkabout", "x3634830803298285", "x9531494193591052" };
+    // HITMAN 3 VR: Reloaded (Glacier, OpenXR) does Meta's arithmetic itself: told
+    // the two canted cones it made its swapchain wider by their union (4096 ->
+    // 5193, x1.268 = 2 tan 60 / (tan 60 + tan 45)), drew both eyes through the
+    // left eye's viewport and frustum (no per-view viewports here, KL_XR_VIEW0_RECT)
+    // and so left the right eye's outer 15 degrees undrawn, while the start
+    // window said 4096 (the owner on device, 2026-10-20: "die auflösung ist 4096
+    // aber er rendert 5193"). Told the union, it draws each eye full width with
+    // one cone: the area the setting names, both eyes complete.
+    static const char *on[] = { "intotheradius", "x5817243991680545", "walkabout", "x3634830803298285", "x9531494193591052",
+                                "x8012387035448196" };
     const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;
@@ -3503,6 +3519,16 @@ static void klovrp_headless_pose(void) {
     static uint64_t t0;
     if (state == 1 || state == 3) return;
     if (!state) {
+        // KL_OVRP_HEAD_AFTER=<s>: no head at all until then (a Mac run that must
+        // get through a menu the way it does without one — HITMAN 3 VR:
+        // Reloaded's pointer otherwise sits on a row and pins the selection).
+        static uint64_t first;
+        double wait = kl_env_float("KL_OVRP_HEAD_AFTER", 0.0f);
+        if (wait > 0) {
+            uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            if (!first) first = now;
+            if ((double)(now - first) / 1e9 < wait) return;
+        }
         const char *e = kl_env_str("KL_OVRP_HEAD", NULL);
         state = 1;
         if (!e || !*e || __atomic_load_n(&g_head_set, __ATOMIC_ACQUIRE)) return;
@@ -5518,13 +5544,14 @@ void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
 // lands on the screens they show. Seconds cannot do that here — startup is
 // dominated by the engine's one-time shader optimization, which is minutes and
 // is not the same length twice.
-#define KLOVRP_POKE_MAX 32
+#define KLOVRP_POKE_MAX 160
 static struct klovrp_poke {
     double   t;                       // seconds after the first read
     long     frame;                   // ...or the guest frame, when >= 0
     uint32_t b[2];                    // raw button bits, per hand
     float    idx[2], grip[2];         // triggers, per hand
     float    sx, sy;                  // right thumbstick
+    float    lx, ly;                  // left thumbstick (LUP/LDOWN/LLEFT/LRIGHT)
     int      fired;
 } g_poke[KLOVRP_POKE_MAX];
 static int    g_poke_n = -1;          // -1 = not parsed yet
@@ -5550,14 +5577,22 @@ static int klovrp_poke_name(const char *n, size_t len, struct klovrp_poke *p) {
         { "DOWN",  1, KL_OVRP_RAW_RTHUMBSTICK_DOWN,  0, 0,  0, -1 },
         { "LEFT",  1, KL_OVRP_RAW_RTHUMBSTICK_LEFT,  0, 0, -1,  0 },
         { "RIGHT", 1, KL_OVRP_RAW_RTHUMBSTICK_RIGHT, 0, 0,  1,  0 },
+        // The left stick: HITMAN 3 VR: Reloaded's mission menu moves its
+        // selection with it and not with the right one (Mac, 2026-10-20).
+        { "LUP",    0, 0, 0, 0,  0,  1 },
+        { "LDOWN",  0, 0, 0, 0,  0, -1 },
+        { "LLEFT",  0, 0, 0, 0, -1,  0 },
+        { "LRIGHT", 0, 0, 0, 0,  1,  0 },
     };
     for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
         if (strlen(t[i].n) != len || strncasecmp(t[i].n, n, len) != 0) continue;
         p->b[t[i].hand] |= t[i].bit;
         if (t[i].idx)  p->idx[t[i].hand]  = 1.0f;
         if (t[i].grip) p->grip[t[i].hand] = 1.0f;
-        if (t[i].sx)   p->sx = t[i].sx;
-        if (t[i].sy)   p->sy = t[i].sy;
+        if (t[i].hand == 1 && t[i].sx) p->sx = t[i].sx;
+        if (t[i].hand == 1 && t[i].sy) p->sy = t[i].sy;
+        if (t[i].hand == 0 && t[i].sx) p->lx = t[i].sx;
+        if (t[i].hand == 0 && t[i].sy) p->ly = t[i].sy;
         return 1;
     }
     return 0;
@@ -5596,7 +5631,7 @@ static void klovrp_poke_parse(void) {
             if (!klovrp_poke_name(w, (size_t)(s - w), &p)) {
                 fprintf(stderr, "  [ovrp] KL_OVRP_POKE: no button named \"%.*s\" — "
                                 "A B X Y START BACK RTRIG LTRIG RGRIP LGRIP UP "
-                                "DOWN LEFT RIGHT\n", (int)(s - w), w);
+                                "DOWN LEFT RIGHT LUP LDOWN LLEFT LRIGHT\n", (int)(s - w), w);
                 ok = 0;
             }
             if (*s != '+') break;
@@ -5644,6 +5679,9 @@ static klovrp_input_state klovrp_input(int hand) {
         if (hand == 1) {
             if (p->sx != 0) v.stick_x = p->sx;
             if (p->sy != 0) v.stick_y = p->sy;
+        } else {
+            if (p->lx != 0) v.stick_x = p->lx;
+            if (p->ly != 0) v.stick_y = p->ly;
         }
     }
     return v;
@@ -5655,14 +5693,68 @@ static klovrp_input_state klovrp_input(int hand) {
 // ovrp_GetNodePoseState hands the other guest in the same frame. Reading
 // g_hand_pose directly here would have been the shorter line and would have
 // reintroduced the unlatched read in a new API.
+// The press knobs (KL_OVRP_POKE, KL_OVRP_FAKE_BUTTONS / _TRIGGER) make both hands
+// present and tracked at their parked pose: on the Mac no frontend publishes
+// one, an OpenXR guest's actions read nothing from an absent hand, and HITMAN 3
+// VR: Reloaded draws an untracked controller at the LOCAL origin — in the eye
+// once LOCAL is eye-level (2026-10-20).
+static int klovrp_fake_present(void) {
+    static int fake = -1;
+    if (fake < 0) fake = kl_env_uint("KL_OVRP_FAKE_BUTTONS", 0) != 0 || kl_env_str("KL_OVRP_FAKE_TRIGGER", NULL) != NULL
+                         || kl_env_str("KL_OVRP_POKE", NULL) != NULL;
+    return fake;
+}
+// KL_OVRP_HAND_SCRIPT="<s>:<L|R>:<dx>,<dy>,<dz>;..." — a host run's hands, placed
+// relative to the head (metres, head frame: +x right, +y up, -z ahead) from that
+// many seconds on, until that hand's next entry; "<s>:<L|R>:off" hands it back.
+// Timed on KL_OVRP_POKE's clock, so the two scripts line up. For a tutorial that
+// asks for a gesture — HITMAN 3 VR: Reloaded's "move the item into the wrist
+// inventory ring" (Mac, 2026-10-21). Diagnostic; a headset never sets it.
+#define KLOVRP_HS_MAX 64
+static struct { double t; int hand, off; float d[3]; } g_hs[KLOVRP_HS_MAX];
+static int g_hs_n = -1;
+static void klovrp_hand_script(int hand, klovrp_pose *p) {
+    if (g_hs_n < 0) {
+        g_hs_n = 0;
+        const char *s = kl_env_str("KL_OVRP_HAND_SCRIPT", NULL);
+        while (s && *s && g_hs_n < KLOVRP_HS_MAX) {
+            double t; char h; float x, y, z; int n = 0;
+            if (sscanf(s, "%lf:%c:off%n", &t, &h, &n) == 2 && n) {
+                g_hs[g_hs_n].t = t; g_hs[g_hs_n].hand = (h == 'L' || h == 'l') ? 0 : 1; g_hs[g_hs_n].off = 1; g_hs_n++;
+            } else if (sscanf(s, "%lf:%c:%f,%f,%f%n", &t, &h, &x, &y, &z, &n) == 5 && n) {
+                g_hs[g_hs_n].t = t; g_hs[g_hs_n].hand = (h == 'L' || h == 'l') ? 0 : 1; g_hs[g_hs_n].off = 0;
+                g_hs[g_hs_n].d[0] = x; g_hs[g_hs_n].d[1] = y; g_hs[g_hs_n].d[2] = z; g_hs_n++;
+            } else break;
+            s = strchr(s, ';');
+            if (s) s++;
+        }
+        if (g_hs_n) fprintf(stderr, "  [ovrp] KL_OVRP_HAND_SCRIPT: %d hand placement(s)\n", g_hs_n);
+    }
+    if (!g_hs_n) return;
+    double now = klovrp_mono_now();
+    if (g_poke_t0 == 0.0) g_poke_t0 = now;
+    double el = now - g_poke_t0;
+    int at = -1;
+    for (int i = 0; i < g_hs_n; i++)
+        if (g_hs[i].hand == hand && g_hs[i].t <= el && (at < 0 || g_hs[i].t >= g_hs[at].t)) at = i;
+    if (at < 0 || g_hs[at].off) return;
+    klovrp_pose head = klovrp_head();
+    float ox, oy, oz;
+    klovrp_qrot(&head, g_hs[at].d[0], g_hs[at].d[1], g_hs[at].d[2], &ox, &oy, &oz);
+    p->px = head.px + ox; p->py = head.py + oy; p->pz = head.pz + oz;
+    p->qx = head.qx; p->qy = head.qy; p->qz = head.qz; p->qw = head.qw;
+    p->vx = p->vy = p->vz = 0; p->avx = p->avy = p->avz = 0;
+}
+
 int kl_ovrp_hand_motion(int hand, float *pos, float *quat, float *vel, float *ang) {
     if ((unsigned)hand > 1) return 0;
     klovrp_pose p = klovrp_hand(hand);
+    klovrp_hand_script(hand, &p);
     if (pos)  { pos[0] = p.px; pos[1] = p.py; pos[2] = p.pz; }
     if (quat) { quat[0] = p.qx; quat[1] = p.qy; quat[2] = p.qz; quat[3] = p.qw; }
     if (vel)  { vel[0] = p.vx; vel[1] = p.vy; vel[2] = p.vz; }
     if (ang)  { ang[0] = p.avx; ang[1] = p.avy; ang[2] = p.avz; }
-    return __atomic_load_n(&g_hand_set[hand], __ATOMIC_ACQUIRE) ? 1 : 0;
+    return (klovrp_fake_present() || __atomic_load_n(&g_hand_set[hand], __ATOMIC_ACQUIRE)) ? 1 : 0;
 }
 
 int kl_ovrp_controller_input(int hand, uint32_t *buttons, uint32_t *touches,
@@ -5680,7 +5772,7 @@ int kl_ovrp_controller_input(int hand, uint32_t *buttons, uint32_t *touches,
     // hand publishes both in the same breath, and there is no separate "the
     // buttons are meaningful" signal here. A hand-tracked hand therefore reads
     // present with every button released, which is the truth about it.
-    return __atomic_load_n(&g_hand_set[hand], __ATOMIC_ACQUIRE) ? 1 : 0;
+    return (klovrp_fake_present() || __atomic_load_n(&g_hand_set[hand], __ATOMIC_ACQUIRE)) ? 1 : 0;
 }
 
     // KL_OVRP_HANDS_SWEEP=1: collapse both hands onto the head and sweep their

@@ -2078,6 +2078,10 @@ static int kl_execv(const char *p, char *const argv[]) {
 // time (January: no DST). tzset is forwarded rather than wrapped, so a guest
 // that calls it and re-reads the variable still sees this value.
 static long kl_timezone_var;
+// `daylight` is its partner (HITMAN 3 VR: Reloaded imports it): nonzero when the
+// zone has summer time at all, read here as "July's offset differs from
+// January's" — the same question tzset answers on Linux.
+static int kl_daylight_var;
 __attribute__((constructor)) static void kl_init_timezone(void) {
     tzset();
     struct tm jan = {0};
@@ -2085,6 +2089,12 @@ __attribute__((constructor)) static void kl_init_timezone(void) {
     time_t t = mktime(&jan);
     struct tm lt;
     if (t != (time_t)-1 && localtime_r(&t, &lt)) kl_timezone_var = -lt.tm_gmtoff;
+    struct tm jul = {0};
+    jul.tm_year = 120; jul.tm_mon = 6; jul.tm_mday = 15; jul.tm_isdst = -1;
+    time_t u = mktime(&jul);
+    struct tm lu;
+    if (t != (time_t)-1 && u != (time_t)-1 && localtime_r(&u, &lu))
+        kl_daylight_var = lu.tm_gmtoff != -kl_timezone_var;
 }
 
 // ---------- small bionic-isms ----------
@@ -2129,7 +2139,7 @@ X(klb_errno) X(klb_gettid) X(klb_sysprop_find) X(klb_sysprop_get) X(klb_sysprop_
 X(klb_prctl) X(klb_sched_getaffinity) X(klb_sched_setaffinity)
 X(klb___sched_cpucount) X(klb___libc_current_sigrtmin) X(klb___libc_current_sigrtmax)
 X(klb_stat) X(klb_lstat) X(klb_fstat) X(klb_statfs) X(klb_uname) X(klb_sigaction)
-X(klb_opendir) X(klb_readdir) X(klb_closedir) X(klb_scandir) X(klb_alphasort)
+X(klb_opendir) X(klb_readdir) X(klb_closedir) X(klb_scandir) X(klb_alphasort) X(klb_nftw) X(klb_gethostbyname_r)
 X(klb_FD_ISSET_chk) X(klb_FD_SET_chk) X(klb_ctype_mb_cur_max) X(klb_lseek64)
 X(klb_close) X(klb_lseek) X(klb_pread)
 X(klb_sysconf) X(klb_fopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_rename) X(klb_link)
@@ -2150,6 +2160,9 @@ X(klb_pthread_rwlock_wrlock) X(klb_pthread_rwlock_unlock)
 X(klb_pthread_attr_init) X(klb_pthread_attr_destroy) X(klb_pthread_attr_setstacksize) X(klb_pthread_attr_getstacksize)
 X(klb_pthread_attr_setdetachstate) X(klb_pthread_attr_getstack) X(klb_pthread_getattr_np)
 X(klb_pthread_attr_setschedpolicy) X(klb_pthread_attr_setschedparam)
+X(klb_pthread_attr_getdetachstate) X(klb_pthread_attr_getinheritsched) X(klb_pthread_attr_getschedpolicy)
+X(klb_pthread_attr_getschedparam) X(klb_pthread_attr_getguardsize) X(klb_pthread_setschedprio)
+X(klb_pthread_rwlockattr_init) X(klb_pthread_rwlockattr_destroy)
 X(klb_pthread_key_create) X(klb_pthread_key_delete) X(klb_pthread_getspecific)
 X(klb_pthread_setspecific) X(klb_pthread_once)
 X(klb_pthread_create) X(klb_pthread_join) X(klb_pthread_detach) X(klb_pthread_exit)
@@ -2183,7 +2196,7 @@ X(klb_ungetwc) X(klb_fputwc) X(klb_putwc) X(klb_fwide)
 X(klb_pthread_rwlock_tryrdlock) X(klb_pthread_rwlock_trywrlock)
 X(klb___register_atfork) X(klb___gnu_strerror_r) X(klb___write_chk)
 // ...and what the 2D frontend (libshell + Qt6) adds on top of it.
-X(klb_eventfd) X(klb_eventfd_read) X(klb_eventfd_write) X(klb_ppoll)
+X(klb_eventfd) X(klb_eventfd_read) X(klb_eventfd_write) X(klb_ppoll) X(klb_timerfd_create) X(klb_timerfd_settime)
 X(klb_accept4) X(klb_pipe2) X(klb_dup2) X(klb_dup3) X(klb_memfd_create) X(klb_clone)
 X(klb_inotify_init) X(klb_inotify_init1)
 X(klb_inotify_add_watch) X(klb_inotify_rm_watch)
@@ -2337,6 +2350,15 @@ void kl_libc_free_report(FILE *f) {
 
 // ---------- table ----------
 typedef struct { const char *name; void *fn; } kl_entry;
+// bionic's FORTIFY fread: the caller's buffer size rides along, and a read that
+// could overrun it is a fatal check, as in bionic, rather than a quiet overflow.
+static size_t kl_fread_chk(void *p, size_t cap, size_t a, size_t b, void *f) {
+    if (a && b > cap / a) {
+        fprintf(stderr, "[klepton] fatal: __fread_chk: %zu x %zu bytes into a %zu-byte buffer\n", a, b, cap);
+        abort();
+    }
+    return kl_fread(p, a, b, f);
+}
 #define E(n, f)   { n, (void *)(f) }
 #define KL_FWD(n) { #n, (void *)(n) },
 
@@ -2474,7 +2496,7 @@ static const kl_entry g_shim[] = {
     E("mkdir", klb_mkdir), E("unlink", klb_unlink), E("rename", klb_rename),
     E("link", klb_link),
     E("opendir", klb_opendir), E("readdir", klb_readdir), E("closedir", klb_closedir),
-    E("scandir", klb_scandir), E("alphasort", klb_alphasort),
+    E("scandir", klb_scandir), E("alphasort", klb_alphasort), E("nftw", klb_nftw), E("gethostbyname_r", klb_gethostbyname_r),
     E("lseek64", klb_lseek64), E("__ctype_get_mb_cur_max", klb_ctype_mb_cur_max),
     E("getpwuid", klb_getpwuid), E("getpwuid_r", klb_getpwuid_r),
     E("prctl", klb_prctl),
@@ -2578,6 +2600,7 @@ static const kl_entry g_shim[] = {
     // fallback for. None is a silent success.
     E("eventfd", klb_eventfd),
     E("eventfd_read", klb_eventfd_read), E("eventfd_write", klb_eventfd_write),
+    E("timerfd_create", klb_timerfd_create), E("timerfd_settime", klb_timerfd_settime),
     E("ppoll", klb_ppoll),
     E("accept4", klb_accept4), E("pipe2", klb_pipe2), E("dup3", klb_dup3),
     E("dup2", klb_dup2),
@@ -2754,7 +2777,20 @@ static const kl_entry g_shim[] = {
     E("roundl", klv_roundl),
     // FORTIFY forms and a DATA symbol.
     E("__strlcat_chk", kl_strlcat_chk), E("__strlcpy_chk", kl_strlcpy_chk),
-    E("timezone", &kl_timezone_var),
+    E("timezone", &kl_timezone_var), E("daylight", &kl_daylight_var),
+    // HITMAN 3 VR: Reloaded (2026-10-20): the attr getters and setschedprio
+    // (kl_pthread.c), the FORTIFY fread, and two host functions whose ABI is
+    // the same on both sides.
+    E("pthread_attr_getdetachstate", klb_pthread_attr_getdetachstate),
+    E("pthread_attr_getinheritsched", klb_pthread_attr_getinheritsched),
+    E("pthread_attr_getschedpolicy", klb_pthread_attr_getschedpolicy),
+    E("pthread_attr_getschedparam", klb_pthread_attr_getschedparam),
+    E("pthread_attr_getguardsize", klb_pthread_attr_getguardsize),
+    E("pthread_setschedprio", klb_pthread_setschedprio),
+    E("pthread_rwlockattr_init", klb_pthread_rwlockattr_init),
+    E("pthread_rwlockattr_destroy", klb_pthread_rwlockattr_destroy),
+    E("__fread_chk", kl_fread_chk),
+    E("nextafterf", nextafterf), E("inflateValidate", inflateValidate),
 
     E("__klepton_unresolved", kl_unresolved),
 };

@@ -1782,6 +1782,15 @@ puts the camera on the ground with its hands underneath it.
   which hands the shader the same bits. Default 1 for `x5245041552210029`
   (Arizona Sunshine 2), else 0 — Alien keeps such a pipeline refused, as it was
   measured.
+- `KL_VK_GRID_DILATE=0|1` — conservative rasterization for draws through a
+  100x60 viewport: each is drawn again four times with the viewport moved by
+  ±0.49 pixel, so every pixel a primitive touches gets a fragment. HITMAN 3 VR:
+  Reloaded sorts the gates between its rooms and its lights into two 100x60
+  screen grids that way, and a lighting shader takes a pixel's room and lights
+  from its cell; cells a slanted edge only grazed were left out here (not on the
+  Quest) and lit as the wrong room — lighter steps along the window in the VR
+  tutorial's third room and along shadow edges. Default 1 for
+  `x8012387035448196`, else 0.
 - `KL_VK_SUBPASS_MS_SAMPLE=0|1` — a fragment shader that reads a
   MULTISAMPLED subpass input (OpTypeImage Dim=SubpassData MS=1) with a bare
   subpassLoad — an OpImageRead with no Sample operand, which the spec forbids

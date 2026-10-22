@@ -886,6 +886,80 @@ int klb_eventfd_write(int fd, uint64_t value) {
     return w == (ssize_t)sizeof value ? 0 : -1;
 }
 
+// timerfd_create / timerfd_settime — HITMAN 3 VR: Reloaded's HTTP manager
+// (ZHttpManagerQuest::InitAsyncIO) puts one beside its curl sockets in an epoll
+// set as curl's timeout clock, and the game aborted on the unresolved import
+// before its first frame (Mac run 2026-10-20). Darwin has no timerfd, so it is
+// the eventfd above — a self-connected datagram socket epoll (kqueue) sees as
+// readable — fed by a dispatch timer that sends one 8-byte count per expiry.
+// What is not reproduced: the accumulated counter (each expiry is its own
+// datagram, a read returns 1) and the clock choice (relative times on the
+// monotonic clock, TFD_TIMER_ABSTIME converted from CLOCK_MONOTONIC). The timer
+// writes through its own dup of the fd, so a guest close never makes it write
+// into a reused descriptor number; that dup and the timer stay until the
+// process ends — one per timerfd, and the one game that uses it makes one.
+#include <dispatch/dispatch.h>
+#include <time.h>
+#define LX_TFD_TIMER_ABSTIME 1
+typedef struct { struct timespec it_interval, it_value; } lx_itimerspec;   // same 32 bytes on both sides
+static struct { int fd, out; dispatch_source_t src; int resumed; lx_itimerspec cur; } g_tfd[16];
+static pthread_mutex_t g_tfd_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void kl_tfd_fire(void *ctx) {
+    int i = (int)(intptr_t)ctx;
+    uint64_t one = 1;
+    send(g_tfd[i].out, &one, sizeof one, MSG_DONTWAIT);
+}
+
+int klb_timerfd_create(int clockid, int flags) {
+    (void)clockid;
+    // TFD_CLOEXEC and TFD_NONBLOCK are O_CLOEXEC and O_NONBLOCK, the eventfd flags' values.
+    int fd = klb_eventfd(0, flags & (LX_EFD_CLOEXEC | LX_EFD_NONBLOCK));
+    if (fd < 0) return -1;
+    pthread_mutex_lock(&g_tfd_lock);
+    int i;
+    for (i = 0; i < 16 && g_tfd[i].src; i++) {}
+    if (i < 16) { g_tfd[i].fd = fd; g_tfd[i].out = dup(fd); g_tfd[i].resumed = 0;
+                  memset(&g_tfd[i].cur, 0, sizeof g_tfd[i].cur);
+                  g_tfd[i].src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                     dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+                  if (g_tfd[i].src) { dispatch_set_context(g_tfd[i].src, (void *)(intptr_t)i);
+                                      dispatch_source_set_event_handler_f(g_tfd[i].src, kl_tfd_fire); } }
+    pthread_mutex_unlock(&g_tfd_lock);
+    if (i == 16 || !g_tfd[i].src) { close(fd); errno = EMFILE; return -1; }
+    fprintf(stderr, "  [libc] timerfd_create -> fd %d (a datagram socket fed by a dispatch timer)\n", fd);
+    return fd;
+}
+
+int klb_timerfd_settime(int fd, int flags, const lx_itimerspec *nv, lx_itimerspec *old) {
+    if (!nv) { errno = EFAULT; return -1; }
+    pthread_mutex_lock(&g_tfd_lock);
+    int i;
+    for (i = 0; i < 16 && !(g_tfd[i].src && g_tfd[i].fd == fd); i++) {}
+    if (i == 16) { pthread_mutex_unlock(&g_tfd_lock); errno = EINVAL; return -1; }
+    if (old) *old = g_tfd[i].cur;
+    g_tfd[i].cur = *nv;
+    int64_t value = (int64_t)nv->it_value.tv_sec * 1000000000 + nv->it_value.tv_nsec;
+    int64_t every = (int64_t)nv->it_interval.tv_sec * 1000000000 + nv->it_interval.tv_nsec;
+    if (value > 0 && (flags & LX_TFD_TIMER_ABSTIME)) {
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        value -= (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+        if (value < 1) value = 1;
+    }
+    // An interval of DISPATCH_TIME_FOREVER is libdispatch's one-shot; a start
+    // of FOREVER is a timer that never fires, i.e. disarmed. Re-arming is only
+    // set_timer again, so the source is resumed exactly once (a second resume
+    // is fatal in libdispatch).
+    if (value <= 0)
+        dispatch_source_set_timer(g_tfd[i].src, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
+    else
+        dispatch_source_set_timer(g_tfd[i].src, dispatch_time(DISPATCH_TIME_NOW, value),
+                                  every > 0 ? (uint64_t)every : DISPATCH_TIME_FOREVER, 1000000);
+    if (!g_tfd[i].resumed) { g_tfd[i].resumed = 1; dispatch_resume(g_tfd[i].src); }
+    pthread_mutex_unlock(&g_tfd_lock);
+    return 0;
+}
+
 // ---- ppoll ----
 //
 // poll() with a timespec and an optional signal mask. The mask swap is NOT

@@ -567,6 +567,11 @@ static int recon_run(int view_pump) {
     // left while the engine was still opening its files.
     if (TARGET->kind == KL_GUEST_SDL2 && getenv("KL_LIFECYCLE"))
         return native_door_run(view_pump);
+    // ...and a NativeActivity guest with a render thread of its own (HITMAN 3
+    // VR: Reloaded): without the pump the host run ended three seconds in, at
+    // the loading screen, and KL_NATIVE_WAIT did nothing.
+    if (TARGET->kind == KL_GUEST_NATIVE && getenv("KL_LIFECYCLE"))
+        return native_door_run(view_pump);
 
     if (kl_driver_boot(stdout) != 0) return fail(kl_driver_error());
 

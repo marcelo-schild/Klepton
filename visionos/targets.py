@@ -199,6 +199,27 @@ TARGETS = {
         # .upperLimbVisibility(.hidden).
         "hand_matting": False,
     },
+    "x2582932495064035": {
+        # Real VR Fishing 3.06102 (com.Miragesoft.RealVrFishingQ).  Keep an
+        # explicit AVP Play target so this game uses the normal launcher and
+        # stable bundle/product identity instead of the generic Klepton route.
+        "libs":    None,
+        "srcdir":  "x2582932495064035/lib/arm64-v8a",
+        "tree":    "x2582932495064035",
+        "apk":     "x2582932495064035.apk",
+        "assets":  "x2582932495064035/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonX2582932495064035",
+        "display": "Real VR Fishing",
+        "hand_matting": False,
+        "stage_files": "Android/obb/com.Miragesoft.RealVrFishingQ",
+        "obb_file":    "main.1219.com.Miragesoft.RealVrFishingQ.obb",
+        "meta_apk_id": "29566115676319018",
+        "meta_obb_id": "29566100019653917",
+    },
     "batman": {
         # Batman: Arkham Shadow 1.4.1 (com.camouflaj.manta, versionCode 350961).
         # Unity 2022 + IL2CPP + Burst, the Oculus XR plugin, Wwise for audio,

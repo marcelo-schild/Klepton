@@ -297,8 +297,9 @@ static klj_val klj_Omni_start(void *env, void *self, const klj_val *a, int n) {
 // may be created later (resumeAll resumes the ones that exist: none). With no
 // answer the first of them stopped the game before its first frame ("no host
 // implementation", 2026-10-11). Real VR Fishing (x2582932495064035) sets two
-// more of the same kind on the way into its title scene, setDrmEnabled and
-// globallySetUserAgent (fix 37, 2026-10-14; not run here).
+// more of the same kind on the way into its title scene, setDrmEnabled,
+// setRemoteDebuggingEnabled and globallySetUserAgent (fix 37, 2026-10-14;
+// setRemoteDebuggingEnabled observed on device 2026-10-20).
 //
 // Deliberately only these. WebView3D.<init> and everything that would hand the
 // game a page stays unimplemented, so a game that really opens a web view
@@ -325,6 +326,21 @@ static klj_val klj_Vuplex_isWebViewAvailable(void *env, void *self, const klj_va
         KLJ_LOG("com/vuplex/webview/WebView3D.isWebViewAvailable() -> false "
                 "(no Android WebView on this host)");
     return (klj_val){.j = 0};
+}
+
+// Real VR Fishing's native microphone helper checks Android's Bluetooth
+// adapter after the title scene loads. visionOS owns the headset's Bluetooth
+// route and exposes no Android adapter to the guest, so this is the same result
+// Android returns on a device without Bluetooth support: null. The helper then
+// continues with its non-Bluetooth audio path.
+static klj_val klj_BluetoothAdapter_getDefaultAdapter(void *env, void *self,
+                                                       const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("BluetoothAdapter.getDefaultAdapter() -> null (Bluetooth audio "
+                "routing belongs to visionOS)");
+    return (klj_val){.l = NULL};
 }
 
 // ---- Meta Voice SDK: a telemetry service that is never bound ----
@@ -2855,10 +2871,17 @@ const klj_binding klj_bind_services[] = {
     {"com/vuplex/webview/WebView3D", "setAlternativePointerInputSystemEnabled", "(Z)V", klj_Vuplex_setting},
     {"com/vuplex/webview/WebView3D", "setAutoplayEnabled", "(Z)V", klj_Vuplex_setting},
     {"com/vuplex/webview/WebView3D", "setDrmEnabled", "(Z)V", klj_Vuplex_setting},
+    {"com/vuplex/webview/WebView3D", "setRemoteDebuggingEnabled", "(Z)V", klj_Vuplex_setting},
     {"com/vuplex/webview/WebView3D", "globallySetUserAgent", "(Ljava/lang/String;)V", klj_Vuplex_setting},
     {"com/vuplex/webview/WebView3D", "globallySetUserAgent", "(Z)V", klj_Vuplex_setting},
     {"com/vuplex/webview/WebView3D", "resumeAll", "()V", klj_Vuplex_setting},
     {"com/vuplex/webview/WebView3D", "isWebViewAvailable", "()Z", klj_Vuplex_isWebViewAvailable},
+    {"android/bluetooth/BluetoothAdapter", "getDefaultAdapter", "()Ljava/lang/Object;", klj_BluetoothAdapter_getDefaultAdapter},
+    // Real VR Fishing's Java audio bridge caches an encoded clip before the
+    // lobby begins. The native output path is loaded separately; accepting the
+    // cache hint is equivalent to a completed asynchronous preload and avoids
+    // making the optional Android-side cache a launch requirement.
+    {"com/qck/nativeaudiobridge/NativeAudioBridge", "PreloadAudio", "(Ljava/lang/String;[BIIZ)V", klj_void_noop},
     // The Voice SDK's telemetry connection (see klj_VoiceLogger_getService):
     // the fragment is an inert object, the service behind it is never bound.
     {"com/oculus/assistant/api/unity/logging/UnityPlatformLoggerServiceFragment", "createAndAttach",

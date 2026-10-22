@@ -2527,18 +2527,15 @@ static uint64_t klplat_user_id(void) { pthread_once(&g_user_once, klplat_user_in
 // download and an upload). The game itself carries a profile over when the id
 // changes: it copies it to the new id's folder (LAST_DATAPATH_Oculus).
 //
-// ...and the two titles that got the offline user with fixes 37 and 38 (Real VR
-// Fishing, BattleGroupVR2; 2026-10-14) have it from their first release here:
-// nobody on this side has their files, so nobody could look whether they key
-// an account on the id — Real VR Fishing is an online game with things to buy —
-// and one account shared by every player is the worse of the two mistakes.
-// There are no saves filed under the fixed id to lose, apart from the two
-// senders' own.
+// BattleGroupVR2 got the offline user with fix 38 (2026-10-14) and keeps its
+// per-install id. Real VR Fishing must retain the legacy fixed id: its local
+// save is encrypted/keyed under User_1000000000000042, and changing the id on
+// reinstall makes the game reject that save and deliberately quit after load.
 // ...and every title under the profile for untested games, for the same
 // reason: nobody here knows whether it keys an account on the id.
 int kl_ovrplat_user_id_per_install(const char *target) {
     return target && (strcmp(target, "x3634830803298285") == 0 || strcmp(target, "walkabout") == 0 ||
-                      strcmp(target, "x2582932495064035") == 0 || strcmp(target, "x9386827918099701") == 0 ||
+                      strcmp(target, "x9386827918099701") == 0 ||
                       kl_untested_target(target));
 }
 static uint64_t klplat_User_GetLoggedInUser(void) {

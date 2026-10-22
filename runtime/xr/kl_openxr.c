@@ -2678,15 +2678,19 @@ enum { KLXR_REF_SPACE_ANCHOR = 0x6b6c5000, KLXR_ANCHOR_MAX = 64 };
 // the tracking origin raised to the eye height, and the origin is on the floor,
 // so LOCAL_FLOOR is the origin itself — the pose STAGE already has. Refused,
 // DreamSpace asked for it ~4000 times a run and never reached xrBeginSession: a
-// black picture with its music playing (2026-10-16).
-//   KL_XR_LOCAL_FLOOR=0|1 — default 1 for DreamSpace (x9449316705178989), else
-//       0: a guest that runs today keeps the reference spaces it was given.
+// black picture with its music playing (2026-10-16). Fluid (x6946182742093178,
+// Unity OpenXR, api 1.1.54) did the same: ~6000 refusals, no xrBeginSession,
+// black (2026-10-21).
+//   KL_XR_LOCAL_FLOOR=0|1 — default 1 for DreamSpace (x9449316705178989) and
+//       Fluid (x6946182742093178), else 0: a guest that runs today keeps the
+//       reference spaces it was given.
 static int klxr_local_floor_on(void) {
     static int on = -1;
     if (on < 0) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
-        on = kl_env_on("KL_XR_LOCAL_FLOOR", t && !strcmp(t, "x9449316705178989"));
+        on = kl_env_on("KL_XR_LOCAL_FLOOR", t && (!strcmp(t, "x9449316705178989") ||
+                                                  !strcmp(t, "x6946182742093178")));
     }
     // Core from 1.1 on; before that it is an extension we do not advertise.
     uint64_t v = (uint64_t)g_instance.api_version;

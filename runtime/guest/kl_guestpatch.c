@@ -722,7 +722,37 @@ static const kl_gp_word k_moh_exit_no_rhi_teardown[] = {
     { 0x684f3b8, 0x9450a993, 0x9450a993, "fingerprint only (AndroidMain: bl RequestExit)" },
 };
 
+// Fluid Browser + Video Player (com.Fluid.Fluid 0.44.6.1, version code 845,
+// store target x6946182742093178; Unity 6000.3, metadata v39): the startup
+// sequence's "Keyboard Warmup" step never completes, so the app stays on its
+// logo with the progress bar full (2026-10-21).
+//
+// StartupLoadSequence.KeyboardWarmupStep waits for its SurfaceAttached
+// property, which is
+//
+//     get => <forced> || (keyboard != null && keyboard.WarmupSurfaceAttached);
+//
+// and FluidVirtualKeyboard.WarmupSurfaceAttached is set only when the Java
+// keyboard (so/fluid/kb/FluidKeyboard) attaches its Android surface. There is
+// no Java here, so it never is. The route: metadata v39 names the methods
+// (KeyboardWarmupStep::get_SurfaceAttached is token 0x06001b2d), and
+// Assembly-CSharp.dll's Il2CppCodeGenModule methodPointers[rid - 1] gives
+// 0x443564c. Taking the <forced> edge makes the step complete; the keyboard
+// itself stays without its surface, as it would anyway.
+//   0x443567c  cbz w8, 0x4435688  -> nop     ; SurfaceAttached -> true
+static const kl_gp_word k_fluid_keyboard_warmup[] = {
+    { 0x443567c, 0x34000068, 0xd503201f, "KeyboardWarmupStep::get_SurfaceAttached -> true (nop)" },
+    { 0x443564c, 0xf81e0ffe, 0xf81e0ffe, "fingerprint only (get_SurfaceAttached prologue)" },
+    { 0x4435678, 0x39406268, 0x39406268, "fingerprint only (ldrb w8, [x19, #0x18])" },
+    { 0x4435680, 0x52800020, 0x52800020, "fingerprint only (mov w0, #1)" },
+    { 0x44883c0, 0x3942c800, 0x3942c800, "fingerprint only (FluidVirtualKeyboard::get_WarmupSurfaceAttached)" },
+};
+
 static const kl_gp_patch k_patches[] = {
+    { "fluid-keyboard-warmup", "libil2cpp.so",
+      "the startup keyboard warmup completes without the Java keyboard's surface",
+      k_fluid_keyboard_warmup,
+      sizeof k_fluid_keyboard_warmup / sizeof *k_fluid_keyboard_warmup },
     { "moh-exit-no-rhi-teardown", "libUE4.so",
       "Quit does not tear the Vulkan RHI down a second time (shader archive double free)",
       k_moh_exit_no_rhi_teardown,

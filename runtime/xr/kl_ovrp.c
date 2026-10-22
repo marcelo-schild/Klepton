@@ -8244,13 +8244,16 @@ static void klovrp_record_overlays(const void *layer_submits, int count) {
 // KL_OVRP_ENQ_WITH_XR (default on for Mission: ISS) the enqueue path keeps its
 // set aside and the OpenXR frame publishes its quads plus that set; the
 // enqueue set is aged on the OpenXR frame boundary (kl_ovrp_openxr_frame_end),
-// so panels the guest stops filing still come down.
+// so panels the guest stops filing still come down. Fluid (x6946182742093178)
+// draws its whole browser UI as such panels over a black eye picture: without
+// it, black from start to finish (2026-10-21).
 static void klovrp_overlays_publish(const kl_ovrp_overlay *v, int n);
 static int klovrp_enq_with_xr(void) {
     static int v = -1;
     if (v < 0) {
         const char *t = kl_driver_target_name();
-        v = kl_env_on("KL_OVRP_ENQ_WITH_XR", t && !strcmp(t, "x2094303753986147"));
+        v = kl_env_on("KL_OVRP_ENQ_WITH_XR", t && (!strcmp(t, "x2094303753986147") ||
+                                                    !strcmp(t, "x6946182742093178")));
         if (v) fprintf(stderr, "  [ovrp] enqueued panels ride on the OpenXR frame "
                                "(KL_OVRP_ENQ_WITH_XR)\n");
     }
@@ -8515,6 +8518,19 @@ void kl_ovrp_openxr_frame_end(void) {
     // Enqueued panels riding on OpenXR frames age on this boundary — see
     // kl_ovrp_overlays_external.
     if (klovrp_enq_with_xr()) klovrp_enq_age();
+    // ...and on a GLES guest their images are copied here, where ovrp_EndFrame
+    // would have (klovrp_mirror_enq_gl): this thread is the guest's render
+    // thread with its context current. Without the copy every panel reached
+    // the compositor with no MTLTexture and was dropped — Fluid
+    // (x6946182742093178), whose whole UI is two such Quads, stayed black
+    // (2026-10-21).
+    //   KL_OVRP_ENQ_MIRROR_XR=0|1 — default 1 for Fluid, else 0.
+    static int mirror = -1;
+    if (mirror < 0) {
+        const char *t = kl_driver_target_name();
+        mirror = kl_env_on("KL_OVRP_ENQ_MIRROR_XR", t && !strcmp(t, "x6946182742093178"));
+    }
+    if (mirror && klovrp_enq_with_xr()) klovrp_mirror_enq_gl();
     if (!klovrp_pt_on() || g_pt_enq_since >= 1000000u) return;
     g_pt_enq_since++;
     int enqueued = g_pt_enq_since <= 3;

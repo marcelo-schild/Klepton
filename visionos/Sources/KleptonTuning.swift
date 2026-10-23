@@ -935,12 +935,16 @@ private struct TestSwitchRow: View {
         self.entry = entry
         _on = State(initialValue: KleptonTestSwitches.isOn(entry))
     }
+    // One long `+` chain inside Text(...) times out the type checker in Swift 6.3.
+    private var noteLine: String {
+        let extra: String = entry.also.map { (k: String, v: String) -> String in " \(k)=\(v)" }.joined()
+        return "\(entry.note) (\(entry.env)=\(entry.value)\(extra))"
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Toggle(entry.title, isOn: $on)
                 .onChange(of: on) { _, v in KleptonTestSwitches.set(entry, on: v) }
-            Text(entry.note + " (" + entry.env + "=" + entry.value
-                 + entry.also.map { " " + $0.0 + "=" + $0.1 }.joined() + ")")
+            Text(noteLine)
                 .font(.caption).foregroundStyle(.secondary)
             if KleptonTestSwitches.onFromInstall.contains(entry.env) {
                 Text(klT("On from the start in this installation: AVP Play's settings asked for it.",

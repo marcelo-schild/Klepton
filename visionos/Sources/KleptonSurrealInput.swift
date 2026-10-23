@@ -43,6 +43,31 @@ enum SurrealWire {
     static let pose = "6E401002-B5A3-F393-E0A9-E50E24DCCA9E"
     static let input = "6E401003-B5A3-F393-E0A9-E50E24DCCA9E"
     static let haptic = "6E401004-B5A3-F393-E0A9-E50E24DCCA9E"
+    // The haptic characteristic is the device's TLV control channel; replies arrive on 1006.
+    // Message types per github.com/shinyquagsire23/SurrealTouch_re (dm_common_enums.py).
+    static let controlResponse = "6E401006-B5A3-F393-E0A9-E50E24DCCA9E"
+    static let modeSet: UInt8 = 0x0C       // 1 u8 arg: 0 = controller mode, 1 = mouse (cursor) mode
+    static let modeRequest: UInt8 = 0x0D
+    static let modeSetResponse: UInt8 = 0x0E
+    static let controllerMode: UInt8 = 0x00
+
+    /// One control message: type, u16 length (sequence + data), u16 sequence, data.
+    static func tlv(type: UInt8, sequence: UInt16, data: [UInt8] = []) -> Data {
+        let length = UInt16(data.count + 2)
+        var bytes: [UInt8] = [type, UInt8(length & 0xFF), UInt8(length >> 8),
+                              UInt8(sequence & 0xFF), UInt8(sequence >> 8)]
+        bytes.append(contentsOf: data)
+        return Data(bytes)
+    }
+
+    /// A reply from 1006 as (type, sequence, data), or nil when it is shorter than its header says.
+    static func parseTLV(_ data: Data) -> (type: UInt8, sequence: UInt16, data: [UInt8])? {
+        let b = [UInt8](data)
+        guard b.count >= 5 else { return nil }
+        let size = Int(integer(b, 1, 2))
+        guard size >= 2, b.count >= 3 + size else { return nil }
+        return (b[0], UInt16(integer(b, 3, 2)), Array(b[5..<(3 + size)]))
+    }
 
     static func integer(_ bytes: [UInt8], _ offset: Int, _ count: Int) -> UInt64 {
         (0..<count).reduce(0) { $0 | UInt64(bytes[offset + $1]) << (8 * $1) }

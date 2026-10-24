@@ -403,6 +403,9 @@ extern const char *kl_driver_target_name(void);
 // a black eye picture, or only the room behind its passthrough (2026-10-16).
 // Fluid (x6946182742093178, Unity 6000.3 + OpenXR) is the same again: ~1450
 // incomplete-framebuffer errors a run and a black picture (2026-10-21).
+// Sweet Surrender (x4723352327707414, Unity 6000.1 + OpenXR, SinglePassMultiview
+// with 4x anti-aliasing) is the same again: ~2000 incomplete-framebuffer errors in
+// 25 s, a black picture with its music playing (2026-10-23).
 static int klgl_want_msrtt(void) {
     static int v = -1;
     if (v < 0) {
@@ -410,7 +413,8 @@ static int klgl_want_msrtt(void) {
         const char *t = kl_driver_target_name();
         v = kl_env_on("KL_GL_MSRTT", kl_guest_beatsaber_openxr() ||
                                      (t && (strcmp(t, "x9449316705178989") == 0 ||
-                                            strcmp(t, "x6946182742093178") == 0)));
+                                            strcmp(t, "x6946182742093178") == 0 ||
+                                            strcmp(t, "x4723352327707414") == 0)));
     }
     return v;
 }

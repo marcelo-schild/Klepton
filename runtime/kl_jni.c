@@ -796,14 +796,37 @@ static int klj_frame_holds(const klj_object *o) {
     return 0;
 }
 
+// The same shape from a UE4 guest building a String[]: AcquirePermissions
+// makes each name with a scoped ToJavaString, stores it with
+// SetObjectArrayElement and DeleteLocalRefs it at the end of the loop — on the
+// game thread, with no frame open — so on Android the array keeps every name
+// alive and here every name was retired before PermissionHelper read it
+// ("expected a java/lang/String, got an untagged pointer", 32 bytes apart).
+// KL_JNI_DEFER_STRING_DELETE: a deleted String is retired by age instead,
+// through the frameless-string ring (klj_loose_note), and a frame's String by
+// its pop. Default on for The Walking Dead: Saints & Sinners - Chapter 2
+// (x5190288877703616) alone, whose loading waits on that permission answer.
+static int klj_defer_string_delete(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_JNI_DEFER_STRING_DELETE",
+                       t && strcmp(t, "x5190288877703616") == 0);
+    }
+    return on;
+}
+static void klj_loose_note(klj_object *o);
+
 static void  klj_DeleteLocalRef(void *env, void *obj) {
     (void)env;
     if (!obj) return;                       // DeleteLocalRef(NULL) is legal
     pthread_mutex_lock(&g_lock);
     klj_object *o = klj_as_object(obj);
     if (o) g_stat_delete++;
-    if (!t_frame || !o || klj_frame_holds(o)) klj_retire_object_locked(obj);
+    int defer = o && o->cls == KLJ_CLASS_STRING && !o->pinned && klj_defer_string_delete();
+    if (!defer && (!t_frame || !o || klj_frame_holds(o))) klj_retire_object_locked(obj);
     pthread_mutex_unlock(&g_lock);
+    if (defer && !t_frame) klj_loose_note(o);
 }
 static void *klj_NewGlobalRef(void *env, void *obj) {
     (void)env;

@@ -22,6 +22,7 @@
 #include "kl_fault.h"
 #include "kl_target.h"
 #include "kl_env.h"
+#include "guest/kl_driver.h"   // the target name, for per-target JNI defaults
 #include "kl_ovrp.h"
 #include "kl_avdec.h"
 #include "kl_egl.h"
@@ -914,6 +915,18 @@ static klj_val klj_GvrPermission_acquire(void *env, void *self, const klj_val *a
     }
     void (*cb)(void *, void *, void *, void *) = (void (*)(void *, void *, void *, void *))
         kl_jni_native(KLJ_PERMISSION_HELPER, "onAcquirePermissions", NULL);
+    // UE4 4.27's AndroidPermission plugin does not RegisterNatives it: it is a
+    // static export, JNI_METHOD Java_..._PermissionHelper_onAcquirePermissions,
+    // found by name as GameActivity's natives are. The Walking Dead: Saints &
+    // Sinners - Chapter 2 (x5190288877703616) asks on its loading path and
+    // waited on it for good, black, when only the registered table was read.
+    // KL_UE4_PERMISSION_EXPORT, default on for that title alone: the names
+    // reach this callback intact only with KL_JNI_DEFER_STRING_DELETE (kl_jni.c),
+    // and a guest that reads retired names back is not one to call into.
+    const char *t = kl_driver_target_name();
+    if (!cb && kl_env_on("KL_UE4_PERMISSION_EXPORT", t && strcmp(t, "x5190288877703616") == 0))
+        cb = (void (*)(void *, void *, void *, void *))kl_jni_guest_native(
+            "Java_com_google_vr_sdk_samples_permission_PermissionHelper_onAcquirePermissions");
     KLJ_LOG("PermissionHelper.acquirePermissions(%d) -> onAcquirePermissions%s",
             len, cb ? "" : " — SKIPPED, the guest registered no such native");
     if (cb) cb(env ? env : kl_jni_env(), kl_jni_class(KLJ_PERMISSION_HELPER),

@@ -72,6 +72,17 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   in `klplat_user_listed` — the ones that quit or wait without a user,
   BattleGroupVR2 (`x9386827918099701`), whose start waits for player data,
   and Cubism (`x2264524423619421`) among them — and off for every other.
+- `KL_JNI_DEFER_STRING_DELETE=0|1` — (`runtime/kl_jni.c`) a String the guest
+  `DeleteLocalRef`s is retired by age (the frameless-string ring) instead of at
+  once, so a name it stored in a String[] and then deleted is still readable
+  where the array is read. Default on for The Walking Dead: Saints & Sinners -
+  Chapter 2 (`x5190288877703616`), whose permission request arrived with every
+  name retired; off for every other.
+- `KL_UE4_PERMISSION_EXPORT=0|1` — (`runtime/jni/kl_jni_window.c`) deliver
+  `PermissionHelper.acquirePermissions`' answer through the guest's exported
+  `Java_com_google_vr_sdk_samples_permission_PermissionHelper_onAcquirePermissions`
+  when it registered none (UE4 4.27's AndroidPermission). Default on for
+  `x5190288877703616`, whose loading waits on that answer; off for every other.
 - `KL_PLAT_IAP_EMPTY=0|1` — (`runtime/xr/kl_ovrplat.c`) answer
   `ovr_IAP_GetProductsBySKU` and `ovr_IAP_GetViewerPurchases` with an EMPTY
   list instead of refusing the request. For a title whose start waits for the

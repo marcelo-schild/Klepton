@@ -935,12 +935,17 @@ private struct TestSwitchRow: View {
         self.entry = entry
         _on = State(initialValue: KleptonTestSwitches.isOn(entry))
     }
+    /// Caption under the toggle: note plus env=value (and any `also` pairs).
+    /// Kept out of `Text(...)` so the SwiftUI type checker does not time out.
+    private var caption: String {
+        let also = entry.also.map { " \($0.0)=\($0.1)" }.joined()
+        return "\(entry.note) (\(entry.env)=\(entry.value)\(also))"
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Toggle(entry.title, isOn: $on)
                 .onChange(of: on) { _, v in KleptonTestSwitches.set(entry, on: v) }
-            Text(entry.note + " (" + entry.env + "=" + entry.value
-                 + entry.also.map { " " + $0.0 + "=" + $0.1 }.joined() + ")")
+            Text(caption)
                 .font(.caption).foregroundStyle(.secondary)
             if KleptonTestSwitches.onFromInstall.contains(entry.env) {
                 Text(klT("On from the start in this installation: AVP Play's settings asked for it.",

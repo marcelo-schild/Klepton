@@ -226,6 +226,31 @@ int main(void) {
             CHECK(d < 0.5f, "%s curled: %s %.2f deg off", name, kl_hands_bone_name(b), d);
         }
 
+        // A stronger bend (kl_hands_scale_bend): 50 deg at Index2 becomes 65,
+        // and a cap holds a joint at 60.
+        {
+            kl_ovr_hand g = o;
+            kl_hands_scale_bend(hand, &g, 1.3f, 100);
+            M bm, c, e; qmat(bl.bone[KLO_INDEX2].pose.q, &bm);
+            axis_angle(0, 0, 1, 65, &c); mmul(&bm, &c, &e);
+            float eq[4]; mq(&e, eq);
+            CHECK(qdiff(g.rot[KLO_INDEX2], eq) < 0.5f, "%s: bend x1.3 %.2f deg off", name, qdiff(g.rot[KLO_INDEX2], eq));
+            g = o;
+            kl_hands_scale_bend(hand, &g, 1.3f, 60);
+            axis_angle(0, 0, 1, 60, &c); mmul(&bm, &c, &e); mq(&e, eq);
+            CHECK(qdiff(g.rot[KLO_INDEX2], eq) < 0.5f, "%s: bend cap %.2f deg off", name, qdiff(g.rot[KLO_INDEX2], eq));
+            CHECK(qdiff(g.rot[KLO_THUMB2], o.rot[KLO_THUMB2]) < 1e-3f, "%s: thumb untouched", name);
+        }
+
+        // Fist assist: Index 20+50+40 = 110 deg is under the 120 start and
+        // stays; the same finger at 30+60+50 = 140 (of 120..170 -> 250) gets
+        // 120 + 20*130/50 = 172 in all, each joint scaled alike.
+        {
+            kl_ovr_hand g = o;
+            kl_hands_fist_assist(hand, NULL, &g, 120, 250, 170);
+            CHECK(qdiff(g.rot[KLO_INDEX2], o.rot[KLO_INDEX2]) < 1e-3f, "%s: fist assist below start", name);
+        }
+
         // Pinch: index tip onto the thumb tip.
         place(&bl, &R, T, hand, &w, NULL);
         to_arkit(&w, hand ? &convR : &convL, j);

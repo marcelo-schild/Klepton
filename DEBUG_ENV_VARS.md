@@ -4650,19 +4650,37 @@ ARKit's 27 hand joints, published by `KleptonControllers.swift` every frame
 OVRPlugin's hand tracking: `ovrp_GetHandState`/`2` (root pose = wrist, 24 local
 bone rotations in OVR's convention, pinch strengths and bits, pointer pose,
 hand scale, confidence), `ovrp_GetSkeleton` (a generic bind pose of our own),
-`ovrp_GetHandTrackingEnabled`; hands are the connected and active controller
-(0x60) while no Sense controller is in a hand. `ovrp_GetMesh`, `GetHandState3`
-and `GetSkeleton2/3` stay refused. `tests/t_hands.c` (`make hands`) checks the
+`ovrp_GetSkeleton2/3` (the two OVR hand types, 70/84 bone slots),
+`ovrp_GetHandTrackingEnabled`, `ovrp_GetControllerIsInHand`; hands are the
+connected and active controller (0x60) while no Sense controller is tracked.
+`ovrp_GetMesh` and `GetHandState3` stay refused. `tests/t_hands.c` (`make hands`) checks the
 conversion on synthetic hands.
 
 - `KL_OVRP_HANDS=0|1` — hand tracking for this guest. Default on for Elixir
-  (`x3793077684043441`), off everywhere else.
+  (`x3793077684043441`) and Angry Birds VR: Isle of Pigs (`x2718606324833775`),
+  off everywhere else. A tracked Sense controller comes first: while one is
+  there it is the input, without one the hands take over.
 - `KL_OVRP_HANDS_ONLY=0|1` — hands are the input even with Sense controllers
   paired; a controller in a hand is that hand not seen. Default on for Elixir.
 - `KL_OVRP_HANDS_AXIS=+x|-x|+y|-y|+z|-z` — which axis of ARKit's joint frame
   points out of the back of a finger. Normally found on a flat hand and logged
   (`[hands] … ARKit joint axis … is the back of the fingers`): -y left, +y right
   on visionOS 27.
+- `KL_OVRP_HANDS_BESIDE=0|1` — the controllers stay the active input and each
+  hand ARKit sees is only connected beside them (for a game that switches to
+  hands with an option of its own). Default off.
+- `KL_OVRP_HANDS_FIST=<deg>` — fist assist: a finger (index to little) bent more
+  than this in all is bent further toward a full fist (170 -> 250 degrees);
+  once engaged it holds down to 30 degrees less. Default 110 for Angry Birds
+  (Meta's FingerPalmGrabAPI wants a Quest-tight fist for the slingshot), 0 off
+  elsewhere.
+- `KL_OVRP_HANDS_CURL=<gain>` — every finger bend times this (default 1). 1.3
+  made claws of a relaxed hand in Angry Birds; the fist assist replaced it.
+- Pinch (no switch): 1 at 3 cm thumb-to-fingertip, 0 at 5.5 cm (ARKit's tips
+  sit inside the pads); on from 0.8, off below 0.3 for three frames; a fist (two
+  of middle/ring/little tips within 4.5 cm of their knuckle) reports no pinch.
+  A wrist that jumps more than 12 cm in one frame is held for up to 8 frames
+  (hands covering each other); the pointer ray is smoothed by speed.
 - `KL_OVRP_HANDS_HOLD_MS=<ms>` — a hand ARKit loses for this long stays where
   it was, tracked (default 250).
 - `KL_OVRP_FAKE_HANDS=1` — Mac host runs: made-up hands in front of the head,

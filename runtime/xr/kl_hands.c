@@ -428,19 +428,42 @@ int kl_hands_to_ovr(int hand, const kl_hand_xf j[KLH_JOINTS], uint32_t tracked,
     c->scale = c->scale > 0 ? c->scale + (s - c->scale) * 0.02f : s;
     out->scale = c->scale;
 
-    // Pinch: thumb tip to each fingertip, 1 at 1.2 cm, 0 at 6 cm; a finger
-    // pinches from 0.9 and lets go below 0.7. The thumb counts as pinching
-    // with whichever finger it pinches.
+    // Pinch: thumb tip to each fingertip. ARKit's tips sit inside the pads, so
+    // fingers pressed together still measure about 2.7 cm (the frontend's own
+    // pinch-to-trigger maps 5 cm open to 3 cm closed for the same reason):
+    // 1 at 3 cm, 0 at 5.5 cm. A finger pinches from 0.8 (3.5 cm) and lets go
+    // below 0.5 (4.25 cm); with 1.2 cm as "closed" a pinch almost never
+    // registered (Angry Birds: the ray showed, nothing clicked, 2026-10-24).
+    // The thumb counts as pinching with whichever finger it pinches.
+    //
+    // Letting go needs the fingers clearly apart (below 0.3, 4.75 cm) for three
+    // frames running: ARKit's estimate of a tip flickers, and a pinch that drops
+    // for one frame is a slingshot released mid-aim (Angry Birds, 2026-10-24).
+    //
+    // A fist is no pinch: with the middle, ring and little fingers rolled in
+    // (two of their tips within 4.5 cm of their own knuckle) thumb and index tip
+    // are close as well, and the game read a pinch where a grab was meant.
+    int rolled = 0;
+    for (int fi = 2; fi < 5; fi++) {
+        int knuckle = k_finger_of_tip[fi] - 3;
+        if (vlen(vsub(jp(j, k_finger_of_tip[fi]), jp(j, knuckle))) < 0.045f) rolled++;
+    }
+    int fist = rolled >= 2;
     v3 tt = jp(j, KLH_THUMB_TIP);
     float thumb = 0;
     uint32_t bits = 0;
     for (int fi = 1; fi < 5; fi++) {
         float d = vlen(vsub(jp(j, k_finger_of_tip[fi]), tt));
-        float v = clampf((0.06f - d) / (0.06f - 0.012f), 0, 1);
+        float v = fist ? 0 : clampf((0.055f - d) / (0.055f - 0.030f), 0, 1);
         out->pinch[fi] = v;
         if (v > thumb) thumb = v;
         int was = (int)(c->pinch_bits >> fi & 1);
-        if (v > 0.9f || (was && v > 0.7f)) bits |= 1u << fi;
+        if (v > 0.8f) { bits |= 1u << fi; c->pinch_low[fi] = 0; }
+        else if (was && !fist) {
+            if (v > 0.3f) c->pinch_low[fi] = 0;
+            else c->pinch_low[fi]++;
+            if (c->pinch_low[fi] < 3) bits |= 1u << fi;
+        }
     }
     out->pinch[0] = thumb;
     if (bits) bits |= 1u;
@@ -511,5 +534,106 @@ void kl_hands_synth(int hand, const float pos[3], const float fwd[3], float curl
         if (bone_of[i] < 0) q = vadd(p[KLO_WRIST], vmul(vsub(p[b], p[KLO_WRIST]), 0.35f));
         j[i].p[0] = q.x; j[i].p[1] = q.y; j[i].p[2] = q.z;
         m_to_q(f[b], j[i].q);       // "ARKit's" axes = OVR's here
+    }
+}
+
+// ---- a stronger bend, for a game that wants a fist ---------------------------
+
+static void q_mul(const float a[4], const float b[4], float r[4]) {
+    float t[4] = {
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    };
+    memcpy(r, t, sizeof t);
+}
+
+void kl_hands_scale_bend(int hand, kl_ovr_hand *o, float gain, float cap_deg) {
+    static kl_ovr_skel bind[2];
+    static int have[2];
+    if ((unsigned)hand > 1 || gain == 1.0f) return;
+    if (!have[hand]) { kl_hands_bind(hand, &bind[hand]); have[hand] = 1; }
+    static const int bones[12] = { KLO_INDEX1, KLO_INDEX2, KLO_INDEX3, KLO_MIDDLE1, KLO_MIDDLE2,
+                                    KLO_MIDDLE3, KLO_RING1, KLO_RING2, KLO_RING3, KLO_PINKY1,
+                                    KLO_PINKY2, KLO_PINKY3 };
+    float cap = cap_deg * 3.14159265f / 180;
+    for (int i = 0; i < 12; i++) {
+        int b = bones[i];
+        // The turn away from the bind pose, scaled about its own axis.
+        const float *bq = bind[hand].bone[b].pose.q;
+        float inv[4] = { -bq[0], -bq[1], -bq[2], bq[3] }, d[4];
+        q_mul(inv, o->rot[b], d);
+        if (d[3] < 0) for (int k = 0; k < 4; k++) d[k] = -d[k];
+        float s = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (s < 1e-6f) continue;
+        float ang = 2 * atan2f(s, d[3]) * gain;
+        if (ang > cap) ang = cap;
+        float k = sinf(ang / 2) / s;
+        float nd[4] = { d[0] * k, d[1] * k, d[2] * k, cosf(ang / 2) };
+        q_mul(bq, nd, o->rot[b]);
+    }
+}
+
+// ---- a loose fist read as a fist ------------------------------------------------
+
+void kl_hands_fist_assist(int hand, kl_hands_ctx *ctx, kl_ovr_hand *o, float from_deg,
+                          float to_deg, float at_deg) {
+    static kl_ovr_skel bind[2];
+    static int have[2];
+    if ((unsigned)hand > 1 || from_deg <= 0 || at_deg <= from_deg) return;
+    if (!have[hand]) { kl_hands_bind(hand, &bind[hand]); have[hand] = 1; }
+    static const int first[4] = { KLO_INDEX1, KLO_MIDDLE1, KLO_RING1, KLO_PINKY1 };
+    const float r2d = 57.29578f;
+    for (int f = 0; f < 4; f++) {
+        float d[3][4], ang[3], total = 0;
+        for (int k = 0; k < 3; k++) {
+            int b = first[f] + k;
+            const float *bq = bind[hand].bone[b].pose.q;
+            float inv[4] = { -bq[0], -bq[1], -bq[2], bq[3] };
+            q_mul(inv, o->rot[b], d[k]);
+            if (d[k][3] < 0) for (int c = 0; c < 4; c++) d[k][c] = -d[k][c];
+            float s = sqrtf(d[k][0] * d[k][0] + d[k][1] * d[k][1] + d[k][2] * d[k][2]);
+            ang[k] = 2 * atan2f(s, d[k][3]) * r2d;
+            // Only a bend toward the palm counts (+Z on either hand in OVR's frames).
+            total += d[k][2] > 0 ? ang[k] : 0;
+        }
+        // Engaged above from_deg, kept down to from_deg - 30: a fist held while
+        // ARKit's estimate wobbles stays a fist.
+        int on = ctx && ctx->fist_on[f];
+        float start = on ? from_deg - 30 : from_deg;
+        if (total <= start) { if (ctx) ctx->fist_on[f] = 0; continue; }
+        if (ctx) ctx->fist_on[f] = 1;
+        if (total <= from_deg) {
+            // Held below the start: bend it up to the start, not beyond.
+            float scale0 = from_deg / total;
+            for (int k = 0; k < 3; k++) {
+                if (d[k][2] <= 0) continue;
+                float s = sqrtf(d[k][0] * d[k][0] + d[k][1] * d[k][1] + d[k][2] * d[k][2]);
+                if (s < 1e-6f) continue;
+                float a = ang[k] * scale0;
+                if (a > 110) a = 110;
+                a /= r2d;
+                float m = sinf(a / 2) / s;
+                float nd[4] = { d[k][0] * m, d[k][1] * m, d[k][2] * m, cosf(a / 2) };
+                q_mul(bind[hand].bone[first[f] + k].pose.q, nd, o->rot[first[f] + k]);
+            }
+            continue;
+        }
+        // from..at maps onto from..to, above `at` it stays at `to`.
+        float t = total >= at_deg ? to_deg
+                                  : from_deg + (total - from_deg) * (to_deg - from_deg) / (at_deg - from_deg);
+        float scale = t / total;
+        for (int k = 0; k < 3; k++) {
+            if (d[k][2] <= 0) continue;
+            float s = sqrtf(d[k][0] * d[k][0] + d[k][1] * d[k][1] + d[k][2] * d[k][2]);
+            if (s < 1e-6f) continue;
+            float a = ang[k] * scale;
+            if (a > 110) a = 110;
+            a /= r2d;
+            float m = sinf(a / 2) / s;
+            float nd[4] = { d[k][0] * m, d[k][1] * m, d[k][2] * m, cosf(a / 2) };
+            q_mul(bind[hand].bone[first[f] + k].pose.q, nd, o->rot[first[f] + k]);
+        }
     }
 }

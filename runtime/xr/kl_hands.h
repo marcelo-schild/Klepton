@@ -103,6 +103,8 @@ typedef struct {
     int just_latched;           // set for one call when the axes were found
     float scale;
     uint32_t pinch_bits;
+    uint8_t pinch_low[5];       // frames each finger has been below the release level
+    uint8_t fist_on[4];         // fist assist engaged per finger (index..little)
 } kl_hands_ctx;
 
 void kl_hands_init(kl_hands_ctx *ctx);
@@ -127,6 +129,19 @@ void kl_hands_force_axis(kl_hands_ctx *ctx, int dorsal_axis);
 // `curl_deg` at each joint. Its joint axes are OVR's.
 void kl_hands_synth(int hand, const float pos[3], const float fwd[3], float curl_deg,
                     kl_hand_xf joints[KLH_JOINTS]);
+
+// Each finger bone's turn away from the bind pose (index to little finger, not
+// the thumb) times `gain`, at most `cap_deg` per joint: a normal fist read as the
+// tight one a game's grab expects.
+void kl_hands_scale_bend(int hand, kl_ovr_hand *o, float gain, float cap_deg);
+
+// A loose fist read as a fist: a finger (index to little) bent more than
+// `from_deg` in all (its three joints toward the palm) is bent further, so that
+// `at_deg` becomes `to_deg`; fingers below `from_deg` are left as they are.
+// Engaged above `from_deg`, it stays engaged down to `from_deg` - 30 (state in
+// `ctx`, which may be NULL for no memory).
+void kl_hands_fist_assist(int hand, kl_hands_ctx *ctx, kl_ovr_hand *o, float from_deg,
+                          float to_deg, float at_deg);
 
 const char *kl_hands_axis_name(int axis);       // "+x" .. "-z", "?"
 const char *kl_hands_bone_name(int bone);

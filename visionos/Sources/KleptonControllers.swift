@@ -2551,11 +2551,13 @@ final class KleptonControllers {
     /// (ARKit's, with the app's recentre), predicted like them: the anchor was
     /// asked for at the presentation time.
     private func publishJoints(hand: Int, anchor: HandAnchor?, holdsController: Bool) {
+        noteJointStats()
+        // Controllers first (the owner's choice for Angry Birds, 2026-10-24):
+        // while a Sense controller is tracked for this hand, it is the input.
         if holdsController {
             kl_ovrp_set_hand_joints(Int32(hand), 2, nil, 0)
             return
         }
-        noteJointStats()
         guard let anchor, anchor.isTracked, let sk = anchor.handSkeleton else {
             jointStats[hand].lost += 1
             kl_ovrp_set_hand_joints(Int32(hand), 0, nil, 0)

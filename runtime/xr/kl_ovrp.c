@@ -31,6 +31,7 @@
 #include "kl_vulkan.h"
 #include "kl_openxr.h"
 #include "kl_metrics.h"
+#include "kl_hands.h"
 
 #define KL_OVRP_MAX 512
 static struct { const char *name; unsigned calls; } g_ovrp[KL_OVRP_MAX];
@@ -4100,6 +4101,7 @@ static void klovrp_grip_to_touch(klovrp_pose *p, int hand) {
     p->qw = qw * cw - qx * sx;
 }
 
+static int klovrp_hand_is_wrist(int hand);
 static klovrp_pose klovrp_step_hand(int step, int hand) {
     int ix = klovrp_step_ix(step);
     klovrp_pose p;
@@ -4110,8 +4112,9 @@ static klovrp_pose klovrp_step_hand(int step, int hand) {
     else
         p = klovrp_hand(hand);
     // Here and not in klovrp_hand: this is the OVRPlugin guest's read.
-    // kl_ovrp_hand_motion is kl_openxr's and must keep the grip.
-    klovrp_grip_to_touch(&p, hand);
+    // kl_ovrp_hand_motion is kl_openxr's and must keep the grip. Not for a
+    // tracked hand's wrist, which is OVR's hand root as it stands.
+    if (!klovrp_hand_is_wrist(hand)) klovrp_grip_to_touch(&p, hand);
     return p;
 }
 
@@ -5406,11 +5409,317 @@ static void klovrp_grab_trace(int hand, const klovrp_pose *v) {
     have[hand] = 1;
 }
 
+// ---- hand tracking: the user's own fingers -------------------------------------
+//
+// OVRPlugin's hand tracking (OVRP_1_44_0: ovrp_GetHandState, ovrp_GetSkeleton,
+// ovrp_GetHandTrackingEnabled) answered from ARKit's hand joints. The frontend
+// publishes the 27 joints of each tracked hand once a frame
+// (kl_ovrp_set_hand_joints), already predicted to the frame's presentation
+// time; kl_hands.c turns them into OVR's 24-bone skeleton there and then, so
+// the guest's reads only copy.
+//
+// Off unless asked for: KL_OVRP_HANDS=1, on by default for the titles below.
+// Every other guest keeps the answers it had (tracking off, the queries
+// refused), which matters because a game that sees hands may switch its whole
+// input to them.
+//
+//   Elixir (x3793077684043441): a hands-only game; with tracking off it stops at
+//   a screen asking for it to be turned on.
+//   Angry Birds VR: Isle of Pigs (x2718606324833775): controllers first, like on
+//   a Quest — while a Sense controller is tracked it is the input; without one
+//   the hands take over.
+//
+// Hands are the input — ConnectedControllers/ActiveController say Hands (0x60)
+// and the hand nodes are the wrist — unless a Sense controller is in a hand.
+// While one is, the frontend says so (state 2) and everything is the Touch pair
+// it was before.
+
+static int klovrp_hands_title(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *t = kl_driver_target_name();
+        if (!t) return 0;               // asked before the guest is chosen: not kept
+        on = kl_env_on("KL_OVRP_HANDS", !strcmp(t, "x3793077684043441") ||
+                                        !strcmp(t, "x2718606324833775"));
+        if (on) fprintf(stderr, "  [hands] hand tracking for %s on (KL_OVRP_HANDS=0 turns it off)\n", t);
+    }
+    return on;
+}
+int kl_ovrp_hand_tracking_on(void) { return klovrp_hands_title(); }
+
+static pthread_mutex_t g_hj_lock = PTHREAD_MUTEX_INITIALIZER;
+static kl_ovr_hand g_hj_ovr[2];             // under g_hj_lock: what the guest reads
+static kl_hand_xf  g_hj_raw[2][KLH_JOINTS];  // ...and the joints it came from (pointer pose)
+static int g_hj_state[2];                   // 0 not seen, 1 tracked, 2 a controller in it
+static double g_hj_time[2];
+static kl_hands_ctx g_hj_ctx[2];            // the publisher's only
+static int g_hj_owner[2];                   // the hand node is the wrist (atomic)
+static unsigned g_hj_held[2], g_hj_failed[2], g_hj_jumps[2];   // publisher's counts, for the log
+static kl_hand_xf g_hj_ptr[2] = { { { 0, 0, 0 }, { 0, 0, 0, 1 } }, { { 0, 0, 0 }, { 0, 0, 0, 1 } } };
+static unsigned g_hj_reads[2], g_hj_reads_lost[2];  // guest's reads (any thread; approximate)
+
+// KL_OVRP_HANDS_BESIDE=1: the controllers stay the input and the hands are only
+// offered beside them — connected while ARKit sees them, their state and
+// skeleton answered — for a game that switches to hands with an option of its
+// own. Off by default: Angry Birds VR turned out to have no such option, and
+// switches by itself once hands are connected.
+static int klovrp_hands_beside(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *t = kl_driver_target_name();
+        if (!t) return 0;
+        on = klovrp_hands_title() && kl_env_on("KL_OVRP_HANDS_BESIDE", 0);
+        if (on) fprintf(stderr, "  [hands] controllers stay the input, hands are offered beside them "
+                                "(KL_OVRP_HANDS_BESIDE=0 makes the hands the input when no controller is held)\n");
+    }
+    return on;
+}
+
+// The hand bits to add to the connected controllers beside a Touch pair: each
+// hand ARKit is tracking right now.
+static uint32_t klovrp_hands_beside_bits(void) {
+    if (!klovrp_hands_beside()) return 0;
+    pthread_mutex_lock(&g_hj_lock);
+    uint32_t b = (g_hj_ovr[0].tracked ? 0x20u : 0) | (g_hj_ovr[1].tracked ? 0x40u : 0);
+    pthread_mutex_unlock(&g_hj_lock);
+    return b;
+}
+
+// Hands are the input: hand tracking is on for this guest, the controllers are
+// not to stay the input, and neither hand holds a controller.
+static int klovrp_hands_mode(void) {
+    if (!klovrp_hands_title() || klovrp_hands_beside()) return 0;
+    return __atomic_load_n(&g_hj_state[0], __ATOMIC_ACQUIRE) != 2 &&
+           __atomic_load_n(&g_hj_state[1], __ATOMIC_ACQUIRE) != 2;
+}
+
+static void klovrp_hands_log_first(int hand, const kl_hand_xf *j, const kl_ovr_hand *o) {
+    // Lengths between the joints ARKit gives, so the joint mapping is checkable
+    // against a hand: wrist to thumb base ~4.5 cm, to the middle knuckle ~9.5.
+    #define KLH_D(a, b) sqrtf((j[a].p[0] - j[b].p[0]) * (j[a].p[0] - j[b].p[0]) + \
+                              (j[a].p[1] - j[b].p[1]) * (j[a].p[1] - j[b].p[1]) + \
+                              (j[a].p[2] - j[b].p[2]) * (j[a].p[2] - j[b].p[2]))
+    fprintf(stderr, "  [hands] %s hand first seen: wrist-thumb base %.1f cm, wrist-middle knuckle %.1f, "
+                    "middle finger %.1f+%.1f+%.1f, thumb %.1f+%.1f+%.1f, scale %.2f\n",
+            hand ? "right" : "left",
+            100 * KLH_D(KLH_WRIST, KLH_THUMB_KNUCKLE), 100 * KLH_D(KLH_WRIST, KLH_MIDDLE_KNUCKLE),
+            100 * KLH_D(KLH_MIDDLE_KNUCKLE, KLH_MIDDLE_IB), 100 * KLH_D(KLH_MIDDLE_IB, KLH_MIDDLE_IT),
+            100 * KLH_D(KLH_MIDDLE_IT, KLH_MIDDLE_TIP), 100 * KLH_D(KLH_THUMB_KNUCKLE, KLH_THUMB_IB),
+            100 * KLH_D(KLH_THUMB_IB, KLH_THUMB_IT), 100 * KLH_D(KLH_THUMB_IT, KLH_THUMB_TIP), o->scale);
+    #undef KLH_D
+}
+
+// Each finger's bend as OVR reports it: the angles of its bones' turns about
+// their Z axis, summed (0 flat, ~200 a fist), and the twist about X of the
+// first bone. One line per hand every few seconds while tracked.
+static void klovrp_hands_log_pose(int hand, const kl_ovr_hand *o, uint32_t tracked) {
+    static const int first[5] = { KLO_THUMB1, KLO_INDEX1, KLO_MIDDLE1, KLO_RING1, KLO_PINKY1 };
+    float bend[5];
+    for (int f = 0; f < 5; f++) {
+        bend[f] = 0;
+        for (int b = first[f]; b < first[f] + 3; b++) {
+            const float *q = o->rot[b];
+            bend[f] += 2 * atan2f(q[2], q[3]) * 57.29578f;
+        }
+    }
+    fprintf(stderr, "  [hands] %s: bend thumb %.0f index %.0f middle %.0f ring %.0f little %.0f deg, "
+                    "pinch %.2f %.2f %.2f %.2f bits %#x, wrist %.2f %.2f %.2f, joints %d/27, "
+                    "fingers sure %d%d%d%d%d\n",
+            hand ? "R" : "L", bend[0], bend[1], bend[2], bend[3], bend[4],
+            o->pinch[1], o->pinch[2], o->pinch[3], o->pinch[4], o->pinch_bits,
+            o->root.p[0], o->root.p[1], o->root.p[2], __builtin_popcount(tracked),
+            o->finger_high[0], o->finger_high[1], o->finger_high[2], o->finger_high[3],
+            o->finger_high[4]);
+}
+
+void kl_ovrp_set_hand_joints(int hand, int state, const float *xf, uint32_t tracked) {
+    if ((unsigned)hand > 1 || !klovrp_hands_title()) return;
+    static int forced = -2;
+    if (forced == -2) {
+        // KL_OVRP_HANDS_AXIS=+x|-x|+y|-y|+z|-z: ARKit's joint axis that points
+        // out of the back of a finger, instead of finding it on a flat hand.
+        const char *a = getenv("KL_OVRP_HANDS_AXIS");
+        forced = -1;
+        for (int i = 0; a && i < 6; i++) if (!strcmp(a, kl_hands_axis_name(i))) forced = i;
+        kl_hands_init(&g_hj_ctx[0]);
+        kl_hands_init(&g_hj_ctx[1]);
+        if (forced >= 0) {
+            kl_hands_force_axis(&g_hj_ctx[0], forced);
+            kl_hands_force_axis(&g_hj_ctx[1], forced);
+        }
+    }
+    // KL_OVRP_HANDS_ONLY=1: hands are the input even with controllers paired —
+    // a controller in a hand is that hand not seen (ARKit loses a hand that
+    // holds one anyway). On by default for the hands-only titles: Elixir.
+    static int only = -1;
+    if (only < 0) {
+        const char *t = kl_driver_target_name();
+        only = kl_env_on("KL_OVRP_HANDS_ONLY", t && !strcmp(t, "x3793077684043441"));
+        if (only) fprintf(stderr, "  [hands] hands only: controllers are not offered to this game\n");
+    }
+    if (only && state == 2) state = 0;
+    int was = __atomic_load_n(&g_hj_state[hand], __ATOMIC_ACQUIRE);
+    // A hand ARKit loses for a few frames stays where it was, tracked, for up
+    // to KL_OVRP_HANDS_HOLD_MS (default 250): a game that hides a hand the
+    // moment it is not tracked otherwise blinks it out every second or two.
+    static double hold_s = -1;
+    if (hold_s < 0) hold_s = kl_env_int("KL_OVRP_HANDS_HOLD_MS", 250) / 1000.0;
+    static double last_ok[2];
+    double now_s = klovrp_mono_now();
+    if (state == 0 && was == 1 && last_ok[hand] > 0 && now_s - last_ok[hand] < hold_s) {
+        g_hj_held[hand]++;
+        return;
+    }
+    if (state != 1 || !xf) {
+        __atomic_store_n(&g_hj_owner[hand], 0, __ATOMIC_RELEASE);
+        pthread_mutex_lock(&g_hj_lock);
+        g_hj_ovr[hand].tracked = 0;
+        g_hj_ovr[hand].pinch_bits = 0;
+        pthread_mutex_unlock(&g_hj_lock);
+        __atomic_store_n(&g_hj_state[hand], state == 2 ? 2 : 0, __ATOMIC_RELEASE);
+        if (was != state && (was == 2 || state == 2))
+            fprintf(stderr, "  [hands] %s hand: %s\n", hand ? "right" : "left",
+                    state == 2 ? "holds a controller — Touch until it is put down"
+                               : "no controller any more — hands are the input");
+        return;
+    }
+    // Into the guest's space exactly as kl_ovrp_set_hand_motion does a pose.
+    kl_hand_xf j[KLH_JOINTS];
+    for (int i = 0; i < KLH_JOINTS; i++) {
+        memcpy(j[i].p, xf + 7 * i, sizeof j[i].p);
+        memcpy(j[i].q, xf + 7 * i + 3, sizeof j[i].q);
+        klovrp_stick_move_offset(&j[i].p[0], &j[i].p[2]);
+        j[i].p[1] -= klovrp_origin_y();
+    }
+    kl_ovr_hand o;
+    int ok = kl_hands_to_ovr(hand, j, tracked, &g_hj_ctx[hand], &o);
+    if (ok) {
+        // A jump no hand makes: more than 12 cm from one published frame to the
+        // next (several metres a second). Hands crossing or covering each other
+        // make ARKit swap or misplace them for a few frames, and the aim then
+        // flicks across the room (Angry Birds, 2026-10-24). The hand stays where
+        // it was until the new place has held for 8 frames (~80 ms).
+        static int jump_frames[2];
+        pthread_mutex_lock(&g_hj_lock);
+        kl_ovr_hand prev = g_hj_ovr[hand];
+        pthread_mutex_unlock(&g_hj_lock);
+        if (prev.tracked) {
+            float dx = o.root.p[0] - prev.root.p[0], dy = o.root.p[1] - prev.root.p[1],
+                  dz = o.root.p[2] - prev.root.p[2];
+            if (dx * dx + dy * dy + dz * dz > 0.12f * 0.12f && jump_frames[hand] < 8) {
+                jump_frames[hand]++;
+                g_hj_jumps[hand]++;
+                __atomic_store_n(&g_hj_state[hand], 1, __ATOMIC_RELEASE);
+                return;
+            }
+        }
+        jump_frames[hand] = 0;
+        last_ok[hand] = now_s;
+        // KL_OVRP_HANDS_CURL=<gain>: the four fingers' bend times this (at most
+        // 100 degrees a joint). Tried as 1.3 for Angry Birds, whose slingshot
+        // grab took only a very tight fist: the fingers then hooked into claws
+        // even on a relaxed hand and it played worse (2026-10-24). Default 1.
+        static float curl = -1;
+        if (curl < 0) curl = kl_env_float("KL_OVRP_HANDS_CURL", 1.0f);
+        kl_hands_scale_bend(hand, &o, curl, 100);
+        // KL_OVRP_HANDS_FIST=<deg>: a finger bent more than this in all (its
+        // three joints) is bent further toward a full fist (170 -> 250 deg), a
+        // relaxed finger not at all. For a game whose grab wants a Quest-tight
+        // fist from ARKit's looser reading (Angry Birds' slingshot: Meta's
+        // FingerPalmGrabAPI). Default 110 there, 0 (off) elsewhere; once engaged
+        // it holds down to 30 degrees less.
+        static float fist = -1;
+        if (fist < 0) {
+            const char *t = kl_driver_target_name();
+            fist = kl_env_float("KL_OVRP_HANDS_FIST", t && !strcmp(t, "x2718606324833775") ? 110.0f : 0.0f);
+        }
+        if (fist > 0) kl_hands_fist_assist(hand, &g_hj_ctx[hand], &o, fist, 250, 170);
+        // The pointer ray, from an estimated shoulder through the hand, smoothed
+        // by speed: still when the hand is still, prompt when it moves.
+        klovrp_pose h = klovrp_pose_read(&g_head_pose);
+        float fx, fy, fz;
+        klovrp_qrot(&h, 0, 0, -1, &fx, &fy, &fz);
+        float l = sqrtf(fx * fx + fz * fz);
+        if (l < 1e-3f) { fx = 0; fz = -1; l = 1; }
+        fx /= l; fz /= l;
+        float side = hand ? 0.17f : -0.17f;
+        float sh[3] = { h.px - fz * side - fx * 0.05f, h.py - 0.25f, h.pz + fx * side - fz * 0.05f };
+        kl_hand_xf ptr;
+        kl_hands_pointer(j, sh, &ptr);
+        static kl_hand_xf sm[2];
+        static int have_sm[2];
+        if (have_sm[hand]) {
+            float mx = ptr.p[0] - sm[hand].p[0], my = ptr.p[1] - sm[hand].p[1], mz = ptr.p[2] - sm[hand].p[2];
+            float move = sqrtf(mx * mx + my * my + mz * mz);       // metres this frame
+            float a = 0.25f + move / 0.01f;                        // 1 cm a frame: no smoothing
+            if (a > 1) a = 1;
+            for (int k = 0; k < 3; k++) sm[hand].p[k] += (ptr.p[k] - sm[hand].p[k]) * a;
+            float dot = 0;
+            for (int k = 0; k < 4; k++) dot += sm[hand].q[k] * ptr.q[k];
+            float sgn = dot < 0 ? -1.0f : 1.0f, n = 0;
+            for (int k = 0; k < 4; k++) { sm[hand].q[k] += (sgn * ptr.q[k] - sm[hand].q[k]) * a; n += sm[hand].q[k] * sm[hand].q[k]; }
+            n = sqrtf(n);
+            for (int k = 0; k < 4; k++) sm[hand].q[k] /= n;
+        } else {
+            sm[hand] = ptr;
+            have_sm[hand] = 1;
+        }
+        pthread_mutex_lock(&g_hj_lock);
+        g_hj_ptr[hand] = sm[hand];
+        pthread_mutex_unlock(&g_hj_lock);
+    } else g_hj_failed[hand]++;
+    kl_hands_ctx *c = &g_hj_ctx[hand];
+    if (c->just_latched)
+        fprintf(stderr, "  [hands] %s hand: ARKit joint axis %s %s the back of the fingers "
+                        "(agreement %.3f; along the bone: %s %.3f; thumb |dot| %.3f)\n",
+                hand ? "right" : "left", kl_hands_axis_name(c->dorsal_axis),
+                c->just_latched > 0 ? "is" : "NOT clearly", c->dorsal_score,
+                kl_hands_axis_name(c->distal_axis), c->distal_score, c->thumb_dot);
+    if (ok) {
+        static int first[2];
+        if (!first[hand]++) klovrp_hands_log_first(hand, j, &o);
+        static double said[2];
+        double now = klovrp_mono_now();
+        if (now - said[hand] > 5.0) { said[hand] = now; klovrp_hands_log_pose(hand, &o, tracked); }
+    }
+    // The hand node is the wrist now (kl_ovrp_set_hand_motion stands back) —
+    // unless the other hand holds a controller, which makes both Touch.
+    if (ok && !klovrp_hands_beside() && __atomic_load_n(&g_hj_state[!hand], __ATOMIC_ACQUIRE) != 2) {
+        klovrp_pose v = { o.root.p[0], o.root.p[1], o.root.p[2],
+                          o.root.q[0], o.root.q[1], o.root.q[2], o.root.q[3],
+                          0, 0, 0, 0, 0, 0, 0 };
+        klovrp_derive_motion(&v, &g_hand_hist[hand], 0);
+        klovrp_pose_write(&g_hand_pose[hand], &v);
+        __atomic_store_n(&g_hand_set[hand], 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_hj_owner[hand], 1, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_lock(&g_hj_lock);
+    if (ok) {
+        g_hj_ovr[hand] = o;
+        memcpy(g_hj_raw[hand], j, sizeof j);
+        g_hj_time[hand] = kl_ovrp_predicted_display_time();
+    } else {
+        g_hj_ovr[hand].tracked = 0;         // the last pose stays where it was
+    }
+    pthread_mutex_unlock(&g_hj_lock);
+    __atomic_store_n(&g_hj_state[hand], 1, __ATOMIC_RELEASE);
+    if (was == 2)
+        fprintf(stderr, "  [hands] %s hand: no controller any more — hands are the input\n",
+                hand ? "right" : "left");
+}
+
+// Is the hand node this hand's wrist (hands mode, joints published)?
+static int klovrp_hand_is_wrist(int hand) {
+    return klovrp_hands_mode() && __atomic_load_n(&g_hj_owner[hand], __ATOMIC_ACQUIRE);
+}
+
 void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
                              float qx, float qy, float qz, float qw,
                              float vx, float vy, float vz,
                              float avx, float avy, float avz) {
     if ((unsigned)hand > 1) return;
+    // While the wrist from the hand's joints is the node, the grip pose waits.
+    if (klovrp_hand_is_wrist(hand)) return;
     klovrp_stick_move_offset(&px, &pz);
     py -= klovrp_origin_y();
     klovrp_pose v = { px, py, pz, qx, qy, qz, qw, vx, vy, vz, avx, avy, avz, 1 };
@@ -5432,6 +5741,7 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
 void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
     if ((unsigned)hand > 1) return;
+    if (klovrp_hand_is_wrist(hand)) return;
     klovrp_stick_move_offset(&px, &pz);
     py -= klovrp_origin_y();
     klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0 };
@@ -6535,9 +6845,23 @@ static float klovrp_fake_trigger(void) {
     return klovrp_fake_phase() ? v : 0.0f;
 }
 
+static int klovrp_hands_mode(void);
+static uint32_t klovrp_hands_buttons(void);
+static uint32_t klovrp_hands_beside_bits(void);
+#define OVRP_CTRL_HANDS 0x60u
+
 static void fill_controller_state(int mask, void *out, int version) {
     memset(out, 0, version >= 4 ? 0x60 : version == 2 ? 0x40 : 0x30);
     uint32_t m = (uint32_t)mask;
+    // Hand tracking as the input (see kl_ovrp_set_hand_joints): the hands are
+    // what is connected, not a Touch pair. Elixir decides from this field
+    // alone whether to ask for hands — it never calls GetHandTrackingEnabled.
+    if (klovrp_hands_mode()) {
+        uint32_t *hw = (uint32_t *)out;
+        hw[0] = (m & OVRP_CTRL_ACTIVE) ? OVRP_CTRL_HANDS : (m & OVRP_CTRL_HANDS);
+        if (hw[0]) hw[1] = hw[2] = klovrp_hands_buttons();
+        return;
+    }
     if (m & OVRP_CTRL_ACTIVE) m |= OVRP_CTRL_LTOUCH | OVRP_CTRL_RTOUCH;
     uint32_t conn = m & (OVRP_CTRL_LTOUCH | OVRP_CTRL_RTOUCH);
     uint32_t fake = conn ? klovrp_fake_buttons() : 0;
@@ -6565,6 +6889,10 @@ static void fill_controller_state(int mask, void *out, int version) {
                                   t && strcmp(t, "x2371757336252737") == 0);
     }
     w[0] = all_connected ? (uint32_t)OVRP_CTRL_TOUCH : conn; // ConnectedControllers
+    // Hands offered beside the controllers (KL_OVRP_HANDS_BESIDE): connected
+    // too while seen, for a mask that asks for them.
+    w[0] |= klovrp_hands_beside_bits() &
+            (((uint32_t)mask & OVRP_CTRL_ACTIVE) ? OVRP_CTRL_HANDS : (uint32_t)mask);
     if (conn & OVRP_CTRL_LTOUCH) {
         w[1] |= in[0].buttons;                          // Buttons
         w[2] |= in[0].touches;                          // Touches
@@ -11536,19 +11864,247 @@ static int32_t klovrp_GetDeviceExtensionsVk(const char **names, int *count) {
 static int32_t klovrp_hand_unsupported(void) { return OVRP_FAIL_UNSUPPORTED; }
 
 // ovrp_GetHandTrackingEnabled(ovrpBool* out): is the SYSTEM's hand tracking
-// switched on? No — hands do not reach a guest through this plugin here (the
-// state and skeleton queries above all refuse), so the truthful answer is a
-// successful "false". Maestro (UE4, OculusInput) asks once at start and has a
-// controller path for that answer; unanswered, it stopped on the trampoline.
+// switched on? Yes for a guest that gets hands (kl_ovrp_set_hand_joints), even
+// while a controller is held — on a Quest this is the system setting, not the
+// current input. Otherwise a successful "false": Maestro (UE4, OculusInput) asks
+// once at start and has a controller path for that answer; unanswered, it
+// stopped on the trampoline.
 static int32_t klovrp_GetHandTrackingEnabled(int *out) {
     ovrp_hit("ovrp_GetHandTrackingEnabled");
     if (!out) return OVRP_FAIL_INVALID_PARAM;
-    *out = 0;
+    *out = klovrp_hands_title();
     return OVRP_SUCCESS;
 }
 
+static int32_t klovrp_skeleton_fill(const char *name, int type, void *out, int max_bones);
+
+// ovrp_GetSkeleton2 / ovrp_GetSkeleton3 (ovrpSkeletonType 0..5, out struct): the
+// same Bone and BoneCapsule records as ovrp_GetSkeleton with room for more bones
+// — 70 in Skeleton2Internal (0xc44 bytes), 84 in Skeleton3Internal (0xe3c), the
+// 19 capsules after them. Layouts read from Angry Birds' own metadata
+// (OVRPlugin 1.101: Bones_0 at +12, BoneCapsules_0 at +12+36*N). Only the two
+// OVR hand types are answered; Body and the OpenXR hand skeleton stay refused.
 static int32_t klovrp_GetSkeleton2(int skeleton_type, void *out) {
-    if (skeleton_type < 0 || skeleton_type > 3 || !out) return OVRP_FAIL_INVALID_PARAM;
+    if (skeleton_type < 0 || skeleton_type > 5 || !out) return OVRP_FAIL_INVALID_PARAM;
+    return klovrp_skeleton_fill("ovrp_GetSkeleton2", skeleton_type, out, 70);
+}
+static int32_t klovrp_GetSkeleton3(int skeleton_type, void *out) {
+    if (skeleton_type < 0 || skeleton_type > 5 || !out) return OVRP_FAIL_INVALID_PARAM;
+    return klovrp_skeleton_fill("ovrp_GetSkeleton3", skeleton_type, out, 84);
+}
+
+// ovrp_GetControllerIsInHand(ovrpStep, ovrpNode, ovrpBool *): is the controller
+// held? For a guest with hands (kl_ovrp_set_hand_joints): no while the hands are
+// the input, yes while a Sense controller is. Other guests keep the answer they
+// had — success with the Bool left alone (the shared permissive path).
+static int32_t klovrp_GetControllerIsInHand(int step, int node, int *out) {
+    ovrp_hit("ovrp_GetControllerIsInHand");
+    (void)step; (void)node;
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    if (klovrp_hands_title()) *out = !klovrp_hands_mode();
+    return OVRP_SUCCESS;
+}
+
+// KL_OVRP_FAKE_HANDS=1 (Mac host runs, diagnostic): both hands in front of the
+// head, palms down, the fingers closing and opening every four seconds — what
+// the frontend publishes on the headset, made up. Published from the guest's
+// own reads, so there must be no frontend writing hands at the same time.
+static void klovrp_fake_hands_tick(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_OVRP_FAKE_HANDS", 0) && klovrp_hands_title();
+    if (!on) return;
+    static double last;
+    double now = klovrp_mono_now();
+    if (now - last < 0.008) return;
+    last = now;
+    klovrp_pose h = klovrp_pose_read(&g_head_pose);
+    float hq[4] = { h.qx, h.qy, h.qz, h.qw };
+    (void)hq;
+    float fx, fy, fz, rx, ry, rz;
+    klovrp_qrot(&h, 0, 0, -1, &fx, &fy, &fz);
+    klovrp_qrot(&h, 1, 0, 0, &rx, &ry, &rz);
+    float curl = 45.0f * (1.0f - cosf((float)(now * 2 * 3.14159265 / 4.0)));
+    for (int hand = 0; hand < 2; hand++) {
+        float side = hand ? 0.15f : -0.15f;
+        float pos[3] = { h.px + fx * 0.35f + rx * side, h.py - 0.25f + fy * 0.35f,
+                         h.pz + fz * 0.35f + rz * side };
+        pos[1] += klovrp_origin_y();        // published in the frontend's world
+        float fwd[3] = { fx, fy, fz };
+        kl_hand_xf j[KLH_JOINTS];
+        kl_hands_synth(hand, pos, fwd, curl, j);
+        float xf[KLH_JOINTS * 7];
+        for (int i = 0; i < KLH_JOINTS; i++) {
+            memcpy(xf + 7 * i, j[i].p, 3 * sizeof(float));
+            memcpy(xf + 7 * i + 3, j[i].q, 4 * sizeof(float));
+        }
+        kl_ovrp_set_hand_joints(hand, 1, xf, (1u << KLH_JOINTS) - 1);
+    }
+}
+
+// Index pinches as the buttons a Quest reports with hands: A on the right, X on
+// the left (OVRInput's hands map), so a guest's "press A" works with a pinch.
+static uint32_t klovrp_hands_buttons(void) {
+    klovrp_fake_hands_tick();
+    pthread_mutex_lock(&g_hj_lock);
+    uint32_t l = g_hj_ovr[0].tracked ? g_hj_ovr[0].pinch_bits : 0;
+    uint32_t r = g_hj_ovr[1].tracked ? g_hj_ovr[1].pinch_bits : 0;
+    pthread_mutex_unlock(&g_hj_lock);
+    return ((r & 2u) ? 0x1u : 0) | ((l & 2u) ? 0x100u : 0);
+}
+
+// ovrpHandState (OVRP_1_44_0's HandStateInternal), 0x200 bytes — the size the
+// 1.45 plugin memcpy's out (CompositorVRAPI::GetHandState):
+//   +0x000 Status            +0x1a0 Pinches          +0x1d8 HandConfidence
+//   +0x004 RootPose (q, p)   +0x1a4 PinchStrength[5] +0x1dc FingerConfidences[5]
+//   +0x020 BoneRotations[24] +0x1b8 PointerPose      +0x1f0 RequestedTimeStamp
+//                            +0x1d4 HandScale        +0x1f8 SampleTimeStamp
+// Status: HandTracked 1, InputStateValid 2, DominantHand 0x80 (the right hand).
+// Confidence: Low 0, High 0x3f800000.
+static void klovrp_hand_state_fill(int hand, void *out) {
+    klovrp_fake_hands_tick();
+    kl_ovr_hand o;
+    kl_hand_xf raw[KLH_JOINTS];
+    double t;
+    pthread_mutex_lock(&g_hj_lock);
+    o = g_hj_ovr[hand];
+    memcpy(raw, g_hj_raw[hand], sizeof raw);
+    t = g_hj_time[hand];
+    pthread_mutex_unlock(&g_hj_lock);
+    uint8_t *b = out;
+    memset(b, 0, 0x200);
+    if (o.root.q[3] == 0 && o.root.q[0] == 0 && o.root.q[1] == 0 && o.root.q[2] == 0) {
+        // Never seen: identities rather than zero quaternions.
+        o.root.q[3] = 1;
+        for (int i = 0; i < KLO_BONES; i++) { memset(o.rot[i], 0, 12); o.rot[i][3] = 1; }
+        o.scale = 1;
+    }
+    int32_t status = o.tracked ? 3 : 0;
+    if (hand == 1) status |= 0x80;
+    memcpy(b + 0x00, &status, 4);
+    memcpy(b + 0x04, o.root.q, 16);
+    memcpy(b + 0x14, o.root.p, 12);
+    memcpy(b + 0x20, o.rot, sizeof o.rot);
+    uint32_t pinches = o.tracked ? o.pinch_bits : 0;
+    memcpy(b + 0x1a0, &pinches, 4);
+    if (o.tracked) memcpy(b + 0x1a4, o.pinch, 20);
+    // The pointer ray: from an estimated shoulder through the hand, smoothed by
+    // the publisher (kl_ovrp_set_hand_joints).
+    pthread_mutex_lock(&g_hj_lock);
+    kl_hand_xf ptr = g_hj_ptr[hand];
+    pthread_mutex_unlock(&g_hj_lock);
+    (void)raw;
+    memcpy(b + 0x1b8, ptr.q, 16);
+    memcpy(b + 0x1c8, ptr.p, 12);
+    memcpy(b + 0x1d4, &o.scale, 4);
+    uint32_t hi = 0x3f800000u;
+    if (o.tracked && o.high_confidence) memcpy(b + 0x1d8, &hi, 4);
+    for (int f = 0; f < 5; f++)
+        if (o.tracked && o.finger_high[f]) memcpy(b + 0x1dc + 4 * f, &hi, 4);
+    double now = kl_ovrp_predicted_display_time();
+    memcpy(b + 0x1f0, &now, 8);
+    memcpy(b + 0x1f8, t > 0 ? &t : &now, 8);
+    g_hj_reads[hand]++;
+    if (!o.tracked) g_hj_reads_lost[hand]++;
+    {
+        static double at;
+        double now = klovrp_mono_now();
+        if (at == 0) at = now;
+        if (now - at >= 5.0) {
+            at = now;
+            fprintf(stderr, "  [hands] guest, last 5 s: reads L %u (untracked %u) R %u (untracked %u); "
+                            "held over a gap L %u R %u frames; jumps held back L %u R %u; "
+                            "no hand frame L %u R %u\n",
+                    g_hj_reads[0], g_hj_reads_lost[0], g_hj_reads[1], g_hj_reads_lost[1],
+                    g_hj_held[0], g_hj_held[1], g_hj_jumps[0], g_hj_jumps[1],
+                    g_hj_failed[0], g_hj_failed[1]);
+            g_hj_reads[0] = g_hj_reads[1] = g_hj_reads_lost[0] = g_hj_reads_lost[1] = 0;
+            g_hj_held[0] = g_hj_held[1] = g_hj_failed[0] = g_hj_failed[1] = 0;
+            g_hj_jumps[0] = g_hj_jumps[1] = 0;
+        }
+    }
+    static int said[2];
+    if (o.tracked && !said[hand]++)
+        fprintf(stderr, "  [hands] guest reads the %s hand: tracked, root %.2f %.2f %.2f, scale %.2f\n",
+                hand ? "right" : "left", o.root.p[0], o.root.p[1], o.root.p[2], o.scale);
+}
+
+// ovrp_GetHandState(ovrpStep, ovrpHand, ovrpHandState *) — OVRP_1_44_0.
+static int32_t klovrp_GetHandState(int step, int hand, void *out) {
+    ovrp_hit("ovrp_GetHandState");
+    (void)step;
+    if (!klovrp_hands_title()) return OVRP_FAIL_UNSUPPORTED;
+    if ((unsigned)hand > 1 || !out) return OVRP_FAIL_INVALID_PARAM;
+    klovrp_hand_state_fill(hand, out);
+    return OVRP_SUCCESS;
+}
+
+// ovrp_GetHandState2(ovrpStep, int frameIndex, ovrpHand, ovrpHandState *) —
+// the same struct, one more argument (OVRP_1_55_0... per OVRPlugin.cs).
+static int32_t klovrp_GetHandState2(int step, int frame, int hand, void *out) {
+    ovrp_hit("ovrp_GetHandState2");
+    (void)step; (void)frame;
+    if (!klovrp_hands_title()) return OVRP_FAIL_UNSUPPORTED;
+    if ((unsigned)hand > 1 || !out) return OVRP_FAIL_INVALID_PARAM;
+    klovrp_hand_state_fill(hand, out);
+    return OVRP_SUCCESS;
+}
+
+// ovrp_GetSkeleton(ovrpSkeletonType, ovrpSkeleton *) — OVRP_1_44_0, 0x5cc bytes
+// (the 1.45 plugin zeroes 0x5c0 past the 12-byte head):
+//   +0x000 Type  +0x004 NumBones  +0x008 NumBoneCapsules
+//   +0x00c Bones[24], 0x24 each: Id i32, ParentBoneIndex i16 (+2 pad), Pose (q, p)
+//   +0x36c Capsules[19], 0x20 each: BoneIndex i16 (+2), StartPoint, EndPoint, Radius
+// Types: HandLeft 0, HandRight 1. The pose is kl_hands.c's own generic hand.
+static int32_t klovrp_skeleton_fill(const char *name, int type, void *out, int max_bones) {
+    ovrp_hit(name);
+    if (!klovrp_hands_title()) return OVRP_FAIL_UNSUPPORTED;
+    if ((unsigned)type > 1) {
+        static int said;
+        if (!said++) fprintf(stderr, "  [hands] %s asked for skeleton type %d — only the OVR hand "
+                                     "types (0, 1) are answered\n", name, type);
+        return OVRP_FAIL_UNSUPPORTED;
+    }
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    kl_ovr_skel sk;
+    kl_hands_bind(type, &sk);
+    uint8_t *b = out;
+    size_t caps = 0x0c + 0x24 * (size_t)max_bones;
+    memset(b, 0, caps + 0x20 * KLO_CAPSULES);
+    int32_t head[3] = { type, KLO_BONES, KLO_CAPSULES };
+    memcpy(b, head, 12);
+    for (int i = 0; i < KLO_BONES; i++) {
+        uint8_t *e = b + 0x0c + 0x24 * i;
+        int32_t id = i;
+        memcpy(e, &id, 4);
+        memcpy(e + 4, &sk.bone[i].parent, 2);
+        memcpy(e + 8, sk.bone[i].pose.q, 16);
+        memcpy(e + 24, sk.bone[i].pose.p, 12);
+    }
+    for (int i = 0; i < KLO_CAPSULES; i++) {
+        uint8_t *e = b + caps + 0x20 * i;
+        memcpy(e, &sk.cap[i].bone, 2);
+        memcpy(e + 4, sk.cap[i].a, 12);
+        memcpy(e + 16, sk.cap[i].b, 12);
+        memcpy(e + 28, &sk.cap[i].radius, 4);
+    }
+    fprintf(stderr, "  [hands] guest asked for the %s hand skeleton (%s): 24 bones, 19 capsules\n",
+            type ? "right" : "left", name);
+    return OVRP_SUCCESS;
+}
+
+static int32_t klovrp_GetSkeleton(int type, void *out) {
+    if ((unsigned)type > 1 && klovrp_hands_title()) return OVRP_FAIL_INVALID_PARAM;
+    return klovrp_skeleton_fill("ovrp_GetSkeleton", type, out, 24);
+}
+
+// ovrp_GetMesh: the hand's skinned mesh. Not made here (no mesh of our own yet);
+// refused like before, said once so a guest that needs it shows in the log.
+static int32_t klovrp_GetMesh(int type, void *out) {
+    ovrp_hit("ovrp_GetMesh");
+    (void)out;
+    static int said;
+    if (klovrp_hands_title() && !said++)
+        fprintf(stderr, "  [hands] guest asked for the hand mesh (type %d) — refused, none here\n", type);
     return OVRP_FAIL_UNSUPPORTED;
 }
 
@@ -12154,17 +12710,22 @@ static uint64_t klovrp_GetTimeInSeconds(double *out) {
     return OVRP_SUCCESS;
 }
 
+// Touch, or the hands while they are the input (kl_ovrp_set_hand_joints).
+static uint32_t klovrp_ctrl_present(void) {
+    return klovrp_hands_mode() ? OVRP_CTRL_HANDS : OVRP_CTRL_TOUCH | klovrp_hands_beside_bits();
+}
+
 static uint64_t klovrp_GetConnectedControllers2(int *out) {
     ovrp_hit("ovrp_GetConnectedControllers2");
     if (!out) return OVRP_FAIL_INVALID_PARAM;
-    *out = (int)OVRP_CTRL_TOUCH;
+    *out = (int)klovrp_ctrl_present();
     return OVRP_SUCCESS;
 }
 
 static uint64_t klovrp_GetActiveController2(int *out) {
     ovrp_hit("ovrp_GetActiveController2");
     if (!out) return OVRP_FAIL_INVALID_PARAM;
-    *out = (int)OVRP_CTRL_TOUCH;
+    *out = (int)klovrp_ctrl_present();
     return OVRP_SUCCESS;
 }
 
@@ -12179,11 +12740,11 @@ static uint64_t klovrp_GetActiveController2(int *out) {
 // the 2-forms above: the pair of Touch controllers this runtime presents.
 static uint64_t klovrp_GetConnectedControllers(void) {
     ovrp_hit("ovrp_GetConnectedControllers");
-    return (uint64_t)OVRP_CTRL_TOUCH;
+    return (uint64_t)klovrp_ctrl_present();
 }
 static uint64_t klovrp_GetActiveController(void) {
     ovrp_hit("ovrp_GetActiveController");
-    return (uint64_t)OVRP_CTRL_TOUCH;
+    return (uint64_t)klovrp_ctrl_present();
 }
 
 // --- Display cadence ------------------------------------------------------
@@ -12473,18 +13034,20 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"UnityPluginUnload", (void *)klovrp_UnityPluginUnload},
     {"JNI_OnLoad",        (void *)klovrp_JNI_OnLoad},
     {"ovrp_GetSkeleton2", (void *)klovrp_GetSkeleton2},
-    // ...and the rest of the hand-tracking surface, refused as a group. See
-    // klovrp_hand_unsupported for why one handler may serve numbered siblings
-    // here when it may not anywhere else in this file.
-    {"ovrp_GetSkeleton",  (void *)klovrp_hand_unsupported},
-    {"ovrp_GetSkeleton3", (void *)klovrp_hand_unsupported},
+    // The OVRP_1_44_0 hand surface, answered while hand tracking is on for the
+    // guest (kl_ovrp_set_hand_joints) and refused otherwise; the newer shapes
+    // refused as a group. See klovrp_hand_unsupported for why one handler may
+    // serve numbered siblings here when it may not anywhere else in this file.
+    {"ovrp_GetSkeleton",  (void *)klovrp_GetSkeleton},
+    {"ovrp_GetSkeleton3", (void *)klovrp_GetSkeleton3},
+    {"ovrp_GetControllerIsInHand", (void *)klovrp_GetControllerIsInHand},
     {"ovrp_GetHandTrackingEnabled", (void *)klovrp_GetHandTrackingEnabled},
-    {"ovrp_GetHandState",  (void *)klovrp_hand_unsupported},
-    {"ovrp_GetHandState2", (void *)klovrp_hand_unsupported},
+    {"ovrp_GetHandState",  (void *)klovrp_GetHandState},
+    {"ovrp_GetHandState2", (void *)klovrp_GetHandState2},
     // Wooorld: asked once libovrplugintracking loads (the Avatar SDK's tracking
     // bridge), which it does now that its TLS relocations are served.
     {"ovrp_GetHandState3", (void *)klovrp_hand_unsupported},
-    {"ovrp_GetMesh",  (void *)klovrp_hand_unsupported},
+    {"ovrp_GetMesh",  (void *)klovrp_GetMesh},
     {"ovrp_GetInstanceExtensionsVk", (void *)klovrp_GetInstanceExtensionsVk},
     {"ovrp_GetDeviceExtensionsVk",   (void *)klovrp_GetDeviceExtensionsVk},
     // The init state and everything that reads it. See klovrp_GetInitialized.

@@ -2353,6 +2353,13 @@ final class KleptonControllers {
             lock.unlock()
 
             let accPose = sense[hand]
+            // The fingers themselves, for a guest that reads OVR's hand
+            // skeleton (kl_ovrp_set_hand_joints). Before the pose below, which
+            // kl_ovrp then ignores for a tracked hand: its node is the wrist.
+            if kl_ovrp_hand_tracking_on() != 0 {
+                publishJoints(hand: hand, anchor: hand == 0 ? leftHand : rightHand,
+                              holdsController: accPose != nil || st.fromController)
+            }
             if let accPose {
                 if Self.discretePinch { resetDiscretePinch(hand) }
                 handSuppressed[hand] = false
@@ -2504,6 +2511,101 @@ final class KleptonControllers {
             submit(st, hand: hand)
         }
         reportPinch()
+    }
+
+    /// ARKit's joints in kl_hands.h's order (KLH_*), looked up by name.
+    private static let jointOrder: [HandSkeleton.JointName] = [
+        .wrist,
+        .thumbKnuckle, .thumbIntermediateBase, .thumbIntermediateTip, .thumbTip,
+        .indexFingerMetacarpal, .indexFingerKnuckle, .indexFingerIntermediateBase,
+        .indexFingerIntermediateTip, .indexFingerTip,
+        .middleFingerMetacarpal, .middleFingerKnuckle, .middleFingerIntermediateBase,
+        .middleFingerIntermediateTip, .middleFingerTip,
+        .ringFingerMetacarpal, .ringFingerKnuckle, .ringFingerIntermediateBase,
+        .ringFingerIntermediateTip, .ringFingerTip,
+        .littleFingerMetacarpal, .littleFingerKnuckle, .littleFingerIntermediateBase,
+        .littleFingerIntermediateTip, .littleFingerTip,
+        .forearmWrist, .forearmArm,
+    ]
+    private var jointBuf = [Float](repeating: 0, count: 27 * 7)
+    /// Each joint's last seen transform relative to its hand, per hand.
+    private var lastJointLocal = [[simd_float4x4?]](repeating: [simd_float4x4?](repeating: nil, count: 27),
+                                                    count: 2)
+    /// Frames a hand was seen / not seen; hidden joints taken from ARKit's
+    /// estimate, from their last place, or not at all — a log line every 5 s.
+    private var jointStats = [(seen: Int, lost: Int, estimated: Int, kept: Int, missing: Int)](
+        repeating: (0, 0, 0, 0, 0), count: 2)
+    private var jointStatsAt = CACurrentMediaTime()
+    private func noteJointStats() {
+        let now = CACurrentMediaTime()
+        guard now - jointStatsAt >= 5 else { return }
+        jointStatsAt = now
+        let l = jointStats[0], r = jointStats[1]
+        NSLog("[hands] ARKit, last 5 s: left seen %d lost %d frames (hidden joints: ARKit's estimate %d, "
+              + "last place %d, none %d), right seen %d lost %d (estimate %d, last place %d, none %d)",
+              l.seen, l.lost, l.estimated, l.kept, l.missing, r.seen, r.lost, r.estimated, r.kept, r.missing)
+        jointStats = [(0, 0, 0, 0, 0), (0, 0, 0, 0, 0)]
+    }
+
+    /// One hand's joints to kl_ovrp, in the world the controller poses use
+    /// (ARKit's, with the app's recentre), predicted like them: the anchor was
+    /// asked for at the presentation time.
+    private func publishJoints(hand: Int, anchor: HandAnchor?, holdsController: Bool) {
+        noteJointStats()
+        // Controllers first (the owner's choice for Angry Birds, 2026-10-24):
+        // while a Sense controller is tracked for this hand, it is the input.
+        if holdsController {
+            kl_ovrp_set_hand_joints(Int32(hand), 2, nil, 0)
+            return
+        }
+        guard let anchor, anchor.isTracked, let sk = anchor.handSkeleton else {
+            jointStats[hand].lost += 1
+            kl_ovrp_set_hand_joints(Int32(hand), 0, nil, 0)
+            return
+        }
+        jointStats[hand].seen += 1
+        let world = trackingRebase * anchor.originFromAnchorTransform
+        var mask: UInt32 = 0
+        for (i, name) in Self.jointOrder.enumerated() {
+            let j = sk.joint(name)
+            // A joint ARKit cannot see right now (a finger behind the back of
+            // the hand) is still placed by ARKit's hand model — an estimate,
+            // and much closer to the real finger than any earlier position:
+            // filling such joints with their last seen place left about ten
+            // of 27 per frame stale, and the fingers stopped matching the real
+            // ones (Elixir, 2026-10-24). So the estimate is used whenever it is
+            // a usable transform (finite, within 35 cm of the wrist); only an
+            // unusable one falls back to the joint's last place on the hand.
+            // Either way the joint counts as present, so a hidden knuckle no
+            // longer loses the whole hand.
+            var local = j.anchorFromJointTransform
+            let t = local.columns.3
+            let usable = t.x.isFinite && t.y.isFinite && t.z.isFinite
+                && simd_length(SIMD3(t.x, t.y, t.z)) < 0.35
+                && simd_length(SIMD3(local.columns.0.x, local.columns.0.y, local.columns.0.z)) > 0.5
+            if j.isTracked || usable {
+                if !j.isTracked { jointStats[hand].estimated += 1 }
+                lastJointLocal[hand][i] = local
+                mask |= 1 << UInt32(i)
+            } else if let kept = lastJointLocal[hand][i] {
+                local = kept
+                mask |= 1 << UInt32(i)
+                jointStats[hand].kept += 1
+            } else {
+                jointStats[hand].missing += 1
+            }
+            let m = world * local
+            let q = simd_quatf(simd_float3x3(SIMD3(m.columns.0.x, m.columns.0.y, m.columns.0.z),
+                                             SIMD3(m.columns.1.x, m.columns.1.y, m.columns.1.z),
+                                             SIMD3(m.columns.2.x, m.columns.2.y, m.columns.2.z)))
+            let o = i * 7
+            jointBuf[o] = m.columns.3.x; jointBuf[o + 1] = m.columns.3.y; jointBuf[o + 2] = m.columns.3.z
+            jointBuf[o + 3] = q.imag.x; jointBuf[o + 4] = q.imag.y
+            jointBuf[o + 5] = q.imag.z; jointBuf[o + 6] = q.real
+        }
+        jointBuf.withUnsafeBufferPointer {
+            kl_ovrp_set_hand_joints(Int32(hand), 1, $0.baseAddress, mask)
+        }
     }
 
     /// Where each hand was last, in ARKit's own frame (before any recentring),

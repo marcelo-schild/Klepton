@@ -65,7 +65,7 @@ RUNTIME_SHIP := $(LX_SRC) runtime/guest/kl_linuxproc.c \
            runtime/libc/kl_libc.c runtime/libc/kl_libc_slink.c runtime/libc/kl_pthread.c runtime/kl_dl.c \
            runtime/guest/kl_ndk.c runtime/kl_x18.c runtime/kl_target.c \
            $(RUNTIME_JNI) \
-           runtime/gfx/kl_egl.c runtime/media/kl_opensl.c runtime/media/kl_audio.c runtime/xr/kl_ovrp.c \
+           runtime/gfx/kl_egl.c runtime/media/kl_opensl.c runtime/media/kl_audio.c runtime/xr/kl_ovrp.c runtime/xr/kl_hands.c \
            runtime/xr/kl_ovrp_sret.S runtime/gfx/kl_reproject.c runtime/gfx/kl_present.c \
            runtime/xr/kl_ovrplat.c runtime/xr/kl_assetcfg.c runtime/xr/kl_room.c runtime/xr/kl_steamapi.c runtime/xr/kl_openxr.c runtime/media/kl_mediandk.c runtime/media/kl_vtdec.c runtime/media/kl_avdec.m \
            runtime/gfx/kl_vulkan.c runtime/gfx/kl_vk_eyefix.c runtime/gfx/kl_mtl_foveate.m runtime/gfx/kl_mtl_busy.m \
@@ -968,6 +968,17 @@ build/t_room: tests/t_room.c runtime/xr/kl_room.c runtime/xr/kl_room.h
 room: build/t_room
 	./build/t_room
 
+# Hand tracking for OVRPlugin guests (kl_hands.c): synthetic ARKit hands in,
+# OVR's 24-bone hand skeleton out — bind pose, mirror relation, finger bend,
+# pinch, finding ARKit's joint axes.
+build/t_hands: tests/t_hands.c runtime/xr/kl_hands.c runtime/xr/kl_hands.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_hands.c runtime/xr/kl_hands.c
+
+.PHONY: hands
+hands: build/t_hands
+	./build/t_hands
+
 # The discrete hand pinch (KleptonPinch.swift, KL_PINCH_DISCRETE): the filter
 # the app compiles, run on the Mac against timed sequences of fingertip values
 # and system pinch events at 60, 90 and 100 Hz. No ARKit; in `make check`.
@@ -1095,7 +1106,7 @@ tgkill: build/t_tgkill
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_ovrplat build/t_posebound build/t_ovrplayers build/t_trackers build/t_untested build/t_audio build/t_audiorace build/t_xrinput build/t_softinput build/t_ctr build/t_mtxtable build/t_bcast build/t_neterrno build/t_fault build/t_glcaps build/t_x18race build/t_tgkill build/klepton-ld build/t_uevk build/t_jniobj build/t_fove build/t_mtlbusy build/t_metrics build/t_dl_ext build/t_jni_io build/t_jni_url build/t_jni_firebase build/t_jni_vivox build/t_jni_memory build/t_jni_azs2 build/t_gunclub build/t_maxeye build/t_assetcfg build/t_pinch build/t_arrayviews build/t_surreal build/t_mfxpreset build/t_mfxalpha build/t_statscard build/t_maxeye_swift build/t_x18pool build/t_ue421 build/t_room
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_ovrplat build/t_posebound build/t_ovrplayers build/t_trackers build/t_untested build/t_audio build/t_audiorace build/t_xrinput build/t_softinput build/t_ctr build/t_mtxtable build/t_bcast build/t_neterrno build/t_fault build/t_glcaps build/t_x18race build/t_tgkill build/klepton-ld build/t_uevk build/t_jniobj build/t_fove build/t_mtlbusy build/t_metrics build/t_dl_ext build/t_jni_io build/t_jni_url build/t_jni_firebase build/t_jni_vivox build/t_jni_memory build/t_jni_azs2 build/t_gunclub build/t_maxeye build/t_assetcfg build/t_pinch build/t_arrayviews build/t_surreal build/t_mfxpreset build/t_mfxalpha build/t_statscard build/t_maxeye_swift build/t_x18pool build/t_ue421 build/t_room build/t_hands
 	@# The guest steps read $(TARGET)'s own files. Without them the loader steps print nothing and pass, and the
 	@# run ends at the il2cpp step with a bare "Error 1" - a check that looked green until its last line. A
 	@# working copy without the game's tree (a fresh git worktree) is told so here, before anything runs.
@@ -1178,6 +1189,8 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@echo "=== discrete hand pinch ===" && tail -1 build/pinch.log
 	@./build/t_room > build/room.log 2>&1 || { cat build/room.log; exit 1; }
 	@echo "=== room and play area ===" && tail -1 build/room.log
+	@./build/t_hands > build/hands.log 2>&1 || { cat build/hands.log; exit 1; }
+	@echo "=== hand tracking (OVR skeleton) ===" && tail -1 build/hands.log
 	@./build/t_arrayviews > build/arrayviews.log 2>&1 || { cat build/arrayviews.log; exit 1; }
 	@echo "=== compositor array views ===" && tail -1 build/arrayviews.log
 	@./build/t_ue421 > build/ue421.log 2>&1 || { cat build/ue421.log; exit 1; }

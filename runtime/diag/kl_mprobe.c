@@ -1027,6 +1027,17 @@ static void mprobe_find_methods(void) {
 static Il2CppObject *mprobe_objects(Il2CppObject *type, uint32_t *count) {
     *count = 0;
     const MethodInfo *fa = find_method("UnityEngine", "Object", "FindObjectsByType", 3);
+    if (!fa && type) {
+        // Unity before 2020.3 has no FindObjectsByType (Elixir, 2019.2):
+        // Resources.FindObjectsOfTypeAll, which includes inactive objects too
+        // (and prefabs, which a probe of a running scene rarely meets).
+        const MethodInfo *fall = find_method("UnityEngine", "Resources", "FindObjectsOfTypeAll", 1);
+        if (!fall) return NULL;
+        void *a1[1] = { type };
+        Il2CppObject *arr = invoke(fall, a1, "Resources.FindObjectsOfTypeAll");
+        if (arr) *count = *(uint32_t *)((char *)arr + 24);
+        return arr;
+    }
     if (!fa || !type) return NULL;
     int32_t inactive = 1 /* FindObjectsInactive.Include */, sort = 1 /* FindObjectsSortMode.InstanceID: the same order each time */;
     void *args[3] = { type, &inactive, &sort };
@@ -1146,8 +1157,23 @@ static void mprobe_call_spec(unsigned frame, const char *spec, int nth) {
         }
     }
     fprintf(stderr, "  [mprobe f%u] call: %s.%s::%s(%d) on %s\n", frame, ns, cls, meth, argc, how);
-    invoke_on(self, m, argc ? argv : NULL, meth);
-    fprintf(stderr, "  [mprobe f%u] call: %s() returned\n", frame, meth);
+    Il2CppObject *ret = invoke_on(self, m, argc ? argv : NULL, meth);
+    // What came back, when it is something small: a getter is then a reading.
+    char val[128] = "";
+    if (ret) {
+        Il2CppClass *rk = il.object_get_class(ret);
+        const char *rn = rk ? il.class_get_name(rk) : "?";
+        const char *b = (const char *)ret + 16;      // a boxed value's payload
+        if (!strcmp(rn, "Boolean")) snprintf(val, sizeof val, " -> %s", *b ? "true" : "false");
+        else if (!strcmp(rn, "Int32")) snprintf(val, sizeof val, " -> %d", *(const int32_t *)b);
+        else if (!strcmp(rn, "Single")) snprintf(val, sizeof val, " -> %g", (double)*(const float *)b);
+        else if (!strcmp(rn, "String")) { char t[100]; str_ascii(ret, t, sizeof t); snprintf(val, sizeof val, " -> \"%s\"", t); }
+        else if (!strcmp(rn, "Vector3")) snprintf(val, sizeof val, " -> (%.3f, %.3f, %.3f)",
+                                                  (double)((const float *)b)[0], (double)((const float *)b)[1],
+                                                  (double)((const float *)b)[2]);
+        else snprintf(val, sizeof val, " -> a %s", rn);
+    }
+    fprintf(stderr, "  [mprobe f%u] call: %s() returned%s\n", frame, meth, val);
 }
 
 static void mprobe_call(unsigned frame) { mprobe_call_spec(frame, kl_env_str("KL_PROBE_CALL", NULL), -1); }

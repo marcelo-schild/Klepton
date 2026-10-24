@@ -30,6 +30,8 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <math.h>          // powf — the debug tone map in the capture path
+#include <float.h>         // FLT_MIN — subnormal literals
+#include <ctype.h>
 #include <zlib.h>
 // The decoded-video image path — an AHardwareBuffer here is a
 // CVPixelBuffer, and what ANGLE can take is the IOSurface behind it.
@@ -2791,6 +2793,78 @@ static void klfb_MemoryBarrier(uint32_t barriers) {
     } while (0)
 #define KLFB_CS_GENERIC(target) ((target) == KLFB_GL_SSBO && (kl_glfb_compute_tf() || kl_glfb_ssbo_tex() || kl_glfb_compute_stub()))
 
+// Subnormal float literals, written as the bits they stand for (KL_GLFB_DENORM).
+//
+// Unity's HLSLcc keeps integer temporaries in float registers and moves them
+// with floatBitsToInt/intBitsToFloat. A small integer constant then appears as
+// a float literal whose BITS are the integer: `u_xlat3.x = 2.80259693e-45;` is
+// the int 2, the exit value of a loop counter that is compared by
+// `floatBitsToInt(u_xlat9.x) >= 2`. Metal compiles ANGLE's shaders with fast
+// math, which flushes subnormals to zero, so that constant arrives as 0, the
+// counter is reset to 0 instead of 2 on the way out, and `while(true)` never
+// ends: a GPU hang. Elixir's potion-glass shader (parallax loop, Potionary) hung
+// the Mac's GPU hard enough to take the WindowServer down (2026-10-24) and left
+// the headset's picture black: every later command buffer was discarded.
+//
+// Each such literal becomes intBitsToFloat(<bits> + kl_denorm_zero_), with
+// kl_denorm_zero_ an int uniform nobody sets (so 0, as every uniform starts):
+// a value the compiler cannot fold back into a constant to flush. A literal is
+// rewritten only when it parses to a nonzero float below FLT_MIN; GLSL ES 1.00
+// sources (no bit casts) are left alone. KL_GLFB_DENORM=0 turns it off.
+static int klfb_rewrite_denorm_literals(char *buf, size_t *off, size_t cap) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_GLFB_DENORM", 1);
+    if (!on || strncmp(buf, "#version 3", 10) != 0) return 0;
+    int n = 0;
+    for (char *p = buf; *p; p++) {
+        if (!(*p >= '0' && *p <= '9')) continue;
+        if (p > buf && (isalnum((unsigned char)p[-1]) || p[-1] == '_' || p[-1] == '.')) {
+            while (isalnum((unsigned char)p[1]) || p[1] == '_' || p[1] == '.') p++;
+            continue;
+        }
+        char *end;
+        float v = strtof(p, &end);
+        // Only literals with an exponent can be this small.
+        int has_e = 0;
+        for (char *q = p; q < end; q++) if (*q == 'e' || *q == 'E') has_e = 1;
+        if (!has_e || v == 0.0f || fabsf(v) >= FLT_MIN) { p = end - 1; continue; }
+        int32_t bits;
+        memcpy(&bits, &v, sizeof bits);
+        char rep[64];
+        int rl = snprintf(rep, sizeof rep, "intBitsToFloat(%d + kl_denorm_zero_)", bits);
+        size_t ol = (size_t)(end - p);
+        if (*off + (size_t)rl - ol + 1 >= cap) break;
+        memmove(p + rl, end, strlen(end) + 1);
+        memcpy(p, rep, (size_t)rl);
+        *off += (size_t)rl - ol;
+        p += rl - 1;
+        n++;
+    }
+    if (!n) return 0;
+    // The uniform: after the last #extension / precision line at the top, or
+    // after #version.
+    static const char decl[] = "uniform highp int kl_denorm_zero_;\n";
+    char *at = strchr(buf, '\n');
+    if (!at) return n;
+    at++;
+    for (char *q = at; *q; ) {
+        if (strncmp(q, "#extension", 10) == 0 || strncmp(q, "precision ", 10) == 0 ||
+            strncmp(q, "#ifdef GL_EXT", 13) == 0 || strncmp(q, "#endif", 6) == 0 ||
+            *q == '\n') {
+            char *nl = strchr(q, '\n');
+            if (!nl) break;
+            if (*q != '\n') at = nl + 1;
+            q = nl + 1;
+        } else break;
+    }
+    size_t dl = sizeof decl - 1;
+    if (*off + dl + 1 >= cap) return n;
+    memmove(at + dl, at, strlen(at) + 1);
+    memcpy(at, decl, dl);
+    *off += dl;
+    return n;
+}
+
 static void klfb_ShaderSource(uint32_t shader, int32_t count,
                               const char *const *strings, const int32_t *lengths) {
     if (strings && count > 0) {
@@ -2877,6 +2951,17 @@ static void klfb_ShaderSource(uint32_t shader, int32_t count,
             }
             // Either flag sends `buf` to ANGLE instead of the guest's strings.
             int dbg_modified = trimmed;
+            {
+                int dn = klfb_rewrite_denorm_literals(buf, &off, cap);
+                if (dn) {
+                    dbg_modified = 1;
+                    static int said;
+                    if (said++ < 4)
+                        fprintf(stderr, "  [glfb] shader %u: %d subnormal float literal(s) written as "
+                                        "their bits — fast math would flush them to 0 (an HLSLcc "
+                                        "integer constant; KL_GLFB_DENORM=0 disables)\n", shader, dn);
+                }
+            }
             // KL_GLFB_VS_FINITE: a vertex whose clip position is not finite
             // (an exponent of all ones: infinity or NaN) is moved outside the
             // view. Synth Riders shows its pooled rail LineRenderers for two

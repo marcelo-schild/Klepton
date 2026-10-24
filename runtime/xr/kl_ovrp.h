@@ -214,6 +214,20 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
                              float qx, float qy, float qz, float qw,
                              float vx, float vy, float vz,
                              float avx, float avy, float avz);
+// Hand tracking for an OVRPlugin guest (kl_ovrp.c, kl_hands.c). Is it on for
+// this guest (KL_OVRP_HANDS, default per title)? 0 until the guest is known.
+int kl_ovrp_hand_tracking_on(void);
+
+// One hand's 27 ARKit joints for this frame, in the order of kl_hands.h's
+// KLH_* (HandSkeleton.JointName order), each 7 floats: position x y z, then
+// orientation x y z w — the same world as kl_ovrp_set_hand_motion, predicted to
+// the frame's presentation time. `tracked` has bit i set for each joint ARKit
+// tracks. state: 0 the hand is not seen, 1 tracked (xf required), 2 the hand
+// holds a controller (Touch is the input until it is put down). Call before
+// kl_ovrp_set_hand_motion for the same hand: while the joints are tracked the
+// hand node is their wrist and the grip pose is ignored.
+void kl_ovrp_set_hand_joints(int hand, int state, const float *xf, uint32_t tracked);
+
 // Has a frontend ever published a head pose / this hand's pose (sticky)?
 int kl_ovrp_head_pose_published(void);
 int kl_ovrp_hand_pose_published(int hand);

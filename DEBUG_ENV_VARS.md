@@ -4642,3 +4642,41 @@ off from the launch environment as documented above.
   game (`play area: in room …`, `near the edge`).
 - `make room` — `tests/t_room.c`: scan map, coverage, suggestion, drawing,
   distance field, outlines and room matching on a made-up 5 x 4 m room.
+
+## Hand tracking for OVRPlugin guests (`runtime/xr/kl_hands.c`, `runtime/xr/kl_ovrp.c`)
+
+ARKit's 27 hand joints, published by `KleptonControllers.swift` every frame
+(`kl_ovrp_set_hand_joints`, predicted to the presentation time), answered as
+OVRPlugin's hand tracking: `ovrp_GetHandState`/`2` (root pose = wrist, 24 local
+bone rotations in OVR's convention, pinch strengths and bits, pointer pose,
+hand scale, confidence), `ovrp_GetSkeleton` (a generic bind pose of our own),
+`ovrp_GetHandTrackingEnabled`; hands are the connected and active controller
+(0x60) while no Sense controller is in a hand. `ovrp_GetMesh`, `GetHandState3`
+and `GetSkeleton2/3` stay refused. `tests/t_hands.c` (`make hands`) checks the
+conversion on synthetic hands.
+
+- `KL_OVRP_HANDS=0|1` — hand tracking for this guest. Default on for Elixir
+  (`x3793077684043441`), off everywhere else.
+- `KL_OVRP_HANDS_ONLY=0|1` — hands are the input even with Sense controllers
+  paired; a controller in a hand is that hand not seen. Default on for Elixir.
+- `KL_OVRP_HANDS_AXIS=+x|-x|+y|-y|+z|-z` — which axis of ARKit's joint frame
+  points out of the back of a finger. Normally found on a flat hand and logged
+  (`[hands] … ARKit joint axis … is the back of the fingers`): -y left, +y right
+  on visionOS 27.
+- `KL_OVRP_HANDS_HOLD_MS=<ms>` — a hand ARKit loses for this long stays where
+  it was, tracked (default 250).
+- `KL_OVRP_FAKE_HANDS=1` — Mac host runs: made-up hands in front of the head,
+  the fingers closing and opening every four seconds. No frontend may publish
+  hands at the same time.
+- Log: `[hands] … first seen` (joint distances), a five-second line per hand
+  (bend per finger, pinch, wrist, joints tracked) and five-second counts on both
+  sides (`ARKit, last 5 s` in the frontend: frames seen/lost, hidden joints taken
+  from ARKit's estimate or their last place; `guest, last 5 s`: reads of an
+  untracked hand, frames held over a gap).
+
+- `KL_GLFB_DENORM=0|1` (`runtime/gfx/kl_glfb.c`, default 1) — a subnormal float
+  literal in an ES 3 shader (an HLSLcc integer constant such as 2.80259693e-45 =
+  the int 2) is written as `intBitsToFloat(bits + kl_denorm_zero_)`. Metal's
+  fast math flushes the literal to 0; in Elixir's potion-glass shader that is a
+  loop's exit value, and the endless loop hung the GPU (the Mac's WindowServer
+  went down with it, the headset picture stayed black).

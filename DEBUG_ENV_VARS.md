@@ -224,7 +224,10 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   by default for DreamSpace (`x9449316705178989`, Unity 6 + OpenXR, the same
   case), which is told OVRPlugin 1.203.0 and gets the GLES 3.0 capability
   profile (as Space Channel does) so Unity does not skin on the GPU. On by
-  default for Fluid (`x6946182742093178`, Unity 6000.3 + OpenXR) as well.
+  default for Fluid (`x6946182742093178`, Unity 6000.3 + OpenXR) as well, and
+  for Sweet Surrender (`x4723352327707414`, Unity 6000.1 + OpenXR,
+  SinglePassMultiview with 4x anti-aliasing: every frame "Framebuffer is not
+  complete", a black picture with its music playing).
 - `KL_NET_NO_META=0|1` — (`runtime/libc/kl_shim.c`) names under oculus.com,
   oculuscdn.com, facebook.com, facebook.net, fbcdn.net and meta.com do not
   resolve (`EAI_NONAME`, as on a headset without a network); every other host

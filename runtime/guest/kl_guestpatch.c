@@ -748,7 +748,106 @@ static const kl_gp_word k_fluid_keyboard_warmup[] = {
     { 0x44883c0, 0x3942c800, 0x3942c800, "fingerprint only (FluidVirtualKeyboard::get_WarmupSurfaceAttached)" },
 };
 
+// Roboquest VR, Meta Store build (libUnreal.so, UE 5.6.1 in Meta's fork; store
+// target x9269393463181825, version 1.0.4 / 101): FMallocBinned3's pools are
+// 512 MB here instead of 1 GB, so its one reservation fits this address space.
+//
+// The engine's allocator is created by the first static initialiser that
+// allocates, and FMallocBinned3's constructor reserves one block of address
+// space for all of its pools at once: 76 pools (size classes up to 128 KB) of
+// 1 GB each, 76 GB, mmap'd read-write. Android overcommits that. visionOS does
+// not have the addresses: even with extended-virtual-addressing (the app has
+// it) the ceiling is about 64 GB, the mmap fails, and Unreal stops with "Ran
+// out of memory allocating 81604378624 bytes" — inside static init, before
+// GError exists, so the report itself faults (write at 0x10, pc
+// libUnreal.so+0x1f5b638; crash reports 2026-10-23 21:34 and 21:43, on start).
+//
+// The pool size is a compile-time constant, so it is in the code in a few
+// spellings; all of them are here. Every reader of the allocator's base
+// (the static at 0xa3ad960, read directly at 4 sites and through its GOT slot
+// 0xa207b00 at 5 — a scan of the whole .text, 2026-10-23) is in this one
+// region, and these are the pool-size uses around them:
+//   * pool index from an offset: lsr/ubfx #30 -> #29
+//   * pool base from an index:   lsl #30 -> #29; the pool-start mask
+//     0x3fffffffc0000000 -> 0x3fffffffe0000000
+//   * "is this an OS allocation": (offset >> 32) against 0x12/0x13, i.e.
+//     offset >= 76 GB, becomes (offset >> 31) against the same numbers, i.e.
+//     offset >= 38 GB = 76 pools of 512 MB
+//   * blocks per pool, which sizes each pool's bitmaps: 1 GB / block -> 512 MB
+//   * the reservation: 76 GB -> 40 GB (38 GB rounded up to what one movz
+//     can say; the last 2 GB is never handed out and never looked up), and the
+//     extent the constructor registers with it.
+// A size class now holds up to 512 MB; the whole game is told it has 6 GB
+// (KL_MEM_TOTAL_MB), and no one size class of an allocator spread over 76 comes
+// near that. The pool count, the size classes and everything else stay as they
+// were.
+static const kl_gp_word k_roboquest_meta_binned3[] = {
+    { 0x1e97e30, 0x92627d6b, 0x9263816b, "and x11, x11, #0x3fffffffc0000000 -> #0x3fffffffe0000000 (start of the pool a block is in)" },
+    { 0x1e98200, 0xd3627edb, 0xd3637edb, "ubfiz x27, x22, #30, #32 -> #29 (pool index -> pool base)" },
+    { 0x1e9862c, 0xd2c00260, 0xd2c00140, "mov x0, #0x1300000000 -> #0xa00000000 (the reservation: 76 GB -> 40 GB)" },
+    { 0x1e9865c, 0x92dffda9, 0x92dffec9, "mov x9, #-0xffed00000001 -> #-0xfff600000001 (its extent: 76 GB - 1 -> 40 GB - 1)" },
+    { 0x1e986c4, 0x52a8000d, 0x52a4000d, "mov w13, #0x40000000 -> #0x20000000 (blocks per pool, for the bitmaps' size)" },
+    { 0x1e9883c, 0x52a80009, 0x52a40009, "mov w9, #0x40000000 -> #0x20000000 (blocks per pool)" },
+    { 0x1e99680, 0x8b147929, 0x8b147529, "add x9, x9, x20, lsl #30 -> lsl #29 (pool index -> pool base)" },
+    { 0x1e99e48, 0xd35efd14, 0xd35dfd14, "lsr x20, x8, #30 -> #29 (pool index)" },
+    { 0x1e99e50, 0xd360fd08, 0xd35ffd08, "lsr x8, x8, #32 -> #31 (OS allocation: offset >= 38 GB)" },
+    { 0x1e9cb1c, 0xd360fea8, 0xd35ffea8, "lsr x8, x21, #32 -> #31 (OS allocation: offset >= 38 GB)" },
+    { 0x1e9cb38, 0xd35efea8, 0xd35dfea8, "lsr x8, x21, #30 -> #29 (pool index)" },
+    { 0x1e9cb98, 0xd35ef6a8, 0xd35df2a8, "ubfx x8, x21, #30, #32 -> #29, #32 (pool index)" },
+    { 0x1e9cc50, 0xd35ef6a8, 0xd35df2a8, "ubfx x8, x21, #30, #32 -> #29, #32 (pool index)" },
+    { 0x1e9cca0, 0xd35ef6a8, 0xd35df2a8, "ubfx x8, x21, #30, #32 -> #29, #32 (pool index)" },
+    { 0x1e9cd34, 0xd360fd09, 0xd35ffd09, "lsr x9, x8, #32 -> #31 (OS allocation: offset >= 38 GB)" },
+    { 0x1e9cd38, 0xd35efd02, 0xd35dfd02, "lsr x2, x8, #30 -> #29 (pool index)" },
+    { 0x1e9cf14, 0xd360fd09, 0xd35ffd09, "lsr x9, x8, #32 -> #31 (OS allocation: offset >= 38 GB)" },
+    { 0x1e9cf24, 0xd35efd08, 0xd35dfd08, "lsr x8, x8, #30 -> #29 (pool index)" },
+    { 0x1e9d5d4, 0xd360fd09, 0xd35ffd09, "lsr x9, x8, #32 -> #31 (OS allocation: offset >= 38 GB)" },
+    { 0x1e9d5e4, 0xd35efd08, 0xd35dfd08, "lsr x8, x8, #30 -> #29 (pool index)" },
+    { 0x1e986e4, 0xf101313f, 0xf101313f, "fingerprint only (cmp x9, #0x4c: 76 pools)" },
+    { 0x1e99e58, 0xf100491f, 0xf100491f, "fingerprint only (cmp x8, #0x12, kept: (offset >> 31) > 0x12 is offset >= 38 GB)" },
+    { 0x1e9cb20, 0xfa531900, 0xfa531900, "fingerprint only (ccmp x8, #0x13, kept: (offset >> 31) < 0x13 is offset < 38 GB)" },
+    { 0x1e9cd3c, 0xf100493f, 0xf100493f, "fingerprint only (cmp x9, #0x12, kept)" },
+    { 0x1e9cf18, 0xf100493f, 0xf100493f, "fingerprint only (cmp x9, #0x12, kept)" },
+    { 0x1e9d5d8, 0xf100493f, 0xf100493f, "fingerprint only (cmp x9, #0x12, kept)" },
+};
+
+// Roboquest VR, Meta Store build (libUnreal.so, UE 5.6.1 in Meta's fork; store
+// target x9269393463181825, version 1.0.4 / 101): FPakPlatformFile::OpenMappedEx
+// gives the engine's own answer for a platform without memory-mapped IO. The
+// same patch as the earlier Roboquest build's (x3151760, 1.0.3: the pak layer
+// of that build, measured 2026-10-22), re-measured for this one.
+//
+// The game's one pak is inside its patch OBB and reaches the engine through the
+// read-through (kl_obbmap). Those fds cannot be memory-mapped — the pak starts
+// at an arbitrary offset in the archive — so klb_mmap refuses them with ENODEV.
+// UE 5.6's async loader maps bulk data through FPakPlatformFile::OpenMappedEx,
+// the open itself succeeds (it is only open + fstat underneath), and the pak's
+// MapRegion uses the region FAndroidMappedFileHandle::MapRegion hands back
+// without checking it for null: a read at 0x8 on the FAsyncLoading thread a
+// second after the engine came up (crash report 2026-10-23 22:50:42,
+// libUnreal.so 0x32e16dc: ldp x10, x8, [x21, #0x8] on the null region).
+//
+// `mmio.enable` is the engine's switch for exactly this case, and OpenMappedEx
+// reads it first — but this Shipping build has no way to set it from outside.
+// So the branch on it is taken always: every pak map request answers "Memory
+// mapped IO is not enabled on this platform", the caller already handles that
+// error, and the bulk data is read the ordinary way through the read-through.
+// The registration row pins the variable the branch tests to the cvar's name.
+//   0x32c7254  cbz w9, 0x32c7338  -> b 0x32c7338
+static const kl_gp_word k_roboquest_meta_pak_no_mmio[] = {
+    { 0x32c7254, 0x34000729, 0x14000039, "FPakPlatformFile::OpenMappedEx: cbz mmio.enable -> b (not enabled)" },
+    { 0x32c724c, 0xb0038549, 0xb0038549, "fingerprint only (adrp of mmio.enable)" },
+    { 0x32c7250, 0xb942bd29, 0xb942bd29, "fingerprint only (ldr w9, mmio.enable)" },
+    { 0x32c7338, 0x90fe7a61, 0x90fe7a61, "fingerprint only (adrp of \"Memory mapped IO is not enabled\")" },
+    { 0x32f167c, 0x910af042, 0x910af042, "fingerprint only (mmio.enable's registration: the variable it binds)" },
+};
+
 static const kl_gp_patch k_patches[] = {
+    { "roboquest-meta-pak-no-mmio", "libUnreal.so",
+      "pak bulk data is read, not memory-mapped (mmio.enable's own path): the read-through cannot map it",
+      k_roboquest_meta_pak_no_mmio, sizeof k_roboquest_meta_pak_no_mmio / sizeof *k_roboquest_meta_pak_no_mmio },
+    { "roboquest-meta-binned3-512m", "libUnreal.so",
+      "the allocator's pools are 512 MB, so its start-up reservation is 40 GB, not 76",
+      k_roboquest_meta_binned3, sizeof k_roboquest_meta_binned3 / sizeof *k_roboquest_meta_binned3 },
     { "fluid-keyboard-warmup", "libil2cpp.so",
       "the startup keyboard warmup completes without the Java keyboard's surface",
       k_fluid_keyboard_warmup,

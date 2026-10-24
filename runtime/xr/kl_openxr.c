@@ -828,6 +828,11 @@ static klxr_instance *klxr_inst(void *h) {
 // build and every other OpenXR guest get what they got. Told from the Meta
 // build by Steam's library in the game's files, like Walkabout's Steam build
 // (klxr_pitches).
+static int klxr_target_is(const char *name) {
+    extern const char *kl_driver_target_name(void);
+    const char *t = kl_driver_target_name();
+    return t && !strcmp(t, name);
+}
 static int klxr_moss_from_steam(void) {
     extern const char *kl_driver_target_name(void);
     const char *t = kl_driver_target_name();
@@ -1605,10 +1610,13 @@ static XrResult klxr_GetSystemProperties(void *instance, XrSystemId system_id,
     // name says the same so the two identities agree.
     extern const char *kl_driver_target_name(void);
     const char *t = kl_driver_target_name();
+    // Roboquest VR's Meta Store build (x9269393463181825) is presented as a
+    // Quest 3 too (kl_jni.c).
     snprintf(props->systemName, sizeof props->systemName, "%s",
              kl_env_str("KL_XR_SYSTEM_NAME",
-                        t && strcmp(t, "steamlink-vr") == 0 ? "Meta Quest 3"
-                                                            : "Oculus Quest2"));
+                        t && (strcmp(t, "steamlink-vr") == 0 ||
+                              strcmp(t, "x9269393463181825") == 0) ? "Meta Quest 3"
+                                                                   : "Oculus Quest2"));
     // The maxima are a ceiling on what a swapchain may ask for, not a
     // recommendation — so they are generous, and the recommendation lives in
     // the view configuration below where the guest will actually read it.
@@ -4469,8 +4477,12 @@ static XrResult klxr_SuggestInteractionProfileBindings(
             // never arrives. Served like squeeze/click above, from the hand
             // trigger's own threshold bit. For that build only: no other
             // guest's use of the bare path has been looked at.
+            // ...and Roboquest VR's Meta Store build (x9269393463181825, UE 5.6),
+            // whose grab is that key: the hand closed on the grip (its pose is
+            // the axis, squeeze/value) and the weapon in the tutorial could not
+            // be picked up (on device, 2026-10-23, both hands "not recognised").
             if (kind == KLXR_SRC_NONE && strcmp(suffix, "/input/squeeze") == 0 &&
-                klxr_moss_from_steam()) {
+                (klxr_moss_from_steam() || klxr_target_is("x9269393463181825"))) {
                 kind = KLXR_SRC_BUTTON;
                 bit  = hand ? KL_OVRP_RAW_RHAND_TRIGGER : KL_OVRP_RAW_LHAND_TRIGGER;
             }
@@ -5216,7 +5228,10 @@ typedef struct {
     uint64_t vk_img[KLXR_SWAPCHAIN_IMAGES];    // Vulkan: VkImage handles
     uint64_t vk_fdm[KLXR_SWAPCHAIN_IMAGES];    // Vulkan: XR_FB_foveation_vulkan density maps (klxr_fill_foveation_image)
     int      count;
-    int      acquired;        // index the app currently holds, -1 when none
+    int      acquired;        // the OLDEST index the app holds, -1 when none
+    int      held;            // how many it holds (acquired, not yet released)...
+    int      waited;          // ...and how many of those, oldest first, it has waited on
+    int      said_pipelined;  // the one line saying it holds more than one
     int      last_released;   // ...and the last one it handed BACK, which is the
                               // image it drew: by xrEndFrame the guest's own
                               // framebuffer may already point at the next one
@@ -6267,8 +6282,23 @@ static XrResult klxr_EnumerateSwapchainImages(void *swapchain, uint32_t capacity
 // consumer — so wait returns immediately. That is a correct answer for the
 // present arrangement rather than a stub for a missing one, but it is the line
 // that has to change the day the compositor samples an image the guest could
-// still be drawing into. The call ORDER is enforced, because a double-acquire
-// is a guest bug we would rather name than absorb.
+// still be drawing into. The call ORDER is enforced as the spec states it.
+//
+// That order allows MORE than one image to be held at a time: an app may
+// acquire again before it releases (a frame-deep pipeline), up to the number of
+// images, and wait and release then work oldest-first. Unreal 5.6's OpenXR
+// path does exactly that (Roboquest VR, x3151760 and the Meta Store build
+// x9269393463181825): it acquires the next frame's image while the last one is
+// still held. This runtime used to allow one, and answered every second acquire
+// with XR_ERROR_CALL_ORDER_INVALID — 7825 times in one run, about every other
+// frame — and the game drew those frames into an image it was never given: a
+// black picture with glimpses of models and UI, stuttering (on device,
+// 2026-10-22, and again for the Meta Store build on 2026-10-23). Held images are always the oldest run of
+// the round-robin, so `last_released`, the one the compositor reads, is never
+// one the app still holds. An app that holds one at a time sees exactly what it
+// saw before.
+static pthread_mutex_t g_klxr_sc_img_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static XrResult klxr_AcquireSwapchainImage(void *swapchain,
                                            const XrSwapchainImageAcquireInfo *info,
                                            uint32_t *index) {
@@ -6277,10 +6307,22 @@ static XrResult klxr_AcquireSwapchainImage(void *swapchain,
     if (!sc) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     if (!index) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     if (info) klxr_log_chain("xrAcquireSwapchainImage", info->next);
-    if (sc->acquired >= 0) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
-    sc->acquired = sc->next_index;
+    pthread_mutex_lock(&g_klxr_sc_img_lock);
+    if (sc->held >= sc->count) {             // every image is already held
+        pthread_mutex_unlock(&g_klxr_sc_img_lock);
+        KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
+    }
+    int idx = sc->next_index;
     sc->next_index = (sc->next_index + 1) % sc->count;
-    *index = (uint32_t)sc->acquired;
+    if (sc->held++ == 0) sc->acquired = idx;
+    int held = sc->held, say = held > 1 && !sc->said_pipelined;
+    if (say) sc->said_pipelined = 1;
+    pthread_mutex_unlock(&g_klxr_sc_img_lock);
+    if (say)
+        fprintf(stderr, "  [xr] swapchain %ux%u: the app holds %d images at once "
+                        "(acquired before releasing) — served oldest-first\n",
+                sc->width, sc->height, held);
+    *index = (uint32_t)idx;
     return KLXR_SUCCESS;
 }
 
@@ -6290,7 +6332,13 @@ static XrResult klxr_WaitSwapchainImage(void *swapchain,
     klxr_swapchain *sc = klxr_swapchain_of(swapchain);
     if (!sc) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     if (info) klxr_log_chain("xrWaitSwapchainImage", info->next);
-    if (sc->acquired < 0) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
+    // Waits are counted oldest-first. A second wait on an image that is already
+    // waited on was accepted before and still is: only "nothing held" is refused.
+    pthread_mutex_lock(&g_klxr_sc_img_lock);
+    int ok = sc->held > 0;
+    if (sc->waited < sc->held) sc->waited++;
+    pthread_mutex_unlock(&g_klxr_sc_img_lock);
+    if (!ok) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
     return KLXR_SUCCESS;
 }
 
@@ -6300,9 +6348,19 @@ static XrResult klxr_ReleaseSwapchainImage(void *swapchain,
     klxr_swapchain *sc = klxr_swapchain_of(swapchain);
     if (!sc) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     if (info) klxr_log_chain("xrReleaseSwapchainImage", info->next);
-    if (sc->acquired < 0) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
-    sc->last_released = sc->acquired;
-    sc->acquired = -1;
+    // Releases the oldest held image. A release without a wait was accepted
+    // before and still is, so an app that holds one image at a time is answered
+    // exactly as it always was.
+    pthread_mutex_lock(&g_klxr_sc_img_lock);
+    int ok = sc->held > 0;
+    if (ok) {
+        sc->last_released = sc->acquired;
+        sc->held--;
+        if (sc->waited > 0) sc->waited--;
+        sc->acquired = sc->held ? (sc->acquired + 1) % sc->count : -1;
+    }
+    pthread_mutex_unlock(&g_klxr_sc_img_lock);
+    if (!ok) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
     return KLXR_SUCCESS;
 }
 

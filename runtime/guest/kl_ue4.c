@@ -590,6 +590,44 @@ static void ue4_mobile_multiview_off(FILE *out) {
                 r > 0 ? path : "", r < 0 ? " — could not write the file" : "");
 }
 
+// KL_UE4_NO_OCCLUSION=0|1 — Roboquest VR, Meta Store build (x9269393463181825,
+// UE 5.6 mobile on Vulkan): the engine's occlusion culling off, so it draws
+// what is in view without first asking the depth buffer whether it is hidden.
+//
+// With foveated rendering on (kl_fove.m) at ANY level — Light, Medium, Strong —
+// objects blinked in and out; with it off they did not (on device, 2026-10-23).
+// Unreal decides visibility from the depth the scene pass leaves: occlusion
+// queries count the pixels of an object's bounds that pass the depth test, and
+// the scene pass also resolves its depth into an image of its own that it
+// stores for later. Under a rasterization rate map both are foveated: a small
+// box in the coarse part covers few or no pixels, and the stored depth is in
+// the physical (compressed) layout, which kl_fove expands for the eye colour
+// only ("nothing reads the eye depth after the eye pass" — this game does).
+// Either way a visible object is judged hidden for a frame and comes back the
+// next. Drawing everything in view costs this GPU little.
+//
+// Written under [ConsoleVariables] in the game's user Engine.ini, which a
+// device profile does not override; =0 takes the lines out again.
+static void ue4_roboquest_no_occlusion(FILE *out) {
+    const char *t = kl_driver_target_name();
+    if (!t || strcmp(t, "x9269393463181825")) return;
+    int on = kl_env_on("KL_UE4_NO_OCCLUSION", 1);
+    char path[1100];
+    static const char *const keys[] = { "r.AllowOcclusionQueries", "r.HZBOcclusion",
+                                        "r.Mobile.HZBOcclusion" };
+    int r = 0;
+    for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) {
+        int ri = ue4_user_engine_ini("RoboquestVR", "[ConsoleVariables]", keys[i], "0",
+                                     on, path, sizeof path);
+        if (ri < 0) r = -1; else if (ri > 0 && r == 0) r = 1;
+    }
+    if (out)
+        fprintf(out, "  [ue4] occlusion culling %s in the game's Engine.ini "
+                     "(KL_UE4_NO_OCCLUSION%s%s)%s\n",
+                on ? "off" : "as the project ships it", r > 0 ? ", " : "",
+                r > 0 ? path : "", r < 0 ? " — could not write the file" : "");
+}
+
 int kl_ue4_configure(const char *libdir, const char *entry_lib, FILE *out) {
     if (!libdir || !*libdir) return ue4_fail("no library directory");
     snprintf(g_libdir, sizeof g_libdir, "%s", libdir);
@@ -628,6 +666,7 @@ int kl_ue4_configure(const char *libdir, const char *entry_lib, FILE *out) {
     }
     ue4_moss_steam_pso_list(out);
     ue4_mobile_multiview_off(out);
+    ue4_roboquest_no_occlusion(out);
     if (out) {
         fprintf(out, "  [ue4] activity: %s\n", g_activity);
         fprintf(out, "  [ue4] userdata: %s\n", kl_jni_files_dir());
@@ -867,6 +906,8 @@ typedef void (*ue4_fn_ssIIs)(void *, void *, void *, void *, int, int, void *);
 typedef void (*ue4_fn_sIssss)(void *, void *, void *, int, void *, void *, void *, void *);
 // (String, String): the Redpoint EOS plugin's nativeSetEOSCacheDirectories.
 typedef void (*ue4_fn_ss)(void *, void *, void *, void *);
+// (String[]): nativeSetConfigRulesVariables.
+typedef void (*ue4_fn_as)(void *, void *, void *);
 
 static void *ue4_native(const char *name) {
     if (!g_ue4) return NULL;
@@ -1100,6 +1141,27 @@ static void kl_ue4_java_create(FILE *out) {
     if (ue4_native("nativeSetEOSCacheDirectories")) {
         UE4_CALL(out, "nativeSetEOSCacheDirectories", ue4_fn_ss,
                  kl_jni_new_string(files), kl_jni_new_string(files));
+    }
+
+    // nativeSetConfigRulesVariables(String[] keyValuePairs)
+    //
+    // GameActivity.onCreate hands the engine the variables its config rules
+    // set — key, value, key, value — evaluated in Java against the device.
+    // Nothing here evaluates config rules, so the answer is the one a device
+    // that no rule matched gets: an empty array. Unreal 5.6 in Meta's fork
+    // (Roboquest VR: x3151760, and the Meta Store build x9269393463181825)
+    // WAITS for the call: its EventWorker's first config-rule lookup parks until
+    // this native has run, so the APP_CMD_START that onStart queues is never
+    // taken off the pipe and the game sits on a black screen with every counter
+    // healthy (KL_TRACE_CONDDUMP, 2026-10-22). Only for this title, so no other
+    // UE5 game is called with anything it was not called with before.
+    {
+        const char *t = kl_driver_target_name();
+        if (t && strcmp(t, "x9269393463181825") == 0 &&
+            ue4_native("nativeSetConfigRulesVariables")) {
+            UE4_CALL(out, "nativeSetConfigRulesVariables", ue4_fn_as,
+                     kl_jni_new_string_array(NULL, 0));
+        }
     }
 }
 

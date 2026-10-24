@@ -888,6 +888,7 @@ static uint64_t klovrp_GetNativeSDKVersion2(const char **out) {
 // title is written for, and the answer has to agree with the one JNI already gave.
 #define OVRP_HEADSET_OCULUS_QUEST   8
 #define OVRP_HEADSET_OCULUS_QUEST_2 9
+#define OVRP_HEADSET_META_QUEST_3   11   // ovrpSystemHeadset_Meta_Quest_3
 // KL_OVRP_HEADSET=<n> overrides the reported ovrpSystemHeadset. Default is
 // Quest 2 (9). Liminal (Oculus Utilities 1.40, an SDK that predates Quest 2)
 // keys its Touch-vs-3DoF-remote controller mapping on headset == Oculus_Quest
@@ -908,9 +909,14 @@ static int klovrp_headset_type(void) {
         // unimplemented Touch-path ovrp call, not yet isolated. So missioniss stays
         // on the Quest-2 default (stuck-at-menu but stable) until that crash is
         // named; test the Touch path on demand with KL_OVRP_HEADSET=8.
+        // Roboquest VR's Meta Store build (x9269393463181825) is presented as a
+        // Quest 3 at its owner's request (kl_jni.c has why), and this answer
+        // agrees with the model it was given there.
         const char *tgt = kl_driver_target_name();
         int dflt = (tgt && strcmp(tgt, "liminalvr") == 0)
                      ? OVRP_HEADSET_OCULUS_QUEST
+                     : (tgt && strcmp(tgt, "x9269393463181825") == 0)
+                     ? OVRP_HEADSET_META_QUEST_3
                      : OVRP_HEADSET_OCULUS_QUEST_2;
         v = (int)kl_env_int("KL_OVRP_HEADSET", dflt);
     }

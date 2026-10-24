@@ -2169,8 +2169,15 @@ static const char *klj_field_sval(const klj_field *f) {
     // stream, 2304x2304 an eye once unwarped, and was upscaled from there to a
     // display that is far finer — washed out on the Vision Pro (owner,
     // 2026-10-16). eureka is the finest panel in its hmd_config.json table.
+    // Roboquest VR's Meta Store build (x9269393463181825, UE 5.6) at its
+    // owner's request: as a Quest 2 it chose that headset's settings (its saved
+    // settings name the Quest 2's 1920x1832 panel) and the scene looked short
+    // of shadows (2026-10-23). The same Quest 3 everywhere it can ask: here,
+    // the OpenXR system name (kl_openxr.c) and ovrp_GetSystemHeadsetType
+    // (kl_ovrp.c).
     const char *t = kl_driver_target_name();
-    if (t && (strcmp(t, "batman") == 0 || strcmp(t, "steamlink-vr") == 0)) {
+    if (t && (strcmp(t, "batman") == 0 || strcmp(t, "steamlink-vr") == 0 ||
+              strcmp(t, "x9269393463181825") == 0)) {
         if (!strcmp(f->name, "MODEL"))    return "Quest 3";
         if (!strcmp(f->name, "DEVICE"))   return "eureka";
         if (!strcmp(f->name, "PRODUCT"))  return "eureka";

@@ -1780,7 +1780,9 @@ puts the camera on the ground with its hands underneath it.
   "Function requires stage_in attributes but no descriptor was set") is created
   again with those locations reading zeroes from a buffer of the layer's own.
   Pipelines that compile are untouched. Default 1 for `x24882487241367228`
-  (Alien: Rogue Incursion) and `x5245041552210029` (Arizona Sunshine 2), else 0.
+  (Alien: Rogue Incursion), `x5245041552210029` (Arizona Sunshine 2) and
+  `x9269393463181825` (Roboquest VR, Meta Store build: its start-up shader
+  precompile stopped at the first refusal), else 0.
 - `KL_VK_VIN_INT=0|1` — (only with `KL_VK_VIN_FILL` on) the same retry also
   takes a location the state supplies as 32-bit floats but the shader reads as
   int/uint ("Cannot convert attribute from MTLAttributeFormatFloat2 to int4 or
@@ -1812,8 +1814,10 @@ puts the camera on the ground with its hands underneath it.
   after the seam reads undefined tile memory, which shows as a picture drawn in
   32x32 tiles, each all there or all missing. Costs the memory of the
   multisampled scene targets. Default 1 for `x5767635983306831` (Skydance's
-  BEHEMOTH) and `x6605328856182465` (Into The Radius 2, whose main menu showed
-  blocks of garbage, different per eye and per frame, without it), else 0.
+  BEHEMOTH), `x6605328856182465` (Into The Radius 2, whose main menu showed
+  blocks of garbage, different per eye and per frame, without it) and
+  `x9269393463181825` (Roboquest VR, Meta Store build: a black scene with
+  glimpses of models under its UI), else 0.
 - `KL_VK_PASS_BARRIERS=0|1|2` — what happens to a `vkCmdPipelineBarrier`
   recorded INSIDE a dynamic-rendering pass that only makes colour attachments
   readable as input attachments. MoltenVK answers one by ending the Metal pass
@@ -2012,6 +2016,15 @@ puts the camera on the ground with its hands underneath it.
   does; the Steam build switches that list off. `0` takes the line out again.
   A Test switch in the start window, on from the start for Moss (targets.py
   `test_on`); without it the default is off (`kl_ue4.c`).
+- `KL_UE4_NO_OCCLUSION=0|1` — Roboquest VR, Meta Store build
+  (`x9269393463181825`) only, default `1`: writes `r.AllowOcclusionQueries=0`,
+  `r.HZBOcclusion=0` and `r.Mobile.HZBOcclusion=0` under `[ConsoleVariables]`
+  in the game's user config
+  (`<files>/UnrealGame/RoboquestVR/RoboquestVR/Saved/Config/Android/Engine.ini`)
+  before the engine starts. With foveated rendering on, at any level, objects
+  blinked in and out: the engine judges what is hidden from foveated depth
+  (occlusion queries over coarse pixels, and a stored depth resolve that
+  `kl_fove` leaves in the physical layout). `0` takes the lines out again.
 - `KL_JKXR_WAIT=<seconds>` — the same budget for the JKXR door, default 5. Same
   reason there is no frame count: the engine owns its own render thread. A menu
   reached and rendering wants about 45. It bounds the app's window-and-report
@@ -2865,14 +2878,17 @@ The device stays open until the last source has closed.
   own; one stream pausing or flushing leaves the others playing. **Default on
   for Steam Link** (steamlink-vr), which keeps two AAudio outputs open during a
   stream — the 2D shell's SDL3 one (float, 960 frames) and the VR client's own
-  (int16, 256) — and both carry sound (community fix #49). While two sources
+  (int16, 256) — and both carry sound (community fix #49). **Also on for
+  Roboquest VR** (`x9269393463181825`): FMOD's OpenSL player and Unreal's own
+  mixer both carry the game's sound. While two sources
   mix, the periodic `guest PCM so far` line and the 15 s census are followed by
   one line per source: its share of real time since it came and how often it
   fell behind the reader and was resynced. `make audio-mix` checks it against
   the real output device.
 - `KL_AUDIO_MIX_UNLOCK=0|1` — while sources mix, let a writer that waits for
   room nap *outside* the mix lock, so the other stream is not held up behind
-  it. Default on for Steam Link and Pistol Whip (x2104963472963790): Steam
+  it. Default on for Steam Link, Pistol Whip (x2104963472963790) and
+  Roboquest VR (x9269393463181825): Steam
   Link's pair managed ~200 writes a second where real time is ~237 with the
   nap under the lock — dropouts every few seconds.
 - `KL_AUDIO_SOURCE=opensl|aaudio` — force the owner: only that backend reaches

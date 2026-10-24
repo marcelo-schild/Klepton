@@ -2159,6 +2159,7 @@ X(klb_pthread_rwlock_init) X(klb_pthread_rwlock_destroy) X(klb_pthread_rwlock_rd
 X(klb_pthread_rwlock_wrlock) X(klb_pthread_rwlock_unlock)
 X(klb_pthread_attr_init) X(klb_pthread_attr_destroy) X(klb_pthread_attr_setstacksize) X(klb_pthread_attr_getstacksize)
 X(klb_pthread_attr_setdetachstate) X(klb_pthread_attr_getstack) X(klb_pthread_getattr_np)
+X(klb_pthread_attr_setstack)
 X(klb_pthread_attr_setschedpolicy) X(klb_pthread_attr_setschedparam)
 X(klb_pthread_attr_getdetachstate) X(klb_pthread_attr_getinheritsched) X(klb_pthread_attr_getschedpolicy)
 X(klb_pthread_attr_getschedparam) X(klb_pthread_attr_getguardsize) X(klb_pthread_setschedprio)
@@ -2666,6 +2667,7 @@ static const kl_entry g_shim[] = {
     E("pthread_attr_setdetachstate", klb_pthread_attr_setdetachstate),
     E("pthread_attr_setinheritsched", klb_pthread_attr_setinheritsched),
     E("pthread_attr_getstack", klb_pthread_attr_getstack),
+    E("pthread_attr_setstack", klb_pthread_attr_setstack),
     E("pthread_getattr_np", klb_pthread_getattr_np),
     E("pthread_key_create", klb_pthread_key_create),
     E("pthread_key_delete", klb_pthread_key_delete),
@@ -2722,6 +2724,11 @@ static const kl_entry g_shim[] = {
     E("wcscasecmp", wcscasecmp), E("wctomb", wctomb),
     E("sched_getparam", klb_sched_getparam), E("sched_getcpu", klb_sched_getcpu),
     E("putenv", klb_putenv),
+    // asctime_r: the Epic Online Services SDK that Roboquest VR ships imports it
+    // (x3151760, 2026-10-22; the same library in x9269393463181825). struct tm
+    // is laid out the same on both sides — localtime_r and ctime_r are direct
+    // forwards here — so this is one too.
+    E("asctime_r", asctime_r),
     // zlib's one-shot compress(): Robo Recall: Unplugged (x1906871599408213,
     // UE 4.21) imports it beside compress2 and compressBound, which the
     // generated table already forwards — it was in no tree that table was

@@ -206,6 +206,20 @@ static void kl_driver_env_defaults(const kl_target *t) {
             setenv("KL_VK_FOZ_APP", "Source2", 0);
         }
     }
+    else if (!strcmp(t->name, "x9269393463181825")) {
+        // Roboquest VR, Meta Store build (UE 5.6 mobile renderer, OpenXR on
+        // Vulkan). Its RHI thread calls xrEndFrame, and xrEndFrame waited there
+        // for the GPU to finish the frame (kl_vulkan_frame_done) before the RHI
+        // thread could start on the next one. With its multisampled scene in
+        // real memory (KL_VK_NO_TRANSIENT) that came to 40 of 90 frames a
+        // second with the GPU about a third busy and no CPU thread above 18%
+        // (on device, 2026-10-23): frames missed while nothing was at its
+        // limit. Its other build (x3151760) measured the same in the hub.
+        // Published by a worker once the GPU is done instead, as for Alyx above
+        // (kl_openxr.c, klxr_defer_*): the next frame is built while this one
+        // is drawn. KL_VK_FRAME_ASYNC=0 is the old way.
+        setenv("KL_VK_FRAME_ASYNC", "1", 0);
+    }
     else if (!strcmp(t->name, "x9531494193591052")) {
         // Ghost Town, from community PR #41 (sibest). Its Options buttons and
         // the right-hand hold to recenter (KleptonControllers.swift), the

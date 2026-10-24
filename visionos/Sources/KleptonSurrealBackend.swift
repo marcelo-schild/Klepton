@@ -313,6 +313,11 @@ final class KleptonSurrealBackend: NSObject, CBCentralManagerDelegate, CBPeriphe
                 }
                 peripheral.setNotifyValue(true, for: ch)
             }
+            // Replies to control messages (see requestControllerMode). Optional: input works without it.
+            if let replies = chars.first(where: { $0.uuid == CBUUID(string: SurrealWire.controlResponse) }),
+               replies.properties.contains(.notify) {
+                peripheral.setNotifyValue(true, for: replies)
+            }
             haptics[peripheral.identifier] = chars.first { $0.uuid == CBUUID(string: SurrealWire.haptic) }
         } else if let battery = chars.first(where: { $0.uuid == CBUUID(string: "2A19") }) {
             if battery.properties.contains(.read) { peripheral.readValue(for: battery) }
@@ -329,6 +334,32 @@ final class KleptonSurrealBackend: NSObject, CBCentralManagerDelegate, CBPeriphe
         if notified[id]?.count == 2, let hand = sides[id], slots[hand] == id, enabled {
             edit { $0.hands[hand.rawValue].connected = true; $0.hands[hand.rawValue].status = "Connected; start game to calibrate" }
             UserDefaults.standard.set(id.uuidString, forKey: "klepton.surreal.\(hand.rawValue).device")
+            requestControllerMode(peripheral)
+        }
+    }
+    /// Subscribing is not enough: until a control message arrives, the controller keeps
+    /// driving the visionOS pointer over HID and sends nothing on pose/input. On hardware
+    /// (2026-10-23) the first pose packet followed the first control message by 2 ms. Ask
+    /// the mode, then set controller mode; the replies arrive on 1006 and are traced.
+    private func requestControllerMode(_ peripheral: CBPeripheral) {
+        let id = peripheral.identifier
+        let steps: [(Double, UInt8, [UInt8], String)] = [
+            (0.0, SurrealWire.modeRequest, [], "mode request"),
+            (0.5, SurrealWire.modeSet, [SurrealWire.controllerMode], "set controller mode"),
+        ]
+        for (delay, type, data, label) in steps {
+            queue.asyncAfter(deadline: .now() + delay) { [self] in
+                guard enabled, let p = peripherals[id], p.state == .connected, let ch = haptics[id] else {
+                    trace("control: \(label) skipped, \(peripheral.name ?? "unknown") not ready")
+                    return
+                }
+                let response = ch.properties.contains(.write)
+                let packet = SurrealWire.tlv(type: type, sequence: sequence, data: data)
+                sequence &+= 1
+                trace("control: \(label) -> \(p.name ?? "unknown")")
+                if response { writing.insert(id) }
+                p.writeValue(packet, for: ch, type: response ? .withResponse : .withoutResponse)
+            }
         }
     }
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
@@ -349,11 +380,19 @@ final class KleptonSurrealBackend: NSObject, CBCentralManagerDelegate, CBPeriphe
             edit { $0.hands[hand.rawValue].input = input; $0.hands[hand.rawValue].hasInput = true }
         case "2A19":
             if let value = data.first, value <= 100 { edit { $0.hands[hand.rawValue].battery = Int(value) } }
+        case SurrealWire.controlResponse:
+            guard let reply = SurrealWire.parseTLV(data) else {
+                trace("control: unparsed reply hand=\(hand.rawValue) bytes=\(data.count)"); return
+            }
+            let mode = reply.type == SurrealWire.modeSetResponse
+                ? (reply.data.first == SurrealWire.controllerMode ? " (controller mode)" : " (cursor mode)") : ""
+            trace("control: reply hand=\(hand.rawValue) type=0x\(String(format: "%02x", reply.type)) seq=\(reply.sequence)\(mode)")
         default: break
         }
     }
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
         writing.remove(peripheral.identifier)
+        if let error { trace("control: write to \(peripheral.name ?? "unknown") \(characteristic.uuid) failed: \(error.localizedDescription)") }
     }
     #if targetEnvironment(simulator)
     /// Synthetic wire notifications only. No controller or Bluetooth validation is claimed.

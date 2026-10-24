@@ -1631,7 +1631,9 @@ static int klplat_iap_confirmed(void) {
     static int on = -1;
     if (on < 0) {
         const char *t = kl_driver_target_name();
-        on = kl_env_on("KL_PLAT_IAP_CONFIRMED", t && strcmp(t, "x6963344583787383") == 0);
+        on = kl_env_on("KL_PLAT_IAP_CONFIRMED", t && (strcmp(t, "x6963344583787383") == 0 ||
+                                                    // BODYCOMBAT: its add-ons follow the purchase list
+                                                    strcmp(t, "x4015163475201433") == 0));
     }
     return on;
 }
@@ -2447,7 +2449,10 @@ static int klplat_user_listed(const char *t) {
                                 // failed." while the picture stays black
                                 // (owner's device log). Supply offline identity
                                 // through the existing path; no purchase proof.
-                                "x2264524423619421" };
+                                "x2264524423619421",
+                                // LES MILLS BODYCOMBAT: without a user its PlatformInitializer
+                                // fails twice and the game drops to offline mode.
+                                "x4015163475201433" };
     // Beat Saber from 1.45 on (Unity 6; kl_guest_beatsaber_openxr): its start
     // asks for the user FIRST and goes no further without one — no entitlement
     // request, no scene, one draw a frame of black and silence (on device,

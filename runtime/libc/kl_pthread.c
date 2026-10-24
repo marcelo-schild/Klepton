@@ -1187,6 +1187,7 @@ int klb_pthread_rwlock_trywrlock(void *l) { return px(pthread_rwlock_trywrlock(r
 typedef struct { uint32_t flags; void *stack_base; size_t stack_size, guard_size;
                  int32_t policy, prio; char pad[16]; } bionic_attr;
 #define BIONIC_ATTR_DETACHED 1
+#define BIONIC_ATTR_USER_STACK 2   // bionic's PTHREAD_ATTR_FLAG_USER_ALLOCATED_STACK
 
 int klb_pthread_attr_init(bionic_attr *a) {
     memset(a, 0, sizeof *a);
@@ -1220,6 +1221,23 @@ int klb_pthread_attr_setdetachstate(bionic_attr *a, int st) {
 }
 int klb_pthread_attr_getstack(const bionic_attr *a, void **base, size_t *size) {
     *base = a->stack_base; *size = a->stack_size; return 0;
+}
+// pthread_attr_setstack: a stack the guest allocated itself. The Epic Online
+// Services SDK (libEOSSDK, shipped by Roboquest VR — x3151760, and the same
+// library in the Meta Store build x9269393463181825) starts its threads this
+// way, and with no answer the game stopped right after EOS came up: "called
+// unresolved import 'pthread_attr_setstack'" (2026-10-22). bionic's checks and
+// fields are kept, so a guest that reads the attribute back gets what it set —
+// but the thread is created on a HOST stack of that size, not on the guest's
+// buffer: Darwin takes a caller's stack only in 16 KB pages, and a guest sizes
+// and aligns it in Android's 4 KB ones. The buffer goes unused and stays the
+// guest's to free.
+int klb_pthread_attr_setstack(bionic_attr *a, void *base, size_t size) {
+    if ((size & 4095) || size < 16384 || ((uintptr_t)base & 4095)) return 22;   // EINVAL
+    a->stack_base = base;
+    a->stack_size = size;
+    a->flags |= BIONIC_ATTR_USER_STACK;
+    return 0;
 }
 // The getters of the setters above, and pthread_setschedprio. HITMAN 3 VR:
 // Reloaded (IOI's Glacier engine) reads every attribute back before it starts a
@@ -1589,6 +1607,12 @@ int klb_pthread_create(pthread_t *out, const bionic_attr *ga,
     pthread_attr_init(&da);
     if (ga) {
         if (ga->stack_size) pthread_attr_setstacksize(&da, ga->stack_size);
+        // A guest-allocated stack (above) was sized in 4 KB pages; Darwin
+        // refuses a size that is not whole 16 KB ones and would quietly fall
+        // back to its 512 KB default. Round up, so the thread has at least the
+        // stack it was given.
+        if ((ga->flags & BIONIC_ATTR_USER_STACK) && ga->stack_size)
+            pthread_attr_setstacksize(&da, (ga->stack_size + 16383) & ~(size_t)16383);
         if (ga->flags & BIONIC_ATTR_DETACHED)
             pthread_attr_setdetachstate(&da, PTHREAD_CREATE_DETACHED);
     }

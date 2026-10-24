@@ -4501,14 +4501,19 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
     // different per eye and per frame, read as flicker even holding still
     // (2026-10-20, eye captures). With the bit dropped (its 3840x2464 two-layer
     // colour and depth) the menu was clean on the headset, 4.7 GB still free.
-    //   default 1 for those two titles, else 0
+    // Roboquest VR, Meta Store build (x9269393463181825, UE 5.6 mobile, 4x
+    // MSAA, a subpass-input reader): the scene black but for glimpses of
+    // models, the UI drawn over it (on device, 2026-10-23; the same picture as
+    // its other build, x3151760, on 2026-10-22).
+    //   default 1 for those three titles, else 0
     static int no_transient = -1;
     if (no_transient < 0) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
         no_transient = kl_env_on("KL_VK_NO_TRANSIENT",
                                  t && (!strcmp(t, "x5767635983306831") ||
-                                       !strcmp(t, "x6605328856182465")));
+                                       !strcmp(t, "x6605328856182465") ||
+                                       !strcmp(t, "x9269393463181825")));
     }
     if (ci && (ci->usage & 0x40u) && no_transient) {
         mod = *ci;
@@ -5002,9 +5007,16 @@ static int klvk_vin_on(void) {
         const char *t = kl_driver_target_name();
         // HITMAN 3 VR: Reloaded's title screen has one (in_pos at location 2 of a
         // two-attribute layout set with vkCmdSetVertexInputEXT, Mac 2026-10-20).
+        // Roboquest VR, Meta Store build (UE 5.6, x9269393463181825): 70 of the
+        // first ~3,700 pipelines of its start-up precompile, all "Vertex
+        // attribute N is not defined in the vertex descriptor". Unreal asks to
+        // quit over the first one from inside the lock its compile workers
+        // share, and the "compiling shaders" screen then waits forever (on
+        // device, 2026-10-23).
         on = kl_env_on("KL_VK_VIN_FILL", t && (!strcmp(t, "x24882487241367228") ||
                                               !strcmp(t, "x5245041552210029") ||
-                                              !strcmp(t, "x8012387035448196")));
+                                              !strcmp(t, "x8012387035448196") ||
+                                              !strcmp(t, "x9269393463181825")));
     }
     return on;
 }

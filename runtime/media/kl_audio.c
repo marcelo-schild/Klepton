@@ -823,7 +823,12 @@ static void sink_env(void) {
     g_prefer   = kl_env_str("KL_AUDIO_PREFER",
                             target_is(t, "x2104963472963790") ? "aaudio" : NULL);
     if (g_prefer && !*g_prefer) g_prefer = NULL;
-    g_mix_all  = kl_env_on("KL_AUDIO_MIX_SOURCES", target_is(t, "steamlink-vr"));
+    // Roboquest VR, Meta Store build (x9269393463181825, UE 5.6): FMOD's OpenSL
+    // player (48 kHz) and Unreal's own mixer (44.1 kHz) both carry the game's
+    // sound; with one owner, whichever was dropped went missing (on device,
+    // 2026-10-23: "some audio effects might be missing").
+    g_mix_all  = kl_env_on("KL_AUDIO_MIX_SOURCES", target_is(t, "steamlink-vr") ||
+                                                    target_is(t, "x9269393463181825"));
     // Whether a MIXING writer lets go of g_wlock while it waits for room.
     // Holding it across the 2 ms naps serialises the sources: each one's wait
     // for ITS cursor blocks every other source's write for a whole buffer
@@ -833,7 +838,8 @@ static void sink_env(void) {
     // they were still mixed (fix 10). Every ring write still happens under the
     // lock; only the nap is outside it. Only read while mixing.
     g_mix_unlock = kl_env_on("KL_AUDIO_MIX_UNLOCK", target_is(t, "steamlink-vr") ||
-                                                    target_is(t, "x2104963472963790"));
+                                                    target_is(t, "x2104963472963790") ||
+                                                    target_is(t, "x9269393463181825"));
     // See pacing_reader. LES MILLS BODYCOMBAT.
     g_smooth   = kl_env_on("KL_AUDIO_SMOOTH", target_is(t, "x4015163475201433"));
     g_steal_ms = kl_env_int("KL_AUDIO_STEAL_MS", 2000);

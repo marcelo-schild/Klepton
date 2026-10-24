@@ -260,8 +260,11 @@ static void ue4_report_command_line(FILE *out) {
 // user runs on device, where an env var cannot be set. olar (UE5) quits during
 // PreInit with nothing in our capture; forcing its engine log out is the only
 // diagnostic. Remove from this list once its fatal is understood and fixed.
+// x5190288877703616 is twd2 as a store install (The Walking Dead: Saints &
+// Sinners - Chapter 2: Retribution, 32342700): it is listed so that the
+// override file below is written for it too and carries twd2's loading fix.
 static int ue4_stdout_default(void) {
-    static const char *on[] = { "olar", "wrath2", "twd2" };
+    static const char *on[] = { "olar", "wrath2", "twd2", "x5190288877703616" };
     const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;
@@ -415,8 +418,11 @@ static void ue4_maybe_stdout_cmdline(const char *proj) {
         // finalisation deadlock wrath2 hit, so the render thread never draws (0
         // glDraw* all run) and the eyes composite black. Same lever: run all
         // loading on the game thread. No Vulkan gate here — twd2 is GLES.
-        // KL_TWD2_ALT=1 restores the async thread to A/B.
-        else if (t && strcmp(t, "twd2") == 0 && !kl_env_on("KL_TWD2_ALT", 0))
+        // KL_TWD2_ALT=1 restores the async thread to A/B. The store install
+        // (x5190288877703616) is the same build and stayed black the same way
+        // on device: fence set, 0 layers, 0 draws, only shader compiles.
+        else if (t && (strcmp(t, "twd2") == 0 || strcmp(t, "x5190288877703616") == 0) &&
+                 !kl_env_on("KL_TWD2_ALT", 0))
             snprintf(extra_buf, sizeof extra_buf,
                      " -noasyncloadingthread"
                      " -ini:Engine:[ConsoleVariables]:s.AsyncLoadingThreadEnabled=0");

@@ -258,6 +258,9 @@ static void *(*g_guest_native)(const char *symbol);
 void kl_jni_set_guest_native_resolver(void *(*resolve)(const char *symbol)) {
     g_guest_native = resolve;
 }
+void *kl_jni_guest_native(const char *symbol) {
+    return g_guest_native && symbol ? g_guest_native(symbol) : NULL;
+}
 
 // `AndroidThunkJava_InitHMDs` — the activity posts a Runnable to the UI thread
 // whose entire body is `nativeInitHMDs()`, which is the engine giving every HMD

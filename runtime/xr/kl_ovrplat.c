@@ -2369,6 +2369,8 @@ static int klplat_user_listed(const char *t) {
     // right after its first controller poll, before a frame is drawn.
     // Saints & Sinners as a store install (x2897337400373711) is twd2's
     // predecessor and gets the same offline user as twd2 (fix 15, 2026-10-11).
+    // Chapter 2: Retribution as a store install (x5190288877703616) IS twd2 and
+    // was left out: ovr_GetLoggedInUserID answered 0 and it stayed black.
     // BRINK Traveler (x3635172946605196) is the same chain in Unity: after the
     // entitlement request, GetLoggedInUser fails with "Request failed." and the
     // game renders black frames with no draws, never loading its first scene
@@ -2380,7 +2382,8 @@ static int klplat_user_listed(const char *t) {
     static const char *on[] = { "zix", "intotheradius", "x5817243991680545",
                                 "redmatter2", "vampire", "twd2",
                                 "walkabout", "moss", "x4395292760584049", "x5812519008825194", "x6963344583787383",
-                                "x2897337400373711", "x3635172946605196", "x3484270071659289",
+                                "x2897337400373711", "x5190288877703616",
+                                "x3635172946605196", "x3484270071659289",
                                 // Sniper Elite VR: with no user its Init scene
                                 // activates, the loading screen fades out, and it
                                 // stops submitting frames for good.

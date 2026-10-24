@@ -145,6 +145,9 @@ void kl_jni_set_vrlink_running(int on);
 // installed every one of those thunks reports that it could not call back,
 // which is a stated refusal rather than a silent no-op.
 void kl_jni_set_guest_native_resolver(void *(*resolve)(const char *symbol));
+// The guest's exported native by symbol name, through that resolver; NULL when
+// none is installed or the guest has no such export.
+void *kl_jni_guest_native(const char *symbol);
 
 // Root for Context.getAssets()/AssetManager.open(). Defaults to "beatsaber/assets".
 // With no AAssetManager_* import, this JNI path is how assets reach Unity.

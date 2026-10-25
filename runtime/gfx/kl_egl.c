@@ -406,6 +406,11 @@ extern const char *kl_driver_target_name(void);
 // Sweet Surrender (x4723352327707414, Unity 6000.1 + OpenXR, SinglePassMultiview
 // with 4x anti-aliasing) is the same again: ~2000 incomplete-framebuffer errors in
 // 25 s, a black picture with its music playing (2026-10-23).
+// iB Cricket (x5437449896288644, Unity 6000.0 + the Oculus XR plugin, 4x
+// anti-aliasing) too: its eye framebuffers are a colour texture beside a
+// 4-sample depth renderbuffer, every glClear on them raised 0x506 (status
+// 0x8cd6), nothing was ever drawn into the eye textures and the player saw
+// only the untouched eye storage — a plain pink screen.
 static int klgl_want_msrtt(void) {
     static int v = -1;
     if (v < 0) {
@@ -414,7 +419,8 @@ static int klgl_want_msrtt(void) {
         v = kl_env_on("KL_GL_MSRTT", kl_guest_beatsaber_openxr() ||
                                      (t && (strcmp(t, "x9449316705178989") == 0 ||
                                             strcmp(t, "x6946182742093178") == 0 ||
-                                            strcmp(t, "x4723352327707414") == 0)));
+                                            strcmp(t, "x4723352327707414") == 0 ||
+                                            strcmp(t, "x5437449896288644") == 0)));
     }
     return v;
 }
@@ -844,7 +850,10 @@ int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
     // here was verified against the zeros. Synth Riders 3.6.6a1
     // (x2436558143118760, Unity 6000; fix 39, sent in by a user) likewise: it
     // played with magenta assets until it got these, confirmed on the sender's
-    // Vision Pro.
+    // Vision Pro. iB Cricket (x5437449896288644, Unity 6000.0) asks for the
+    // same limits at startup; it got them alongside KL_GL_MSRTT (which is what
+    // ended its pink screen) and runs with both, but whether it needs these on
+    // their own was not tested.
     {
         const char *t = kl_driver_target_name();
         // KL_GL_ES31_LIMITS=1: the same answer for any target, as an experiment
@@ -860,7 +869,8 @@ int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
         if (es31_any || kl_glfb_compute_tf() || kl_glfb_ssbo_tex() || (t && (strcmp(t, "x2544573735586536") == 0
                                                        || strcmp(t, "x2436558143118760") == 0
                                                        || strcmp(t, "x3922378427824210") == 0
-                                                       || strcmp(t, "x3984056454948095") == 0))) {
+                                                       || strcmp(t, "x3984056454948095") == 0
+                                                       || strcmp(t, "x5437449896288644") == 0))) {
             static const struct { uint32_t pname; int32_t value; } es31[] = {
                 {0x8F38 /* MAX_IMAGE_UNITS                     */, 4},
                 {0x90D6 /* MAX_VERTEX_SHADER_STORAGE_BLOCKS    */, 4},

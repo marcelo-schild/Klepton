@@ -1078,6 +1078,15 @@ GENERIC_OBB = {
     # at <files>/Android/obb/<package>, which is the directory Android's
     # getObbDir() names.
     "x9531494193591052": "Android/obb/com.FireproofStudios.GhostTown",
+    # iB Cricket (com.ProYuga.iBC, x5437449896288644) is Unity with a main OBB
+    # AND ~30 store AssetBundles (stadium_*, jerseys_*, ...) that are staged
+    # into <files>/Android/obb/<package>. At boot the game does not ask Java
+    # for its OBB: it stat()s the hardcoded
+    # /sdcard/Android/obb/<package>/main.<code>.<package>.obb, finds nothing
+    # there with the Unity default <files>/obb and throws OBB_FILE_MISSING.
+    # Android's layout puts @obb and the bundles in that one directory, as for
+    # Cave Crave.
+    "x5437449896288644": "Android/obb/com.ProYuga.iBC",
 }
 
 

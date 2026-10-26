@@ -336,7 +336,12 @@ static int klm_extractor_enabled(void) {
         // guest itself — klm_linearize below), not the AHardwareBuffer import
         // the refusal above is about, so the clip plays as it does under GLES.
         int iss = target && !strcmp(target, "x2094303753986147");
-        int default_on = g_video_default > 0 ? 1 : shave ? 0 : iss ? 1 : !vk;
+        // Gundam: Silver Phantom waits for its in-world monitor's clip.
+        // Refusing the extractor leaves AndroidVideoMedia retrying -10002
+        // indefinitely. Let this title reach the decoder so its video path
+        // can run; keep the Vulkan refusal for all other unmeasured guests.
+        int gundam = target && !strcmp(target, "x6811683248909506");
+        int default_on = g_video_default > 0 ? 1 : shave ? 0 : (iss || gundam) ? 1 : !vk;
         on = kl_env_on("KL_MEDIA_EXTRACTOR", default_on);
         if (on && vk)
             fprintf(stderr, "  [media] video is enabled for this Vulkan "

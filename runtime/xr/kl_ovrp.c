@@ -5429,6 +5429,9 @@ static void klovrp_grab_trace(int hand, const klovrp_pose *v) {
 //   a Quest — while a Sense controller is tracked it is the input; without one
 //   the hands take over.
 //
+//   Space Atlas VR (x8016534201745429): loads Left/RightOVRHand and the
+//   avatar hand-tracking contexts; offer the existing skeleton implementation.
+//
 // Hands are the input — ConnectedControllers/ActiveController say Hands (0x60)
 // and the hand nodes are the wrist — unless a Sense controller is in a hand.
 // While one is, the frontend says so (state 2) and everything is the Touch pair
@@ -5440,7 +5443,8 @@ static int klovrp_hands_title(void) {
         const char *t = kl_driver_target_name();
         if (!t) return 0;               // asked before the guest is chosen: not kept
         on = kl_env_on("KL_OVRP_HANDS", !strcmp(t, "x3793077684043441") ||
-                                        !strcmp(t, "x2718606324833775"));
+                                        !strcmp(t, "x2718606324833775") ||
+                                        !strcmp(t, "x8016534201745429"));
         if (on) fprintf(stderr, "  [hands] hand tracking for %s on (KL_OVRP_HANDS=0 turns it off)\n", t);
     }
     return on;
@@ -5457,6 +5461,30 @@ static int g_hj_owner[2];                   // the hand node is the wrist (atomi
 static unsigned g_hj_held[2], g_hj_failed[2], g_hj_jumps[2];   // publisher's counts, for the log
 static kl_hand_xf g_hj_ptr[2] = { { { 0, 0, 0 }, { 0, 0, 0, 1 } }, { { 0, 0, 0 }, { 0, 0, 0, 1 } } };
 static unsigned g_hj_reads[2], g_hj_reads_lost[2];  // guest's reads (any thread; approximate)
+
+
+int kl_ovrp_hand_guide(int hand, float *joints, float *pinch, float *palm_up) {
+    if (hand < 0 || hand > 1 || !joints || !pinch || !palm_up) return 0;
+    const char *target = kl_driver_target_name();
+    if (!target || strcmp(target, "x8016534201745429")) return 0;
+    pthread_mutex_lock(&g_hj_lock);
+    int tracked = g_hj_ovr[hand].tracked;
+    kl_hand_xf root = g_hj_ovr[hand].root;
+    for (int i = 0; i < KLH_JOINTS; i++)
+        memcpy(joints + i * 3, g_hj_raw[hand][i].p, 3 * sizeof(float));
+    *pinch = g_hj_ovr[hand].pinch[1];
+    pthread_mutex_unlock(&g_hj_lock);
+    if (!tracked) return 0;
+    // The left OVR wrist's +Y points out of the palm (kl_hands.h).
+    // This is visual feedback for the posture, not a synthetic menu press.
+    klovrp_pose pose = { .qx = root.q[0], .qy = root.q[1], .qz = root.q[2], .qw = root.q[3] };
+    float nx, ny, nz;
+    klovrp_qrot(&pose, 0, 1, 0, &nx, &ny, &nz);
+    *palm_up = ny;
+    float origin_y = klovrp_origin_y();
+    for (int i = 0; i < KLH_JOINTS; i++) joints[i * 3 + 1] += origin_y;
+    return 1;
+}
 
 // KL_OVRP_HANDS_BESIDE=1: the controllers stay the input and the hands are only
 // offered beside them — connected while ARKit sees them, their state and

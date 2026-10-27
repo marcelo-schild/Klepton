@@ -220,6 +220,8 @@ const klj_binding klj_bind_lang[] = {
     {"java/lang/Throwable", "getMessage", "()Ljava/lang/String;", klj_Throwable_getMessage},
 
     {"java/lang/Class", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
+    // Space Atlas VR avatar SDK: the worker thread uses the same app loader.
+    {"java/lang/Thread", "getContextClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
     {"java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", klj_Class_forName},
     {"java/lang/ClassLoader", "findClass", "(Ljava/lang/String;)Ljava/lang/Class;", klj_ClassLoader_findClass},
     // loadClass is findClass's public face; the delegation between them is the

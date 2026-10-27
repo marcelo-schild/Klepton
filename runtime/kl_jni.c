@@ -2432,6 +2432,12 @@ static klj_val klj_GameActivity_sdkInt(void) {
 
 
 static const klj_field g_fields[] = {
+    // Space Atlas VR: the avatar SDK reads this platform constant before
+    // checking permission. This supplies the name, not a permission grant.
+    KLJ_FSTR("android/Manifest$permission", "READ_EXTERNAL_STORAGE",
+             "android.permission.READ_EXTERNAL_STORAGE"),
+    KLJ_FSTR("android/Manifest$permission", "WRITE_EXTERNAL_STORAGE",
+             "android.permission.WRITE_EXTERNAL_STORAGE"),
     // UE4.27's two GameActivity inner classes, whose objects kl_jni_ue4.c hands
     // back from AndroidThunkJava_GetInputDeviceInfo and
     // ...LocalNotificationGetLaunchNotification. The engine reads these fields

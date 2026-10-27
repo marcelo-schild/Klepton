@@ -76,6 +76,25 @@ static void P(FILE *out, const char *fmt, ...) {
 // already default-on for hl2 via their own target check, so they are not repeated.
 static void kl_driver_env_defaults(const kl_target *t) {
     if (!t || !t->name) return;
+    if (!strcmp(t->name, "x8016534201745429")) {
+        // Space Atlas VR resizes its GLES eyes during startup; the owner sees
+        // the scene confined to the lower-left corner with guest foveation.
+        // Diagnostic A/B: use ordinary full-eye rendering for this title.
+        setenv("KL_VRR", "0", 0);
+        // The tracked right hand can click, but its cursor is invisible.
+        // ES 3.2 produces sampler units 179..188 (invalid); test the ES 3.0
+        // rendering path before changing the hand pose or gesture mapping.
+        setenv("KL_GLES_VERSION", "3.0", 0);
+        // The startup shaders use read-only StructuredBuffers despite ES 3.0.
+        // On device: 1536 failed compiles (std430/readonly), stale images up
+        // to hundreds of milliseconds. Use the existing lossless read path.
+        setenv("KL_GLFB_SSBO_TEX", "1", 0);
+        // The optional Meta audio plugin is refused on this host. Repeated
+        // managed calls throw each frame (1753 in the round-trip test).
+        // Use the existing no-effect implementation; Wwise still owns playback.
+        setenv("KL_METAXR_AUDIO_STUB", "1", 0);
+        fprintf(stderr, "  [klepton] Space Atlas VR: guest foveation disabled for image-placement test\n");
+    }
     if (!strcmp(t->name, "hl2")) {
         // Validated Half-Life 2 VR configuration (2026-08-31): direct-array multiview
         // + forced eye-RT allocation, single-threaded material queue (threaded wedges

@@ -217,6 +217,10 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
 // Hand tracking for an OVRPlugin guest (kl_ovrp.c, kl_hands.c). Is it on for
 // this guest (KL_OVRP_HANDS, default per title)? 0 until the guest is known.
 int kl_ovrp_hand_tracking_on(void);
+// Space Atlas hand guide: 27 measured joints (81 floats) and pinch.
+// Frontend space; read-only snapshot, no UI hit test or input modification.
+// palm_up: left palm normal dotted with world up (right value is unused).
+int kl_ovrp_hand_guide(int hand, float *joints, float *pinch, float *palm_up);
 
 // One hand's 27 ARKit joints for this frame, in the order of kl_hands.h's
 // KLH_* (HandSkeleton.JointName order), each 7 floats: position x y z, then

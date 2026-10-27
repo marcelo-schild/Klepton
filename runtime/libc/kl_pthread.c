@@ -1541,6 +1541,17 @@ typedef struct { void *(*fn)(void *); void *arg; } tramp;
 static void *thread_tramp(void *p) {
     tramp t = *(tramp *)p; free(p);
     kl_thread_init();
+    // Space Atlas VR: IL2CPP's signal handler calls __errno while a worker
+    // may be inside Darwin malloc. First-touch TLV allocation there re-enters
+    // malloc and aborts on its unfair lock (device crash 2026-10-27).
+    // Materialize the errno TLS before this thread enters any guest code.
+    {
+        extern const char *kl_driver_target_name(void);
+        extern int *klb_errno(void);
+        const char *target = kl_driver_target_name();
+        if (target && !strcmp(target, "x8016534201745429"))
+            (void)klb_errno();
+    }
     // KL_GUEST_QOS=1: every guest thread at USER_INITIATED instead of default.
     // On visionOS a default-QoS thread is scheduled behind the compositor's
     // work, and for Steam Link that thread set includes the UDP receive and

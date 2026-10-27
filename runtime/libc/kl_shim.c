@@ -2510,6 +2510,9 @@ static const kl_entry g_shim[] = {
     E("getrandom", klb_getrandom), E("isnan", klb_isnan),
     E("__isnan", klb_isnan), E("__isnanf", klb_isnanf), E("__isinf", klb_isinf),
     E("__isinff", klb_isinff), E("__isfinite", klb_isfinite), E("__isfinitef", klb_isfinitef),
+    // Android arm64 off_t is already 64-bit. Space Atlas VR's avatar SDK
+    // imports mmap64; keep Linux flag translation and the executable-map guard.
+    E("mmap64", klb_mmap),
     E("mmap", klb_mmap), E("mprotect", klb_mprotect), E("madvise", klb_madvise),
     E("sbrk", klb_sbrk),
     // Linux-only, and the third door onto the memory budget — UE4 asks here

@@ -4142,11 +4142,186 @@ final class KleptonCompositor {
         }
         // The play area's edge (KleptonBoundary.swift), over the game and its panels, under our own cards.
         encodeBoundary(enc, viewIndices: viewIndices, drawable: drawable, originFromHead: originFromHead)
+        for hand: Int32 in [0, 1] {
+            drawn += encodeHandGuide(enc, viewIndices: viewIndices, drawable: drawable, originFromHead: originFromHead, hand: hand)
+        }
         drawn += encodeLoadingCard(enc, viewIndices: viewIndices, drawable: drawable,
                                    originFromHead: originFromHead)
         drawn += encodeStatsCard(enc, viewIndices: viewIndices, drawable: drawable,
                                  originFromHead: originFromHead)
         return drawn
+    }
+
+    // Space Atlas VR: both hands from their own measured joints.
+    // Right index reports pinch; left hand reports palm-up posture. No guessed UI contact.
+    // Both hands' input handling, including the left menu gesture, stays untouched.
+    private var rightHandProbePipeline: MTLRenderPipelineState?
+    private var rightHandProbeTried = false
+    private var leftPalmIsUp = false
+    /// Only Space Atlas draws these hands; every other game skips the per-frame snapshot.
+    private lazy var handGuideTitle = String(cString: kl_app_target_name_or_default()) == "x8016534201745429"
+    private func encodeHandGuide(_ enc: MTLRenderCommandEncoder, viewIndices: [Int],
+                                     drawable: KLDrawable, originFromHead: simd_float4x4, hand: Int32) -> Int {
+        guard handGuideTitle else { return 0 }
+        var joints = [Float](repeating: 0, count: 81)
+        var pinch: Float = 0, palmUp: Float = 0
+        let tracked = joints.withUnsafeMutableBufferPointer {
+            kl_ovrp_hand_guide(hand, $0.baseAddress, &pinch, &palmUp)
+        }
+        guard tracked != 0 else {
+            if hand == 0 { leftPalmIsUp = false }
+            return 0
+        }
+        if hand == 0 {
+            // Enter at 60 degrees from up, release at ~69 degrees: avoid
+            // flickering on small tracking changes while holding the menu pose.
+            leftPalmIsUp = palmUp > (leftPalmIsUp ? 0.35 : 0.50)
+        }
+        if !rightHandProbeTried {
+            rightHandProbeTried = true
+            let source = """
+            #include <metal_stdlib>
+            using namespace metal;
+            struct O { float4 pos [[position]]; float shade; };
+            vertex O rh_v(uint id [[vertex_id]], constant float4 *v [[buffer(0)]],
+                          constant float4x4 *mvp [[buffer(1)]], ushort eye [[amplification_id]]) {
+                O o; o.pos=mvp[eye]*float4(v[id].xyz,1.0);
+                o.shade=v[id].w; return o;
+            }
+            fragment float4 rh_f(O o [[stage_in]], constant float4 &color [[buffer(0)]]) {
+                return float4(color.rgb*o.shade,1.0);
+            }
+            """
+            do {
+                let lib = try device.makeLibrary(source: source, options: nil)
+                let p = MTLRenderPipelineDescriptor()
+                p.vertexFunction = lib.makeFunction(name: "rh_v")
+                p.fragmentFunction = lib.makeFunction(name: "rh_f")
+                p.colorAttachments[0].pixelFormat = layerRenderer?.configuration.colorFormat ?? KLRealityTarget.colorFormat
+                p.depthAttachmentPixelFormat = .depth32Float
+                p.maxVertexAmplificationCount = amplification
+                rightHandProbePipeline = try device.makeRenderPipelineState(descriptor: p)
+                NSLog("[hands] both hands: tracked palms and five digits; right index pinch color, left palm-up color; inputs unchanged")
+            } catch { NSLog("[hands] right-hand diagnostic unavailable: %@", String(describing: error)) }
+        }
+        guard let pipe = rightHandProbePipeline else { return 0 }
+        let points = (0..<27).map { i in
+            SIMD3<Float>(joints[i*3],joints[i*3+1],joints[i*3+2])
+        }
+        func unit(_ v: SIMD3<Float>, fallback: SIMD3<Float>) -> SIMD3<Float> {
+            simd_length(v) > 0.00001 ? simd_normalize(v) : fallback
+        }
+        let wrist = points[0]
+        let across = unit(points[6]-points[21], fallback: SIMD3<Float>(1,0,0))
+        let along = unit(points[11]-wrist, fallback: SIMD3<Float>(0,0,-1))
+        let palmNormal = unit(simd_cross(across,along), fallback: SIMD3<Float>(0,1,0))
+        let palmWidth = min(0.11,max(0.05,simd_distance(points[6],points[21])))
+        let light = unit(SIMD3<Float>(originFromHead.columns.1.x,
+                                      originFromHead.columns.1.y,
+                                      originFromHead.columns.1.z), fallback: palmNormal)
+        func vertex(_ p: SIMD3<Float>, _ normal: SIMD3<Float>) -> SIMD4<Float> {
+            SIMD4<Float>(p,0.55+0.45*max(0,simd_dot(normal,light)))
+        }
+        var white = [SIMD4<Float>]()
+        var index = [SIMD4<Float>]()
+
+        // Rounded, tapered fingers follow their own knuckles, not the camera.
+        // Catmull-Rom interpolation rounds the joints without replacing poses.
+        func finger(_ ids: [Int], radius: Float) -> [SIMD4<Float>] {
+            let control = ids.map { points[$0] }
+            var centers = [SIMD3<Float>]()
+            var sizes = [Float]()
+            for i in 0..<(control.count-1) {
+                let a = control[max(0,i-1)], b = control[i]
+                let c = control[i+1], d = control[min(control.count-1,i+2)]
+                for k in 0..<3 {
+                    let t = Float(k)/3, t2 = t*t, t3 = t2*t
+                    centers.append(0.5*((2*b)+(-a+c)*t+(2*a-5*b+4*c-d)*t2+(-a+3*b-3*c+d)*t3))
+                    let fraction = (Float(i)+t)/Float(control.count-1)
+                    sizes.append(radius*(1-0.38*fraction))
+                }
+            }
+            let tip = control.last!
+            let tipDirection = unit(tip-control[control.count-2], fallback: along)
+            let tipRadius = radius*0.62
+            // The last ring's hemisphere ends exactly at the measured fingertip.
+            centers.append(tip-tipDirection*tipRadius); sizes.append(tipRadius)
+            centers.append(tip-tipDirection*tipRadius*0.30); sizes.append(tipRadius*0.70)
+            centers.append(tip); sizes.append(0)
+            let sides = 12
+            var rings = [[SIMD4<Float>]]()
+            for i in centers.indices {
+                let tangent = unit(centers[min(centers.count-1,i+1)]-centers[max(0,i-1)], fallback: tipDirection)
+                var x = simd_cross(tangent,palmNormal)
+                if simd_length(x)<0.01 { x = simd_cross(tangent,across) }
+                x = unit(x,fallback: across)
+                let y = unit(simd_cross(tangent,x),fallback: palmNormal)
+                rings.append((0..<sides).map { k in
+                    let angle = Float(k)*2*Float.pi/Float(sides)
+                    let normal = x*cos(angle)+y*sin(angle)
+                    return vertex(centers[i]+(x*cos(angle)+y*sin(angle)*0.88)*sizes[i],normal)
+                })
+            }
+            var mesh = [SIMD4<Float>]()
+            for i in 0..<(rings.count-1) {
+                for k in 0..<sides {
+                    let n = (k+1)%sides
+                    mesh += [rings[i][k],rings[i+1][k],rings[i][n],
+                             rings[i][n],rings[i+1][k],rings[i+1][n]]
+                }
+            }
+            return mesh
+        }
+        white += finger([1,2,3,4],radius: palmWidth*0.14)       // thumb, opposable by measured pose
+        index = finger([6,7,8,9],radius: palmWidth*0.12)
+        white += finger([11,12,13,14],radius: palmWidth*0.125)
+        white += finger([16,17,18,19],radius: palmWidth*0.115)
+        white += finger([21,22,23,24],radius: palmWidth*0.095)
+
+        // A closed, bevelled palm connects wrist, thumb base and all knuckles.
+        // Its width comes from this hand; no game mesh or fixed hand pose is used.
+        let outline = [wrist+across*palmWidth*0.27,points[1],points[5],
+                       points[6],points[11],points[16],points[21],points[20],
+                       wrist-across*palmWidth*0.27]
+        let center = outline.reduce(SIMD3<Float>(repeating: 0),+)/Float(outline.count)
+        let thickness = palmWidth*0.15
+        var top = [SIMD4<Float>](), bottom = [SIMD4<Float>]()
+        for p in outline {
+            let radial = unit(p-center,fallback: across)
+            let bevelNormal = unit(palmNormal*0.7+radial*0.3,fallback: palmNormal)
+            top.append(vertex(p+palmNormal*thickness*0.6,bevelNormal))
+            bottom.append(vertex(p-palmNormal*thickness*0.6,-bevelNormal))
+        }
+        for k in outline.indices {
+            let n = (k+1)%outline.count
+            white += [vertex(center+palmNormal*thickness,palmNormal),top[k],top[n],
+                      vertex(center-palmNormal*thickness,-palmNormal),bottom[n],bottom[k],
+                      top[k],bottom[k],top[n],top[n],bottom[k],bottom[n]]
+        }
+        var mvp = viewIndices.map { vi in
+            drawable.computeProjection(viewIndex: vi) *
+                (originFromHead*Self.headFromView(drawable.views[vi].transform,midpoint: eyeMidpointInDevice)).inverse
+        }
+        // The full hand exceeds setVertexBytes' 4 KB limit. A Metal buffer is
+        // retained by the command buffer until this draw has finished.
+        func draw(_ mesh: [SIMD4<Float>], color: SIMD4<Float>) {
+            let buffer = mesh.withUnsafeBytes {
+                device.makeBuffer(bytes: $0.baseAddress!,length: $0.count,options: .storageModeShared)
+            }
+            guard let buffer else { return }
+            var color = color
+            enc.setVertexBuffer(buffer,offset: 0,index: 0)
+            enc.setFragmentBytes(&color,length: MemoryLayout<SIMD4<Float>>.stride,index: 0)
+            enc.drawPrimitives(type: .triangle,vertexStart: 0,vertexCount: mesh.count)
+        }
+        enc.setRenderPipelineState(pipe)
+        if let depthState { enc.setDepthStencilState(depthState) }
+        enc.setCullMode(.none)
+        mvp.withUnsafeMutableBytes { enc.setVertexBytes($0.baseAddress!,length: $0.count,index: 1) }
+        let leftGreen = hand == 0 && leftPalmIsUp
+        draw(white,color: leftGreen ? SIMD4<Float>(0,1,0,1) : SIMD4<Float>(1,1,1,1))
+        draw(index,color: leftGreen || (hand == 1 && pinch >= 0.8) ? SIMD4<Float>(0,1,0,1) : SIMD4<Float>(1,1,1,1))
+        return 2
     }
 
     // The play area (KLRoomGuard): made at the first frame, once the device and

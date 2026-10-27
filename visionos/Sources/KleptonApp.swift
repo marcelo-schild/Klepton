@@ -112,7 +112,11 @@ enum Immersive {
     // offered to a mixed-reality game. KL_FULL in the environment still decides
     // either way.
     static var mixed: Bool {
-        !klEnvOn("KL_FULL", default: KleptonRendering.shared.wantsFullSpace)
+        // Space Atlas VR must hide the real room in every direction from the
+        // first immersive frame. A mixed-space black quad is not that guarantee.
+        // KL_FULL=0 remains an explicit A/B override; other titles keep their default.
+        let spaceAtlas = String(cString: kl_app_target_name_or_default()) == "x8016534201745429"
+        return !klEnvOn("KL_FULL", default: spaceAtlas || KleptonRendering.shared.wantsFullSpace)
     }
     static var mixedBlack: Bool { mixed && klEnvOn("KL_MIXED_BLACK", default: true) }
     /// ...as it stood when the game was started: the compositor reads this from

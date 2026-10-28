@@ -97,6 +97,11 @@ struct SurrealTests {
         let stale = cache.sample(reference: nil, at: 11, now: 11, settings: settings, alignmentTarget: forward)
         expect(stale.buttons == 0 && stale.indexTrigger == 0 && stale.handTrigger == 0 && stale.stick == .zero, "Lost tracking releases every input")
         expect(cache.registration == nil, "Stale tracking requires calibration")
+        // Grip still held, no new input packet: the stream resumes and the grip is still down.
+        cache.receivePose(posePacket(ticks: 2_000_000_000), at: 11.0)
+        let resumed = cache.sample(reference: reference, at: 11.0, now: 11.0, settings: settings, alignmentTarget: forward)
+        expect(resumed.buttons & 0x100 != 0 && resumed.handTrigger > 0.55,
+               "A button held through a pose gap is still held when the stream resumes")
         cache.disconnect()
         let disconnected = cache.sample(reference: reference, at: 12, now: 12, settings: settings, alignmentTarget: forward)
         expect(disconnected.buttons == 0 && disconnected.position == [0, -10, 0], "Disconnect parks unused hand; never injects hand pinch")
@@ -178,7 +183,9 @@ struct SurrealTests {
         let stale = cache.sample(reference: reference, at: 20.4, now: 20.4, settings: settings, alignmentTarget: forward)
         expect(stale.position == [0, -10, 0] && stale.buttons == 0 && stale.handTrigger == 0,
                "A visible hand cannot keep a stale BLE controller active")
-        expect(cache.registration == nil && !cache.hasInput, "BLE timeout clears hybrid calibration and inputs")
+        expect(cache.registration == nil, "BLE timeout clears hybrid calibration")
+        expect(cache.hasInput && cache.input.handTrigger == 1,
+               "BLE timeout keeps the button snapshot; input is only notified on change")
         cache.disconnect()
         expect(cache.sample(reference: reference, at: 20.5, now: 20.5, settings: settings, alignmentTarget: forward).position == [0, -10, 0],
                "A visible hand cannot replace a disconnected controller")

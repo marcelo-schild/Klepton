@@ -219,12 +219,17 @@ struct SurrealHandCache {
         guard let next = SurrealPose(data) else { return }
         receivePose(next, at: now)
     }
-    mutating func receivePose(_ decoded: SurrealPose, at now: Double) {
+    /// True when the packet reset the clock (and so the registration).
+    @discardableResult
+    mutating func receivePose(_ decoded: SurrealPose, at now: Double) -> Bool {
         var next = decoded
         let stamp = clock.stamp(next.ticks, arrival: now)
-        if stamp.reset { resetTracking(); input = KleptonHandState(); hasInput = false }
+        // Keep `input`: buttons are notified only on change, so a grip held through
+        // the reset sends nothing new and would read as released until it moved.
+        if stamp.reset { resetTracking() }
         next.time = stamp.time
         pose = next; receivedAt = now
+        return stamp.reset
     }
     mutating func sample(reference: simd_float4x4?, at time: Double, now: Double,
                          settings: SurrealInputSettings,
@@ -237,8 +242,11 @@ struct SurrealHandCache {
         // confidence, but still requires fresh packets with a valid quaternion.
         guard let pose, now - receivedAt < 0.25,
               settings.positionFromHands || pose.confidence > 0 else {
+            // Released while lost, but the snapshot stays: input is notified only on
+            // change, so clearing it lost a grip held through a short pose gap for good.
+            // Disconnect still clears it.
             status = "Tracking lost — inputs released"
-            resetTracking(); input = KleptonHandState(); hasInput = false
+            resetTracking()
             return released
         }
         let body = pose.predicted(at: time)

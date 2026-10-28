@@ -1491,6 +1491,13 @@ def resolve(name):
     # mixed space, every game's start) or 120 (the full space). A choice made
     # in the start window stays; a mixed-reality game is shown mixed anyway.
     t.setdefault("max_rate", 100)
+    # The start window's "Frame generation" before a player chooses one: "off",
+    # "ahead" (a picture made where the game has none) or "between" (the middle
+    # between the game's last two, a display frame later). Half-Life: Alyx is
+    # "between": below its 50 most of the time, and its owner found it
+    # "fühlt sich auch besser an als ohne" (2026-10-28). A choice made in the
+    # start window stays; a copy that never chose takes a changed default.
+    t.setdefault("framegen", "between" if name == "alyx" else "off")
     # How finely the compositor puts the finished picture on the display
     # (KL_CP_QUALITY): "light" 0.40, "standard" 0.52, "full" 1.0. Light for
     # everything whose picture is capped below what the display asks for even

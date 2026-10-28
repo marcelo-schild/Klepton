@@ -1134,8 +1134,7 @@ struct AlyxPanel: View {
     @AppStorage(AlyxPace.storageKey) private var pace = AlyxPace.game.rawValue
     @AppStorage(AlyxLanguage.storageKey) private var language = AlyxLanguage.standard.rawValue
     @AppStorage(AlyxLanguage.voicesKey) private var voices = true
-    @AppStorage(klAlyxStatsKey) private var stats = false
-    @AppStorage(klAlyxLeanDepthKey) private var leanDepth = true
+    @AppStorage(KleptonControllerMode.preferenceKey) private var controllerMode = KleptonControllerMode.selected().rawValue
     @AppStorage(klAlyxLastLeftKey) private var lastLeft = 0
     @AppStorage(klAlyxLastPoolKey) private var lastPool = 0
 
@@ -1208,23 +1207,20 @@ struct AlyxPanel: View {
         }
     }
 
+    /// A small heading inside one of the boxes, above the choice it names.
+    private func heading(_ title: String) -> some View {
+        Text(title).font(.headline)
+    }
+
+    /// The page in five boxes, his order (2026-10-28, "viel zu krass fragmentiert"): Steam Cloud,
+    /// the picture, the controls, the language – and the play area after this view. What only
+    /// measures or tinkers (performance panel, depth samples) is under Advanced.
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             KLSteamCloudPanel()
-            GroupBox(klT("Walking speed", "Laufgeschwindigkeit")) {
+            GroupBox(klT("Picture", "Bild")) {
                 VStack(alignment: .leading, spacing: 10) {
-                    Picker(klT("Walking speed", "Laufgeschwindigkeit"), selection: $pace) {
-                        ForEach(AlyxPace.allCases) { p in Text(p.name).tag(p.rawValue) }
-                    }
-                    .pickerStyle(.segmented)
-                    Text(klT("How fast you move with the stick, walking and in a fight. Higher is faster; “Game's own” leaves the game its two speeds. Teleporting is not affected.",
-                             "Wie schnell du dich mit dem Stick bewegst, beim Gehen und im Kampf. Höher ist schneller; „Wie im Spiel“ lässt dem Spiel seine beiden Geschwindigkeiten. Teleportieren ist davon nicht betroffen."))
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            GroupBox(klT("Graphics", "Grafik")) {
-                VStack(alignment: .leading, spacing: 10) {
+                    heading(klT("Graphics", "Grafik"))
                     Picker(klT("Graphics", "Grafik"), selection: preset) {
                         ForEach(AlyxPreset.allCases) { p in Text(p.name).tag(p.rawValue) }
                         Text(klT("Custom", "Eigene")).tag(Self.customTag)
@@ -1234,6 +1230,9 @@ struct AlyxPanel: View {
                         Text(klT("Your own combination. In every row the choice on the left is the lightest and the one on the right the most demanding.",
                                  "Deine eigene Kombination. In jeder Zeile ist die Wahl links die leichteste und die rechts die aufwendigste."))
                             .font(.callout).foregroundStyle(.secondary)
+                        // Resolution and MetalFX are not part of a preset: a preset neither sets nor
+                        // locks them, they only have their place here among the other dials.
+                        PicturePrimary(hintFont: .footnote)
                         dial(klT("Picture size", "Bildgröße"), $quality, AlyxQuality.allCases,
                              name: { $0.name }, tag: { $0.rawValue }, note: AlyxQuality.note)
                         dial(klT("Edge smoothing", "Kantenglättung"), $edges, AlyxEdges.allCases,
@@ -1257,19 +1256,41 @@ struct AlyxPanel: View {
                     } else if let p = matching {
                         Text(p.note).font(.callout).foregroundStyle(.secondary)
                     }
+                    Divider()
+                    heading(klT("Frame generation", "Zwischenbilder"))
+                    FrameGenPicker()
+                    Divider()
+                    heading(klT("Frame rate", "Bildrate"))
+                    FrameRatePicker()
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            GroupBox(klT("More", "Weiteres")) {
+            GroupBox(klT("Controls", "Steuerung")) {
                 VStack(alignment: .leading, spacing: 10) {
-                    Toggle(klT("Show performance from the start", "Leistungsanzeige von Anfang an einblenden"), isOn: $stats)
-                    Text(klT("A small panel just above the middle of the view: pictures a second, repeated pictures, GPU and CPU load, memory and heat, with the last minute as graphs. Holding Create and Options together for a second shows it and hides it at any time, whether this is on or not.",
-                             "Eine kleine Tafel knapp über der Blickmitte: Bilder pro Sekunde, wiederholte Bilder, Auslastung von GPU und CPU, Speicher und Wärme, dazu die letzte Minute als Verlauf. Create und Options eine Sekunde lang zusammen gehalten blendet sie jederzeit ein und aus, ob das hier an ist oder nicht."))
-                        .font(.footnote).foregroundStyle(.secondary)
-                    Toggle(klT("Keep depth samples out of memory", "Tiefenwerte nicht im Speicher halten"), isOn: $leanDepth)
-                    Text(klT("Saves about 90 to 170 MB of memory, depending on the picture. If parts of the picture are missing or flicker, switch it off.",
-                             "Spart je nach Bild rund 90 bis 170 MB Speicher. Fehlen Bildteile oder flackert etwas, ausschalten."))
-                        .font(.footnote).foregroundStyle(.secondary)
+                    heading(klT("Controllers", "Controller"))
+                    KleptonControllerSettingsView(boxed: false)
+                    Divider()
+                    heading(klT("Walking speed", "Laufgeschwindigkeit"))
+                    Picker(klT("Walking speed", "Laufgeschwindigkeit"), selection: $pace) {
+                        ForEach(AlyxPace.allCases) { p in Text(p.name).tag(p.rawValue) }
+                    }
+                    .pickerStyle(.segmented)
+                    Text(klT("How fast you move with the stick, walking and in a fight. Higher is faster; “Game's own” leaves the game its two speeds. Teleporting is not affected.",
+                             "Wie schnell du dich mit dem Stick bewegst, beim Gehen und im Kampf. Höher ist schneller; „Wie im Spiel“ lässt dem Spiel seine beiden Geschwindigkeiten. Teleportieren ist davon nicht betroffen."))
+                        .font(.callout).foregroundStyle(.secondary)
+                    Divider()
+                    Toggle(klT("Wait for the trigger after loading", "Nach dem Laden auf den Trigger warten"), isOn: $loadingScreens)
+                    Text(loadingScreens
+                         ? klT("When a level is ready the game shows a card and starts when you pull the trigger.",
+                               "Ist ein Level fertig geladen, zeigt das Spiel eine Karte und beginnt, wenn du den Trigger ziehst.")
+                         : klT("The game continues by itself as soon as a level is ready.",
+                               "Das Spiel geht von selbst weiter, sobald ein Level fertig geladen ist."))
+                        .font(.callout).foregroundStyle(.secondary)
+                    if controllerMode == KleptonControllerMode.standard.rawValue {
+                        Divider()
+                        heading(klT("Game controller", "Gamecontroller"))
+                        GamepadStatusView()
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -1298,18 +1319,6 @@ struct AlyxPanel: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            GroupBox(klT("After loading", "Nach dem Laden")) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Toggle(klT("Wait for the trigger", "Auf den Trigger warten"), isOn: $loadingScreens)
-                    Text(loadingScreens
-                         ? klT("When a level is ready the game shows a card and starts when you pull the trigger.",
-                               "Ist ein Level fertig geladen, zeigt das Spiel eine Karte und beginnt, wenn du den Trigger ziehst.")
-                         : klT("The game continues by itself as soon as a level is ready.",
-                               "Das Spiel geht von selbst weiter, sobald ein Level fertig geladen ist."))
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
             if started {
                 Label(klT("The game is running: these apply the next time it is started.",
                           "Das Spiel läuft: Das gilt ab dem nächsten Start."),
@@ -1317,5 +1326,37 @@ struct AlyxPanel: View {
                     .font(.callout).foregroundStyle(.secondary)
             }
         }
+    }
+}
+
+/// Alyx's performance panel under Advanced: whether it shows from the start, and what a tap of
+/// Create + Options does (KleptonTapAction) – an instrument, not a setting to play by.
+struct AlyxPerformancePanelView: View {
+    @AppStorage(klAlyxStatsKey) private var stats = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle(klT("Show performance from the start", "Leistungsanzeige von Anfang an einblenden"), isOn: $stats)
+            Text(klT("A small panel just above the middle of the view: pictures a second, repeated pictures, GPU and CPU load, memory and heat, with the last minute as graphs. Holding Create and Options together for a second shows it and hides it at any time, whether this is on or not.",
+                     "Eine kleine Tafel knapp über der Blickmitte: Bilder pro Sekunde, wiederholte Bilder, Auslastung von GPU und CPU, Speicher und Wärme, dazu die letzte Minute als Verlauf. Create und Options eine Sekunde lang zusammen gehalten blendet sie jederzeit ein und aus, ob das hier an ist oder nicht."))
+                .font(.footnote).foregroundStyle(.secondary)
+            KleptonTapActionPicker()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Alyx's depth samples in tile memory (klAlyxLeanDepthKey), under Advanced › Picture, in detail.
+struct AlyxLeanDepthView: View {
+    @AppStorage(klAlyxLeanDepthKey) private var leanDepth = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle(klT("Keep depth samples out of memory", "Tiefenwerte nicht im Speicher halten"), isOn: $leanDepth)
+            Text(klT("Saves about 90 to 170 MB of memory, depending on the picture. If parts of the picture are missing or flicker, switch it off.",
+                     "Spart je nach Bild rund 90 bis 170 MB Speicher. Fehlen Bildteile oder flackert etwas, ausschalten."))
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

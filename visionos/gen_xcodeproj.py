@@ -355,6 +355,9 @@ ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon
                         # ...and the frame rate the start window starts at
                         # (targets.py "max_rate", KLMaxRateDefault): 100 or 120.
                         + f"\t\t\t\tKL_MAX_RATE_DEFAULT = {int(KLT['max_rate'])};\n"
+                        # ...and the frame generation it starts with (targets.py
+                        # "framegen", KLFrameGenDefault): off, ahead or between.
+                        + f"\t\t\t\tKL_FRAMEGEN_DEFAULT = {KLT['framegen']};\n"
                         + f"\t\t\t\tKL_OUTPUT_DEFAULT = {KLT['output']};\n"
                         # ...and which front the app shows: the boot report
                         # this project was developed against, or the start
@@ -472,7 +475,7 @@ if KLT['data_panel']:
 # the guest libraries are one.
 SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swift",
          "KleptonAudio.swift", "KleptonShell.swift", "KleptonTuning.swift",
-         "KleptonChroma.swift", "KleptonMic.swift",
+         "KleptonChroma.swift", "KleptonMic.swift", "KleptonFrameGen.swift",
          "KleptonLauncher.swift", "KleptonHL1.swift", "KleptonGameData.swift",
          "KleptonAlyx.swift", "KleptonText.swift", "KleptonSteamCloud.swift",
          "KleptonBackup.swift", "KleptonMetrics.swift", "KleptonPinch.swift",

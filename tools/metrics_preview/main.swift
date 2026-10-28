@@ -6,8 +6,9 @@
 //   build/metrics_preview 12 out    12 samples, out-panel.png / out-line.png
 //
 // Also, at full size, out-panel-notap.png (MetalFX cannot upscale: no tap
-// hint) and out-panel-tap.png (it can: MetalFX switched off by a tap, and the
-// hint for the tap).
+// hint), out-panel-tap.png (it can: MetalFX switched off by a tap, and the
+// hint for the tap) and out-panel-framegen.png (Half-Life: Alyx at 30 to 40 of
+// 50 Hz, frame generation "between" from the middle of the minute on).
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -68,6 +69,20 @@ let t = KLMetricsPanel.makeContext(w: KLMetricsPanel.panelPixels.w, h: KLMetrics
                                    units: KLMetricsPanel.panelLayout.w)!
 KLMetricsPanel.drawPanel(t, samples: test)
 write(t, out + "-panel-tap.png")
+var fgs = samples
+for i in fgs.indices {
+    fgs[i].displayHz = 50 + jitter(0.3)
+    fgs[i].fps = 34 + jitter(4)
+    fgs[i].frameGenTap = true
+    fgs[i].upscale = -1
+    fgs[i].path = "Source 2 · Vulkan · 1 layer"
+    if i >= 30 { fgs[i].frameGen = 2; fgs[i].generated = 50 - fgs[i].fps - 1 + jitter(0.5) }
+    fgs[i].shown = fgs[i].generated > 0 ? min(fgs[i].displayHz, fgs[i].fps + fgs[i].generated) : 0
+}
+let fgp = KLMetricsPanel.makeContext(w: KLMetricsPanel.panelPixels.w, h: KLMetricsPanel.panelPixels.h,
+                                     units: KLMetricsPanel.panelLayout.w)!
+KLMetricsPanel.drawPanel(fgp, samples: fgs)
+write(fgp, out + "-panel-framegen.png")
 let l = KLMetricsPanel.makeContext(w: KLMetricsPanel.linePixels.w, h: KLMetricsPanel.linePixels.h)!
 KLMetricsPanel.drawLine(l, sample: samples.last!)
 write(l, out + "-line.png")

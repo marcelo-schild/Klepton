@@ -41,6 +41,8 @@
 	<string>$(KL_PICTURE_RESET)</string>
 	<key>KLMaxRateDefault</key>
 	<string>$(KL_MAX_RATE_DEFAULT)</string>
+	<key>KLFrameGenDefault</key>
+	<string>$(KL_FRAMEGEN_DEFAULT)</string>
 	<key>KLTestOn</key>
 	<string>$(KL_TEST_ON)</string>
 	<key>KLTestBuild</key>

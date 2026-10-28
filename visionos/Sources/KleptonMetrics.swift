@@ -44,6 +44,13 @@ struct KLMetricsSample {
     var outW = 0, outH = 0         // ...the size after it
     var path = ""                  // how the picture comes: "Vulkan · per eye", "OpenXR GL · 2 layers", ...
     var upscaleNote = ""           // ...and why it is linear
+    /// Frame generation (KleptonFrameGen.Mode): 0 off, 1 ahead, 2 between; and whether the tap cycles it.
+    var frameGen = 0
+    var frameGenTap = false
+    var generated: Float = 0       // pictures a second it made, each of them shown
+    var shown: Float = 0           // different pictures shown a second: the game's and the generated ones
+    /// What the eye gets: the game's own pictures, or with generated ones those too.
+    var shownFps: Float { shown > 0 ? shown : fps }
 }
 
 enum KLMetricsPanel {
@@ -152,7 +159,7 @@ enum KLMetricsPanel {
 
     /// The one-line readout: the four numbers one glances at.
     static func line(_ s: KLMetricsSample) -> String {
-        var parts = [String(format: "%.0f fps", s.fps), String(format: "Display %.0f Hz", s.displayHz)]
+        var parts = [String(format: "%.0f fps", s.shownFps), String(format: "Display %.0f Hz", s.displayHz)]
         if s.gpuBusy >= 0 { parts.append(String(format: "GPU %.0f %%", s.gpuBusy * 100)) }
         if let t = thermalName(s.thermal) { parts.append(t) }
         return parts.joined(separator: "   ·   ")
@@ -179,17 +186,23 @@ enum KLMetricsPanel {
         let left: CGFloat = 28, right: CGFloat = 404
         // How to get rid of it, and back: the two menu buttons of the Sense controllers (kl_metrics_chord).
         text(ctx, "Hold Create + Options 1 s to hide", x: left, y: h - 22, font: font(21), color: dim)
-        // A tap of the two switches MetalFX where it can upscale (KleptonMetalFX.tapToggle), on the line above.
-        let tapLine = samples.last?.metalfxTap ?? false
-        if tapLine { text(ctx, "Tap both: MetalFX on / off", x: left, y: h - 50, font: font(21), color: dim) }
+        // A tap of the two switches MetalFX where it can upscale (KleptonMetalFX.tapToggle), on the line above,
+        // or cycles frame generation where that was chosen for the game or MetalFX has nothing to switch.
+        let fgTap = samples.last?.frameGenTap ?? false
+        let tapLine = (samples.last?.metalfxTap ?? false) || fgTap
+        if tapLine {
+            text(ctx, fgTap ? "Tap both: frame gen off / ahead / between" : "Tap both: MetalFX on / off",
+                 x: left, y: h - 50, font: font(21), color: dim)
+        }
         // Shown for the first time, before its first second is over.
         guard let now = samples.last else {
             text(ctx, "Measuring …", x: left, y: 112, font: font(56, bold: true), color: bright)
             return
         }
 
-        // The column: the frame rate large, then one row a number.
-        let big = text(ctx, String(format: "%.0f", now.fps), x: left, y: 112, font: font(100, bold: true),
+        // The column: the frame rate large – what is shown, the generated pictures included – then one row a
+        // number.
+        let big = text(ctx, String(format: "%.0f", now.shownFps), x: left, y: 112, font: font(100, bold: true),
                        color: bright)
         text(ctx, "FPS", x: left + big + 12, y: 112, font: font(30, bold: true), color: dim)
         text(ctx, String(format: "%.0f Hz", now.displayHz), x: right, y: 112, font: font(30), color: dim,
@@ -233,6 +246,19 @@ enum KLMetricsPanel {
             default: rows.append(("MetalFX", "off", bright))
             }
         }
+        // Frame generation: which of the three (a tap cycles them), and the game's own rate beside it – the
+        // large number above has the generated pictures in it. "same rate" while every display frame has a
+        // new game picture anyway (the display at the game's rate): nothing to make then.
+        if now.frameGenTap || now.frameGen != 0 {
+            let name = ["off", "ahead", "between"][min(max(now.frameGen, 0), 2)]
+            if now.frameGen == 0 {
+                rows.append(("Frame gen", "off", bright))
+            } else if now.generated >= 1 {
+                rows.append(("Frame gen", String(format: "%@ · game %.0f", name, now.fps), green))
+            } else {
+                rows.append(("Frame gen", name + " · same rate", amber))
+            }
+        }
         if !now.path.isEmpty { rows.append(("Path", now.path, bright)) }
         if now.upscale == 2, now.outW > 0 { rows.append(("Output", "\(now.outW) × \(now.outH)", green)) }
         // Nine rows fit at the full size; more close up, down to a size still read at a glance, so the
@@ -255,8 +281,7 @@ enum KLMetricsPanel {
         let top = fpsScale(samples)
         graph(ctx, CGRect(x: gx, y: 24, width: gw, height: gh),
               title: "Frames per second", top: top, unit: "",
-              series: [(samples.map { $0.displayHz }, dim, 2, "Display"),
-                       (samples.map { $0.fps }, green, 4, "Game")])
+              series: fpsSeries(samples))
         graph(ctx, CGRect(x: gx, y: 24 + gh + 16, width: gw, height: gh),
               title: "Load", top: 100, unit: " %",
               series: [(samples.map { $0.cpuTop < 0 ? -1 : $0.cpuTop * 100 }, amber, 3, "Thread"),
@@ -270,6 +295,21 @@ enum KLMetricsPanel {
               top: most <= 10 ? 10 : most <= 30 ? 30 : most <= 100 ? 100 : most <= 300 ? 300 : 1000, unit: "",
               series: [(samples.map { $0.compiles }, red, 0, "new"),
                        (samples.map { $0.compilesCached }, slate, 0, "cached")])
+    }
+
+    /// The frame-rate graph's lines: the display's rate, what the game drew, and – once a picture of the
+    /// minute was generated – what was shown, the generated pictures included, over the game's line.
+    private static func fpsSeries(_ samples: [KLMetricsSample])
+        -> [(values: [Float], color: CGColor, width: CGFloat, name: String)] {
+        var series: [(values: [Float], color: CGColor, width: CGFloat, name: String)] =
+            [(samples.map { $0.displayHz }, dim, 2, "Hz")]
+        if samples.contains(where: { $0.generated >= 1 }) {
+            series.append((samples.map { $0.fps }, amber, 3, "Game"))
+            series.append((samples.map { $0.shownFps }, green, 4, "Shown"))
+        } else {
+            series.append((samples.map { $0.fps }, green, 4, "Game"))
+        }
+        return series
     }
 
     /// The top of the frame-rate graph: the display rate the minute reached,

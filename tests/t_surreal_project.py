@@ -65,7 +65,8 @@ class ProjectTests(unittest.TestCase):
         opted_out = generate("surreal", sdk=True, env_extra={"KLEPTON_SURREAL_SDK": "0"})["pbx"]
         self.assertNotIn(sdk, opted_out)
         self.assertNotIn("KL_SURREAL_SDK", opted_out)
-        # Without the framework a Surreal build is the backend-only build it always was.
+        # Loaded by a test (never fetching), a Surreal build without the framework is the
+        # backend-only project; run as the generator it would fetch it or stop.
         self.assertNotIn(sdk, generate("surreal", sdk=False)["pbx"])
 
     def test_privacy_survives_generator_and_plist(self):

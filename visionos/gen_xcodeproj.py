@@ -261,21 +261,24 @@ if CONTROLLER_MODE not in ("standard", "surreal"):
 # neither fetches nor links it, so nothing changes for anyone without Surreal
 # Touch. A STATIC framework, so linked and never embedded.
 #
-# Fetched here, the first time a Surreal build lacks it, so that configuring
-# Surreal Touch is all anyone has to do (tools/surreal_sdk_fetch.sh pins and
-# verifies it; KLEPTON_SURREAL_SDK=0 skips it). Only when run as the generator,
-# not when a test loads this file. A failed fetch is not a failed build: without
-# the framework a Surreal build keeps KleptonSurrealBackend, as before.
+# Building for Surreal Touch IS the decision to use it, so there is no switch at
+# run time and no fallback: the generator fetches it the first time
+# (tools/surreal_sdk_fetch.sh pins and verifies it), and a Surreal build that
+# cannot have it stops here with the reason instead of quietly shipping the old
+# Bluetooth backend. KLEPTON_SURREAL_SDK=0 is the one way to build Surreal
+# without it, on purpose. Only when run as the generator, not when a test loads
+# this file.
 SVR_NAME = "surreal_interactive_openxr_framework"
 _svr_dir = os.path.join(HERE, "Frameworks", f"{SVR_NAME}.xcframework")
 _svr_wanted = CONTROLLER_MODE == "surreal" and os.environ.get("KLEPTON_SURREAL_SDK", "1") != "0"
 _svr_fetched = os.path.isdir(_svr_dir) and any(
     n.startswith(".klepton-fetched-") for n in os.listdir(_svr_dir))
 if _svr_wanted and not _svr_fetched and __name__ == "__main__":
-    _svr_fetch = subprocess.run([os.path.join(HERE, "..", "tools", "surreal_sdk_fetch.sh")])
-    if _svr_fetch.returncode != 0:
-        print("!! could not fetch Surreal Interactive's SDK — this Surreal build uses "
-              "KleptonSurrealBackend only", file=sys.stderr)
+    if subprocess.run([os.path.join(HERE, "..", "tools", "surreal_sdk_fetch.sh")]).returncode != 0:
+        sys.exit("!! a Surreal Touch build needs Surreal Interactive's SDK, and it could not be "
+                 "fetched (above). Check the connection and build again, stage it with "
+                 "`make surreal-sdk`, or set KLEPTON_SURREAL_SDK=0 to build with Klepton's "
+                 "own Bluetooth backend instead.")
 SURREAL_SDK = _svr_wanted and os.path.isfile(
     os.path.join(_svr_dir, "xros-arm64", f"{SVR_NAME}.framework", SVR_NAME))
 
@@ -954,7 +957,7 @@ def main():
     if CONTROLLER_MODE == "surreal":
         print(f"  Surreal Touch poses:       "
               + ("Surreal Interactive's SDK (linked)" if SURREAL_SDK
-                 else "KleptonSurrealBackend (no SDK - tools/surreal_sdk_fetch.sh)"))
+                 else "KleptonSurrealBackend (KLEPTON_SURREAL_SDK=0)"))
     return 0
 
 

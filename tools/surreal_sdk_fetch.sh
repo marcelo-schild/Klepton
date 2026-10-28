@@ -11,9 +11,9 @@
 # slices — so, like MoltenVK, it is fetched and pinned rather than committed.
 #
 # gen_xcodeproj.py runs this by itself for a Surreal build that does not have it
-# yet (KLEPTON_SURREAL_SDK=0 skips that), so nobody configuring Surreal Touch has
-# to know it exists. A failed fetch is not a failed build: without the framework
-# the app keeps KleptonSurrealBackend, exactly as before this existed.
+# yet, so nobody configuring Surreal Touch has to know it exists. Building for
+# Surreal Touch is the decision to use it: if this fails, that build stops with
+# the reason (KLEPTON_SURREAL_SDK=0 builds with the old Bluetooth backend instead).
 #
 # The pin is a commit, and the hashes are of the files that matter — GitHub's
 # generated tarballs are not byte-stable, the binaries inside them are.

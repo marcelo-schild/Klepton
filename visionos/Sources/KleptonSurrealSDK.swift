@@ -15,12 +15,12 @@ import simd
 final class KleptonSurrealSDK: @unchecked Sendable {
     static let shared = KleptonSurrealSDK()
 
-    /// Linked, and not turned off with `klepton.surreal.sdk = false` or KL_SURREAL_SDK=0.
-    /// Only consulted in Surreal mode (KleptonControllers.usesSurrealSDK).
+    /// Whether this app was built with the SDK — decided when the game is built for Surreal
+    /// Touch (gen_xcodeproj.py), never at run time. Only consulted in Surreal mode
+    /// (KleptonControllers.usesSurrealSDK).
     static var enabled: Bool {
         #if KL_SURREAL_SDK
-        if ProcessInfo.processInfo.environment["KL_SURREAL_SDK"] == "0" { return false }
-        return UserDefaults.standard.object(forKey: "klepton.surreal.sdk") as? Bool ?? true
+        return true
         #else
         return false
         #endif
@@ -79,6 +79,7 @@ final class KleptonSurrealSDK: @unchecked Sendable {
         #endif
     }
 
+    #if KL_SURREAL_SDK
     /// The SDK's thread. The same 13-byte packet KleptonSurrealBackend decodes, so the Touch
     /// mapping, analog scale, dead zone and stick touch are the same with either source.
     private func receive(chirality: Int, buttons b: SVRButtons) {
@@ -96,6 +97,7 @@ final class KleptonSurrealSDK: @unchecked Sendable {
         lock.unlock()
         if first { trace("first buttons from the SDK (hand \(chirality))") }
     }
+    #endif
 
     /// Render thread, once per hand per frame.
     func sample(hand: Int) -> KleptonHandState {

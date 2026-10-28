@@ -472,7 +472,7 @@ if KLT['data_panel']:
 # the guest libraries are one.
 SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swift",
          "KleptonAudio.swift", "KleptonShell.swift", "KleptonTuning.swift",
-         "KleptonChroma.swift", "KleptonMic.swift",
+         "KleptonChroma.swift", "KleptonMic.swift", "KleptonFrameGen.swift",
          "KleptonLauncher.swift", "KleptonHL1.swift", "KleptonGameData.swift",
          "KleptonAlyx.swift", "KleptonText.swift", "KleptonSteamCloud.swift",
          "KleptonBackup.swift", "KleptonMetrics.swift", "KleptonPinch.swift",

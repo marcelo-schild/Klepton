@@ -180,8 +180,12 @@ enum KLMetricsPanel {
         // How to get rid of it, and back: the two menu buttons of the Sense controllers (kl_metrics_chord).
         text(ctx, "Hold Create + Options 1 s to hide", x: left, y: h - 22, font: font(21), color: dim)
         // A tap of the two switches MetalFX where it can upscale (KleptonMetalFX.tapToggle), on the line above.
-        let tapLine = samples.last?.metalfxTap ?? false
-        if tapLine { text(ctx, "Tap both: MetalFX on / off", x: left, y: h - 50, font: font(21), color: dim) }
+        // With frame generation on (its test switch) the tap compares that instead (KleptonFrameGen).
+        let tapLine = (samples.last?.metalfxTap ?? false) || KleptonFrameGen.isOn
+        if tapLine {
+            text(ctx, KleptonFrameGen.isOn ? "Tap both: generated pictures on / off" : "Tap both: MetalFX on / off",
+                 x: left, y: h - 50, font: font(21), color: dim)
+        }
         // Shown for the first time, before its first second is over.
         guard let now = samples.last else {
             text(ctx, "Measuring …", x: left, y: 112, font: font(56, bold: true), color: bright)
@@ -231,6 +235,16 @@ enum KLMetricsPanel {
             case 1: rows.append(("MetalFX", now.upscaleNote.isEmpty ? "on · linear"
                                                                    : "linear · " + now.upscaleNote, amber))
             default: rows.append(("MetalFX", "off", bright))
+            }
+        }
+        // Frame generation: on or off (a tap switches it), and how many pictures a second it made – none
+        // while every display frame has a new game picture anyway (the display at the game's rate).
+        if KleptonFrameGen.isOn {
+            if KleptonFrameGen.live {
+                let r = KleptonFrameGen.ratePerSecond()
+                rows.append(("Frame gen", String(format: "on · %.0f made/s", r), r >= 1 ? green : bright))
+            } else {
+                rows.append(("Frame gen", "off", amber))
             }
         }
         if !now.path.isEmpty { rows.append(("Path", now.path, bright)) }

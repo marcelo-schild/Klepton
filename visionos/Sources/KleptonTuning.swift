@@ -626,6 +626,12 @@ final class KleptonMetalFX: ObservableObject {
     /// MetalFX cannot upscale (no scaler, or a game started at 100 %) it does
     /// nothing. The panel's MetalFX, Path and Output rows show what it did.
     static func tapToggle() {
+        // With frame generation on (test switch), the tap compares it instead.
+        if KleptonFrameGen.isOn {
+            KleptonFrameGen.live.toggle()
+            NSLog("[framegen] switched %@ with Create + Options", KleptonFrameGen.live ? "on" : "off")
+            return
+        }
         guard canUpscale else {
             NSLog("[metalfx] tap of Create + Options: nothing to switch (%@)",
                   deviceSupported ? "the game was started at 100 % resolution" : "no MetalFX on this device")
@@ -780,6 +786,11 @@ enum KleptonTestSwitches {
                              "Bildrate: das Spiel zeichnet jedes zweite Bild des Displays"),
                   note: klT("An even 60 of 120 (or 50 of 100) frames a second, with the head movement still corrected at the full rate – for a game that does not quite hold the full rate and stutters unevenly. Not applied while the system itself shows the game at half rate. Half-Life: Alyx has this as a setting of its own.",
                             "Gleichmäßige 60 von 120 (oder 50 von 100) Bildern pro Sekunde, die Kopfbewegung wird weiter mit voller Rate ausgeglichen – für ein Spiel, das die volle Rate nicht ganz hält und ungleichmäßig ruckelt. Greift nicht, solange das System das Spiel selbst mit halber Rate zeigt. Half-Life: Alyx hat dafür eine eigene Einstellung.")),
+            Entry(env: "KL_FRAMEGEN", value: "1",
+                  title: klT("Generated pictures between the game's pictures",
+                             "Errechnete Zwischenbilder zwischen den Bildern des Spiels"),
+                  note: klT("A test of frame generation. Whenever the display needs a picture and the game has not delivered a new one, one is made from the game's last two instead of showing the last one again: moving things should move on smoothly instead of stepping. Most useful with the switch above (every second picture) or a game that does not keep up with the display, such as Half-Life: Alyx. With the performance panel shown (Create and Options held together), a short tap of the two switches the generated pictures on and off, to compare in the same scene.",
+                            "Ein Test der Zwischenbilder. Immer wenn das Display ein Bild braucht und das Spiel noch kein neues geliefert hat, wird eins aus den letzten beiden errechnet, statt das letzte noch einmal zu zeigen: Was sich bewegt, sollte weich weiterlaufen statt zu springen. Am meisten bringt es mit dem Schalter darüber (jedes zweite Bild) oder bei einem Spiel, das mit dem Display nicht mithält, etwa Half-Life: Alyx. Bei eingeblendeter Leistungsanzeige (Create und Options zusammen gehalten) schaltet ein kurzer Tipp auf beide die Zwischenbilder ein und aus, zum Vergleich in derselben Szene.")),
             Entry(env: "KL_FOVE_BOX", value: "0.30",
                   title: klT("Foveated rendering “Strong”: the profile it had before",
                              "Foveated Rendering „Stark“: das frühere Profil"),
@@ -1511,5 +1522,28 @@ enum KleptonProgramCaches {
         NSLog("[app] program caches: build \(build) is new to this copy — "
               + (dropped.isEmpty ? "no ProgramBinaryCache found"
                                  : "removed \(dropped.joined(separator: ", "))"))
+    }
+}
+
+/// Frame generation (KleptonFrameGen.swift, moonshot s3-framegen): on with its test switch, and
+/// `live` is what a tap of Create + Options flips during the game, to compare in the same scene.
+enum KleptonFrameGen {
+    static let isOn = KleptonTestSwitches.isOn(env: "KL_FRAMEGEN") || klEnvOn("KL_FRAMEGEN", default: false)
+    static var live = true
+
+    /// Pictures made, counted by the compositor, for the performance panel.
+    private static let lock = NSLock()
+    private static var made = 0
+    private static var lastCount = 0, lastTime = 0.0, lastRate = 0.0
+    static func noteMade() { lock.lock(); made += 1; lock.unlock() }
+    /// Pictures a second since the last call (at most every half second; in between the last value).
+    static func ratePerSecond() -> Double {
+        lock.lock(); defer { lock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
+        if lastTime == 0 { lastTime = now; lastCount = made; return 0 }
+        guard now - lastTime >= 0.5 else { return lastRate }
+        lastRate = Double(made - lastCount) / (now - lastTime)
+        lastCount = made; lastTime = now
+        return lastRate
     }
 }

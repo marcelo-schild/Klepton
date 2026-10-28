@@ -55,3 +55,6 @@ void kl_mediandk_set_video_default(int on);
 // is it one whose user gets an id of this installation's own.
 int kl_ovrplat_offline_user_for(const char *target);
 int kl_ovrplat_user_id_per_install(const char *target);
+// ...and Surreal Interactive's controller API (KleptonSurrealSDK.swift), which
+// is linked only into a Surreal build that has their framework; see kl_surreal_sdk.h.
+#import "kl_surreal_sdk.h"

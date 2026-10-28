@@ -12,10 +12,12 @@ Inspected on 2026-10-14:
 | myMartek/Klepton, avp-play | `be35c2542b93766543218a876ab08e55bd45ef8b` (published source snapshot of toolchain 507) |
 | globo128/OpenSurreal | `f4dd94de16d1f628d901a6eea25cdaa4648b70fa` (reference only) |
 | shinyquagsire23/SurrealTouch_re | `0bba3170c189c318b373c130560d76090304ab60` (reference only; control message types, inspected 2026-10-23) |
+| surreal-interactive/SwiftSDKBinary | `a42deb007c7f12afb543b235b75464e86e00125a` (Apache-2.0; linked into Surreal builds, see below) |
+| surreal-interactive/SDK | Unity SDK, `Assets/SVR/Scripts/Core/SVRInputApi.cs` (Apache-2.0; the C API signatures, inspected 2026-10-28) |
 
 OpenSurreal has no LICENSE/COPYING file or express redistribution grant in this revision. Its source was inspected to establish its public APIs and interoperability facts, including UUIDs, packet layouts, handedness naming and coordinate conventions. **None of its implementation, UI, spatial session or package is copied, vendored, linked or downloaded by this build.** This is not a claim that the reference project is permissively licensed or that this was a clean-room process. Obtain an explicit license before replacing this backend with OpenSurreal or distributing any of that project's code. SurrealTouch_re likewise has no license file; only the control message type numbers and TLV header layout were taken from its notes, and none of its code is used.
 
-New implementation files follow this repository's MIT license. There is no new third-party runtime dependency. Apple CoreBluetooth, ARKit, QuartzCore and SwiftUI are SDK frameworks. Existing ANGLE/MoltenVK licensing remains in `third-party-licenses`; the validation build uses their prebuilt slices from AVP Play release v1.1.15, toolchain `507-1954ecf`, verified against the release sidecar SHA-256.
+New implementation files follow this repository's MIT license. The one third-party runtime dependency is Surreal Interactive's own SDK (Apache-2.0, `third-party-licenses/SurrealInteractiveSDK-LICENSE.txt`), in Surreal builds only. Apple CoreBluetooth, ARKit, QuartzCore and SwiftUI are SDK frameworks. Existing ANGLE/MoltenVK licensing remains in `third-party-licenses`; the validation build uses their prebuilt slices from AVP Play release v1.1.15, toolchain `507-1954ecf`, verified against the release sidecar SHA-256.
 
 ## Selection and precedence
 
@@ -26,9 +28,24 @@ New implementation files follow this repository's MIT license. There is no new t
 - Standard follows the original Sense/hand/gamepad code. Surreal bypasses Sense polling, gamepad polling, accessory-provider discovery and pinch events. A missing controller is released and parked out of view; the other remains usable.
 - Both routes use `submit(_:hand:)` and the existing `kl_ovrp_set_hand_motion` / `kl_ovrp_set_controller_input` seam. Game haptics are pulled from the same existing runtime queue.
 
+## Pose source: Surreal Interactive's SDK
+
+A Surreal build (`KLEPTON_CONTROLLER_MODE=surreal`) takes its controller poses, buttons and haptics from Surreal Interactive's own visionOS SDK (`KleptonSurrealSDK.swift`), not from the Bluetooth backend described below. A Standard build neither fetches nor links it, and in Standard mode nothing calls it.
+
+Why: the controllers track themselves, and their tracking frame drifts away from the headset's. With only the backend below, which can register a controller only from a still grip hold, the hands ended 15–45 cm off near the head and 20–30 cm off in fast swings on a Vision Pro (Half-Life: Alyx, 2026-10-28): ammo from the backpack failed more than half the time and throws went sideways. The SDK solves that alignment continuously — clock sync with the controllers, the latency between them and hand tracking, the controller-to-world and hand-to-controller transforms, whether a controller is held — and on the same hardware the hands stayed with the player's own.
+
+- **Where it comes from.** `gen_xcodeproj.py` fetches it the first time a Surreal build does not have it (`tools/surreal_sdk_fetch.sh`, also `make surreal-sdk`): Surreal's `SwiftSDKBinary` at a pinned commit, verified by SHA-256, into `visionos/Frameworks/` (gitignored). `KLEPTON_SURREAL_SDK=0` skips it. A failed fetch does not fail the build; that Surreal build simply keeps the Bluetooth backend.
+- **How it is linked.** A static framework: linked, never embedded, with `-framework Accelerate` for its solver, and `KL_SURREAL_SDK` as the Swift condition that lets `KleptonSurrealSDK.swift` call it. Its OpenXR half is not used and not linked (nothing references it); `kl_surreal_sdk.h` declares the small C API the same archive exports, with the signatures of Surreal's Unity SDK.
+- **What it owns.** Its own CoreBluetooth central (it connects the controllers paired in Settings → Bluetooth) and its own ARKit hand-tracking session. `KleptonControllers` therefore disconnects `KleptonSurrealBackend` before starting it; pairing in the launcher is not needed. Hand tracking in `KleptonCompositor` keeps running alongside it.
+- **Per frame.** As Surreal's Unity integration does: `SVRPollDevicePose` at `SVRTimeNow()`, and each poll reported with `SVRRenderFinish` three frames later, which is how the SDK learns the render latency it predicts across. Buttons arrive through `SVRSetButtonCallback` and go through the same 13-byte decoding as the backend, so the Touch mapping, analog scale, dead zone and stick touch are identical.
+- **Three facts found on hardware.** The C API is the one Unity consumes, so its poses are left-handed with +Z forward; ARKit is right-handed with −Z forward, and z is mirrored (position and linear velocity negate z, orientation and angular velocity negate x and y). Until it has aligned a controller it answers position (100, 100, 100), which is treated as untracked. And `SVRStart` creates a new provider, so `SVRSetButtonCallback` must come after it — set before, no button ever arrives.
+- **Turning it off.** `klepton.surreal.sdk = false` in the game's UserDefaults, or `KL_SURREAL_SDK=0`, falls back to the backend in a build that has the SDK. A Standard build switched to Surreal on the headset has no SDK and uses the backend.
+
+Connection events go to `Documents/surreal-sdk.log`, written off the render thread.
+
 ## Pairing and calibration
 
-In the game launcher, open Settings → Controllers, select Surreal Touch, turn on the controllers and select Discover. Connect the explicitly identified left and right devices. Names without an unambiguous Surreal Touch L/R token are rejected rather than guessed. Pairing, connection, battery (optional SIG battery service), input values, recalibration and vibration controls live on Vision Pro.
+This section and the ones after it describe the Bluetooth backend (`KleptonSurrealBackend`), which a Surreal build uses when it has no SDK. In the game launcher, open Settings → Controllers, select Surreal Touch, turn on the controllers and select Discover. Connect the explicitly identified left and right devices. Names without an unambiguous Surreal Touch L/R token are rejected rather than guessed. Pairing, connection, battery (optional SIG battery service), input values, recalibration and vibration controls live on Vision Pro.
 
 The last successful peripheral UUID for each hand is remembered locally. Reconnect retrieves those UUIDs without scanning. A lost link clears that hand immediately and retries on the BLE queue. Disconnect cancels retry for that hand. Bluetooth permission/power failures clear input and report status. There is no pairing on the Mac.
 

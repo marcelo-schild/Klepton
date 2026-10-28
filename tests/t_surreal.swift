@@ -107,6 +107,7 @@ struct SurrealTests {
         expect(pulse == [0x18, 10, 0, 0x34, 0x12, 0x88, 0x13, 170, 0, 100, 0, 0, 0], "Haptic wire format and units")
         let badPulse = SurrealWire.vibration(sequence: 0, amplitude: .nan, duration: .infinity)
         expect(badPulse.count == 13, "Invalid haptic values do not trap")
+        testResetGesture()
         expect(Array(SurrealWire.tlv(type: SurrealWire.modeRequest, sequence: 0)) == [0x0D, 2, 0, 0, 0], "Mode request wire format")
         expect(Array(SurrealWire.tlv(type: SurrealWire.modeSet, sequence: 0x0201, data: [SurrealWire.controllerMode]))
                == [0x0C, 3, 0, 0x01, 0x02, 0x00], "Set controller mode wire format")
@@ -267,6 +268,37 @@ struct SurrealTests {
             expect(result.position == [1.1, 2, 3] && result.handTrigger == 1,
                    "Fixed rotation calibration preserves live hand position and physical grip")
         }
+    }
+
+    static func testResetGesture() {
+        // One squeeze = press then release; hands alternate 0.1 s apart.
+        func squeeze(_ g: inout SurrealResetGesture, _ hand: Int, at t: Double) -> Bool {
+            let fired = g.update(hand: hand, grip: 0.9, at: t)
+            _ = g.update(hand: hand, grip: 0.1, at: t + 0.05)
+            return fired
+        }
+        var g = SurrealResetGesture()
+        var fired = 0
+        for i in 0..<5 { for h in 0...1 { if squeeze(&g, h, at: Double(i) * 0.4 + Double(h) * 0.1) { fired += 1 } } }
+        expect(fired == 1, "Five squeezes on both controllers reset once")
+        var held = SurrealResetGesture()
+        var heldFired = false
+        for i in 0..<20 { heldFired = heldFired || held.update(hand: 0, grip: 0.9, at: Double(i) * 0.05)
+                                   || held.update(hand: 1, grip: 0.9, at: Double(i) * 0.05) }
+        expect(!heldFired, "A held grip is one squeeze, not five")
+        var oneHand = SurrealResetGesture()
+        var oneFired = false
+        for i in 0..<10 { oneFired = squeeze(&oneHand, 0, at: Double(i) * 0.2) || oneFired }
+        expect(!oneFired, "One controller alone does not reset")
+        var slow = SurrealResetGesture()
+        var slowFired = false
+        for i in 0..<5 { for h in 0...1 { slowFired = squeeze(&slow, h, at: Double(i) * 1.0 + Double(h) * 0.1) || slowFired } }
+        expect(!slowFired, "Squeezes spread over more than three seconds do not reset")
+        var light = SurrealResetGesture()
+        var lightFired = false
+        for i in 0..<5 { for h in 0...1 { lightFired = light.update(hand: h, grip: 0.4, at: Double(i) * 0.4) || lightFired
+                                          _ = light.update(hand: h, grip: 0.1, at: Double(i) * 0.4 + 0.05) } }
+        expect(!lightFired, "Light squeezes below the press threshold do not count")
     }
 
     static func testAimOffsets() {

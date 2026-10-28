@@ -42,6 +42,7 @@ final class KleptonSurrealBackend: NSObject, CBCentralManagerDelegate, CBPeriphe
     private var diagnosticLog: FileHandle?
     private var diagnosticBytes = 0
     private var loggedPackets: Set<String> = []
+    private var resetGesture = SurrealResetGesture()   // BLE queue only
     private var loggedDiscoveries: Set<UUID> = []
 
     /// Connection events and the first packet size only; never per-frame pose data.
@@ -378,6 +379,12 @@ final class KleptonSurrealBackend: NSObject, CBCentralManagerDelegate, CBPeriphe
             let settings = snapshot().settings
             guard let input = SurrealWire.buttons(data, hand: hand, settings: settings) else { return }
             edit { $0.hands[hand.rawValue].input = input; $0.hands[hand.rawValue].hasInput = true }
+            if resetGesture.update(hand: hand.rawValue, grip: input.handTrigger, at: now) {
+                // Same reset as the launcher's button; the next still grip hold re-registers.
+                trace("reset gesture: \(SurrealResetGesture.squeezes) grip squeezes on both controllers — tracking reset")
+                recalibrate()
+                for h in 0...1 { vibrate(hand: h, amplitude: 0.8, duration: 0.25) }
+            }
         case "2A19":
             if let value = data.first, value <= 100 { edit { $0.hands[hand.rawValue].battery = Int(value) } }
         case SurrealWire.controlResponse:

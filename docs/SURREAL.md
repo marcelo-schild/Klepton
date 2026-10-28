@@ -38,6 +38,8 @@ Discover includes peripherals already connected by visionOS, because system-conn
 
 After Start, hold each controller still with the corresponding hand visible and squeeze its grip. This explicitly registers the controller's native frame into the world. A reconnect, timestamp reset or stale/invalid pose requires calibration again. Initial calibration is intentionally not persisted across ARKit world origins or controller power cycles.
 
+To recalibrate without leaving the game, squeeze the grip five times on both controllers within three seconds. A squeeze is a press above 0.55 after a release below 0.35, so a held grip counts once and light touches do not count. Both controllers vibrate and the registration of both is discarded, as with **Reset forward alignment**; calibrate again as after Start. The game also receives those squeezes, so do it with empty hands. The gesture is traced to `surreal-ble.log`.
+
 `KleptonCompositor` remains the sole ARKit-session owner. Its existing predicted hand anchors are converted by the existing `gripPose` convention and supplied to the Surreal cache. No second HandTrackingProvider or WorldTrackingProvider is started. World registration is gently corrected while the grip is held and native speed is below 0.35 m/s and 1.5 rad/s. Fast motion and occluded hands use the controller's native pose relative to the last registration. Releasing the grip freezes registration, so an empty hand cannot drag a controller sitting nearby.
 
 ### Optional position from hand tracking

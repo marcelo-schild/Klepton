@@ -331,6 +331,25 @@ final class KleptonRendering: ObservableObject {
     /// The full space, as the person chose it. Never for a mixed-reality game.
     var wantsFullSpace: Bool { !Self.targetIsMixedReality && maxRate == 120 }
 
+    /// Frame generation (KleptonFrameGen): "off", "ahead" or "between", read at the start. Starts at
+    /// the target's own (targets.py "framegen", KLFrameGenDefault): between for Half-Life: Alyx, whose
+    /// owner found it "fühlt sich auch besser an als ohne" (2026-10-28), off for the rest. A copy that
+    /// never chose gets a changed default with the update.
+    private static let frameGenKey = "klepton.framegen"
+    static let targetFrameGen: KleptonFrameGen.Mode =
+        KleptonFrameGen.Mode(name: (Bundle.main.object(forInfoDictionaryKey: "KLFrameGenDefault") as? String) ?? "") ?? .off
+    static var storedFrameGen: KleptonFrameGen.Mode {
+        (UserDefaults.standard.string(forKey: frameGenKey)).flatMap { KleptonFrameGen.Mode(name: $0) } ?? targetFrameGen
+    }
+    @Published var frameGen: Int {
+        didSet {
+            UserDefaults.standard.set(KleptonFrameGen.Mode(rawValue: frameGen)?.name ?? "off", forKey: Self.frameGenKey)
+            // Before the start the run takes it as it is now.
+            let m = KleptonFrameGen.Mode(rawValue: frameGen) ?? .off
+            KleptonFrameGen.chosen = m; KleptonFrameGen.mode = m
+        }
+    }
+
     /// The same for a Vulkan guest, which multisamples by itself and with a
     /// count of its own choosing: 0 leaves that, 4 raises it to four
     /// (kl_vulkan_set_force_samples_default). Which API a game renders with,
@@ -456,6 +475,7 @@ final class KleptonRendering: ObservableObject {
         // says 120); anything a test build stored besides 100 and 120 is 100.
         maxRate = (UserDefaults.standard.object(forKey: Self.rateKey) as? Int)
             .map { $0 == 120 ? 120 : 100 } ?? Self.targetMaxRate
+        frameGen = Self.storedFrameGen.rawValue
         // Never chosen is off (see kl_glfb_multiview_ms for why).
         msaa = (UserDefaults.standard.object(forKey: Self.msaaKey) as? Int)
             .flatMap { [0, 2, 4].contains($0) ? $0 : nil } ?? 0
@@ -626,11 +646,17 @@ final class KleptonMetalFX: ObservableObject {
     /// MetalFX cannot upscale (no scaler, or a game started at 100 %) it does
     /// nothing. The panel's MetalFX, Path and Output rows show what it did.
     static func tapToggle() {
-        // With frame generation on (test switch), the tap compares it instead.
-        if KleptonFrameGen.isOn {
-            KleptonFrameGen.live.toggle()
-            NSLog("[framegen] switched %@ with Create + Options", KleptonFrameGen.live ? "on" : "off")
+        // What the tap does is the game's setting (KleptonTapAction): frame generation cycles (off, ahead,
+        // between), MetalFX switches, or nothing.
+        switch KleptonTapAction.resolved {
+        case .nothing:
+            NSLog("[cp] tap of Create + Options: set to do nothing")
             return
+        case .frameGen:
+            KleptonFrameGen.cycle()
+            return
+        default:
+            break
         }
         guard canUpscale else {
             NSLog("[metalfx] tap of Create + Options: nothing to switch (%@)",
@@ -786,11 +812,6 @@ enum KleptonTestSwitches {
                              "Bildrate: das Spiel zeichnet jedes zweite Bild des Displays"),
                   note: klT("An even 60 of 120 (or 50 of 100) frames a second, with the head movement still corrected at the full rate – for a game that does not quite hold the full rate and stutters unevenly. Not applied while the system itself shows the game at half rate. Half-Life: Alyx has this as a setting of its own.",
                             "Gleichmäßige 60 von 120 (oder 50 von 100) Bildern pro Sekunde, die Kopfbewegung wird weiter mit voller Rate ausgeglichen – für ein Spiel, das die volle Rate nicht ganz hält und ungleichmäßig ruckelt. Greift nicht, solange das System das Spiel selbst mit halber Rate zeigt. Half-Life: Alyx hat dafür eine eigene Einstellung.")),
-            Entry(env: "KL_FRAMEGEN", value: "1",
-                  title: klT("Generated pictures between the game's pictures",
-                             "Errechnete Zwischenbilder zwischen den Bildern des Spiels"),
-                  note: klT("A test of frame generation. Whenever the display needs a picture and the game has not delivered a new one, one is made from the game's last two instead of showing the last one again: moving things should move on smoothly instead of stepping. Most useful with the switch above (every second picture) or a game that does not keep up with the display, such as Half-Life: Alyx. With the performance panel shown (Create and Options held together), a short tap of the two switches the generated pictures on and off, to compare in the same scene.",
-                            "Ein Test der Zwischenbilder. Immer wenn das Display ein Bild braucht und das Spiel noch kein neues geliefert hat, wird eins aus den letzten beiden errechnet, statt das letzte noch einmal zu zeigen: Was sich bewegt, sollte weich weiterlaufen statt zu springen. Am meisten bringt es mit dem Schalter darüber (jedes zweite Bild) oder bei einem Spiel, das mit dem Display nicht mithält, etwa Half-Life: Alyx. Bei eingeblendeter Leistungsanzeige (Create und Options zusammen gehalten) schaltet ein kurzer Tipp auf beide die Zwischenbilder ein und aus, zum Vergleich in derselben Szene.")),
             Entry(env: "KL_FOVE_BOX", value: "0.30",
                   title: klT("Foveated rendering “Strong”: the profile it had before",
                              "Foveated Rendering „Stark“: das frühere Profil"),
@@ -889,6 +910,8 @@ struct TestSwitchesView: View {
                 .font(.caption).foregroundStyle(.secondary)
             ForEach(KleptonTestSwitches.entries) { e in
                 TestSwitchRow(entry: e)
+                // What the tap does, under the switch that shows the panel (the owner's place for it).
+                if e.env == "KL_STATS_CARD" { KleptonTapActionPicker().padding(.leading, 16) }
             }
         }
     }
@@ -1525,13 +1548,98 @@ enum KleptonProgramCaches {
     }
 }
 
-/// Frame generation (KleptonFrameGen.swift, moonshot s3-framegen): on with its test switch, and
-/// `live` is what a tap of Create + Options flips during the game, to compare in the same scene.
-enum KleptonFrameGen {
-    static let isOn = KleptonTestSwitches.isOn(env: "KL_FRAMEGEN") || klEnvOn("KL_FRAMEGEN", default: false)
-    static var live = true
+/// What a short tap of Create + Options does while the performance panel is shown – a setting of each
+/// game, under the switch that shows the panel from the start (the owner's wish, 2026-10-28: "wählen,
+/// was die Share + Menü Taste genau machen soll"). Automatic: frame generation where it is chosen for
+/// the game or MetalFX has nothing to switch, else MetalFX. Holding the two for a second always shows
+/// and hides the panel.
+enum KleptonTapAction: Int, CaseIterable, Identifiable {
+    case automatic = 0, frameGen = 1, metalFX = 2, nothing = 3
+    var id: Int { rawValue }
+    static let storageKey = "klepton.tapAction"
+    static var stored: KleptonTapAction {
+        KleptonTapAction(rawValue: UserDefaults.standard.integer(forKey: storageKey)) ?? .automatic
+    }
+    /// The setting with Automatic decided: frameGen, metalFX or nothing.
+    static var resolved: KleptonTapAction {
+        switch stored {
+        case .automatic: return KleptonFrameGen.chosen != .off || !KleptonMetalFX.canUpscale ? .frameGen : .metalFX
+        case let a: return a
+        }
+    }
+    var title: String {
+        switch self {
+        case .automatic: return klT("Automatic", "Automatisch")
+        case .frameGen: return klT("Frame generation", "Zwischenbilder")
+        case .metalFX: return "MetalFX"
+        case .nothing: return klT("Nothing", "Nichts")
+        }
+    }
+}
 
-    /// Pictures made, counted by the compositor, for the performance panel.
+/// The choice, for a settings page: under the performance panel's switch.
+struct KleptonTapActionPicker: View {
+    @AppStorage(KleptonTapAction.storageKey) private var action = KleptonTapAction.automatic.rawValue
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Picker(klT("A tap of Create + Options", "Ein Tipp auf Create + Options"), selection: $action) {
+                ForEach(KleptonTapAction.allCases) { Text($0.title).tag($0.rawValue) }
+            }
+            Text(klT("What a short tap of the two does while the performance panel is shown. Frame generation: off, ahead, in between, in turn. MetalFX: upscaling on and off, where the game is rendered below 100 %. Automatic: frame generation where it is chosen for this game or MetalFX has nothing to switch, else MetalFX. Holding the two for a second still shows and hides the panel.",
+                     "Was ein kurzer Tipp auf beide tut, während die Leistungsanzeige zu sehen ist. Zwischenbilder: reihum aus, vorausberechnet, dazwischen. MetalFX: Hochskalieren an und aus, wo das Spiel unter 100 % gezeichnet wird. Automatisch: Zwischenbilder, wo sie für dieses Spiel gewählt sind oder MetalFX nichts umzuschalten hat, sonst MetalFX. Eine Sekunde lang halten blendet die Anzeige weiter ein und aus."))
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// Frame generation (KleptonFrameGen.swift, moonshot s3-framegen): the start window's choice
+/// (KleptonRendering.frameGen, a target's own default before one is made), and what a tap of
+/// Create + Options cycles through during the game, to compare in the same scene – not stored.
+enum KleptonFrameGen {
+    enum Mode: Int, CaseIterable {
+        /// The last picture again, timewarped, whenever the game has no new one.
+        case off = 0
+        /// A picture made from the two newest, moved on to the time it is shown at.
+        case ahead = 1
+        /// The middle between the two newest, the newest itself one display frame later (as DLSS).
+        case between = 2
+
+        init?(name: String) {
+            switch name.lowercased() {
+            case "0", "off": self = .off
+            case "1", "on", "ahead": self = .ahead
+            case "2", "between", "interp": self = .between
+            default: return nil
+            }
+        }
+        var name: String { ["off", "ahead", "between"][rawValue] }
+        var next: Mode { Mode(rawValue: (rawValue + 1) % 3)! }
+    }
+
+    /// What the run starts with: KL_FRAMEGEN (0/1/2, off/ahead/between; the lab's and a test's
+    /// lever) over the stored choice over the target's default.
+    static var chosen: Mode = {
+        if let e = getenv("KL_FRAMEGEN"), let m = Mode(name: String(cString: e)) {
+            return klEnvOn("KL_FRAMEGEN_INTERP", default: false) && m != .off ? .between : m
+        }
+        if klEnvOn("KL_FRAMEGEN_INTERP", default: false) { return .between }
+        return KleptonRendering.storedFrameGen
+    }()
+    private static var current: Int = chosen.rawValue
+    static var mode: Mode {
+        get { Mode(rawValue: current) ?? .off }
+        set { current = newValue.rawValue }
+    }
+    static var isOn: Bool { mode != .off }
+    static var interp: Bool { mode == .between }
+
+    /// A tap of Create + Options: off → ahead → between → off.
+    static func cycle() {
+        mode = mode.next
+        NSLog("[framegen] %@ with Create + Options", mode.name)
+    }
+
+    /// Pictures made and shown, counted by the compositor, for the performance panel.
     private static let lock = NSLock()
     private static var made = 0
     private static var lastCount = 0, lastTime = 0.0, lastRate = 0.0

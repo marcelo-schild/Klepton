@@ -3053,6 +3053,9 @@ final class KleptonCompositor {
     /// belongs, and a second or third repeat one further on (up to one whole game frame).
     private var fgPresentation: Double = 0
     private var fgTimes: (older: Double, newer: Double) = (0, 0)
+    /// The display's frame time, from the drawables' presentation times (0 = not known yet).
+    private var fgPeriod: Double = 0
+    private var fgLastPresentation: Double = 0
     private var fgHist: [String: (older: FgSide?, newer: FgSide)] = [:]
     private var fgParity: [String: Int] = [:]
     /// One output per picture source (a layer, or the eye pass), not per texture: the game rotates
@@ -3064,6 +3067,16 @@ final class KleptonCompositor {
     private var fgDoneSwap: [(ObjectIdentifier, MTLTexture, MfxOrigin)] = []
     private var fgSaid: Set<String> = []
     private var fgRateMap: (map: MTLRasterizationRateMap?, buffer: MTLBuffer?) = (nil, nil)
+    /// KL_FRAMEGEN_SCREEN=1: a foveated eye's motion is found and applied in the map's even screen pixels
+    /// (KLFrameGen.pyramid) rather than in its squeezed physical ones. A third of the cost, but fast
+    /// things at the edge of the view are found worse (synthetic test, 2026-10-28: 32.9 against 36.6 dB
+    /// at 80 px a frame), so it is a lever to compare, not the default.
+    private let fgScreenSpace = klEnvOn("KL_FRAMEGEN_SCREEN", default: false)
+    /// "Between" only: the colours of the newest game picture, kept for the next one, whose "older"
+    /// it then is – what the newer picture has covered is only there (KLFrameGen.generate's olderColor).
+    /// One per output, in the output's layout; `fgPrevOf` says which pyramid it belongs to.
+    private var fgPrev: [String: MTLTexture] = [:]
+    private var fgPrevOf: [String: ObjectIdentifier] = [:]
     private func fgSay(_ key: String, _ text: String) {
         if fgSaid.insert(key).inserted { NSLog("[framegen] \(text)") }
     }
@@ -3079,7 +3092,7 @@ final class KleptonCompositor {
 
     private func fgPrepass(stage: Int, on cmd: any MTLCommandBuffer, rendered: kl_ovrp_render_pose, haveRendered: Bool) {
         guard KleptonFrameGen.isOn else {
-            if !fgHist.isEmpty || !fgOut.isEmpty { fgHist = [:]; fgOut = [:]; fgDoneSwap = [] }
+            if !fgHist.isEmpty || !fgOut.isEmpty { fgHist = [:]; fgOut = [:]; fgDoneSwap = []; fgPrev = [:]; fgPrevOf = [:] }
             return
         }
         guard kl_ovrp_eye_layer_live() != 0, !fgFailed else { return }
@@ -3095,6 +3108,11 @@ final class KleptonCompositor {
             return
         }
         fgDone = (frame, staleInARow); fgDoneSwap = []
+        if fgLastPresentation > 0 {
+            let d = fgPresentation - fgLastPresentation
+            if d > 0.004, d < 0.040 { fgPeriod = fgPeriod == 0 ? d : fgPeriod * 0.9 + d * 0.1 }
+        }
+        fgLastPresentation = fgPresentation
 
         // This frame's pictures: (key, array texture, slice, pose, tangents, row 0 at the top).
         typealias Src = (key: String, tex: MTLTexture, slice: Int, q: simd_quatf, tangents: SIMD4<Float>, topDown: Bool, eye: Int,
@@ -3166,6 +3184,75 @@ final class KleptonCompositor {
                                 levels: 0..<1, slices: slice..<(slice + 1))
         }
 
+        // Makes the picture `phase` of a game frame after the newest (negative: back towards the older
+        // one) for every source that has two comparable pictures, and swaps it in.
+        func generateAll(phase: Float) {
+            var made = 0
+            for s in srcs {
+                guard let h = fgHist[s.key], let older = h.older, h.newer.width == s.tex.width, h.newer.height == s.tex.height,
+                      h.newer.rect == rect(s.eye, s.tex, s.sub) else { continue }
+                let id = ObjectIdentifier(s.tex)
+                // Both eyes of a 2-slice array share one output; a texture per eye gets one each.
+                let outKey = s.tex.arrayLength > 1 ? String(s.key.split(separator: ".").first ?? "") + "/a" : s.key
+                // The larger of the eyes' drawn parts, for both: they differ by a few pixels in a level
+                // (2340 vs 2352), and an output sized per eye was rebuilt every frame – black half-made
+                // pictures and a new unwarp grid each time (headset, 2026-10-28). The same rule as mfxContent.
+                // Without a rate map the output is the whole texture: a picture in a corner (Source 2's rect)
+                // is written where it lies.
+                let all = (0..<2).map { rect($0, s.tex) }
+                let ow = rate == nil ? s.tex.width : Int(all.map { $0.z }.max() ?? 0)
+                let oh = rate == nil ? s.tex.height : Int(all.map { $0.w }.max() ?? 0)
+                var out = fgOut[outKey]
+                if out == nil || out!.width != ow || out!.height != oh || out!.pixelFormat != s.tex.pixelFormat
+                    || out!.arrayLength != s.tex.arrayLength {
+                    let d = MTLTextureDescriptor()
+                    d.textureType = .type2DArray; d.pixelFormat = s.tex.pixelFormat
+                    d.width = ow; d.height = oh; d.arrayLength = s.tex.arrayLength
+                    d.usage = [.shaderRead, .shaderWrite, .pixelFormatView]; d.storageMode = .private
+                    out = device.makeTexture(descriptor: d)
+                    fgOut[outKey] = out
+                    if let out { fgSay("out \(outKey) \(ow)x\(oh)", "output \(outKey): \(ow)x\(oh), \(out.arrayLength) slice(s), \(out.allocatedSize >> 20) MiB") }
+                }
+                guard let out, let src = view2D(s.tex, s.slice), let dst = view2D(out, s.slice) else { continue }
+                if s.tex.arrayLength > 1, srcs.filter({ $0.tex === s.tex }).count < s.tex.arrayLength {
+                    // A slice nobody here writes would show whatever the copy held: copy the source first.
+                    if let blit = cmd.makeBlitCommandEncoder() {
+                        for sl in 0..<s.tex.arrayLength {
+                            blit.copy(from: s.tex, sourceSlice: sl, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                                      sourceSize: MTLSize(width: ow, height: oh, depth: 1),
+                                      to: out, destinationSlice: sl, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                        }
+                        blit.endEncoding()
+                    }
+                }
+                // The turn in the picture's own pixels: the rate map's screen (= the texture) for a foveated
+                // eye, else the rect the frustum was drawn into.
+                let rr = h.newer.rect
+                let rsize = rate != nil ? SIMD2(Float(src.width), Float(src.height)) : SIMD2(Float(rr.z), Float(rr.w))
+                let rot = KLFrameGen.rotationMap(from: h.newer.q, to: older.q, tangents: h.newer.tangents,
+                                                 size: rsize, topDown: h.newer.topDown)
+                let screen = fgScreenSpace && rate != nil
+                // The older picture's colours, when they were kept for exactly that picture.
+                let oldColor = phase < 0 && fgPrevOf[s.key] == ObjectIdentifier(older.pyramid)
+                    ? fgPrev[s.key].flatMap { $0.makeTextureView(pixelFormat: Self.fgLinear($0.pixelFormat)) } : nil
+                fg.generate(older: older.pyramid, newer: h.newer.pyramid, newerColor: src, phase: phase,
+                            rotation: rot, rateMap: screen ? nil : rate?.buffer, rateLayer: s.eye,
+                            screenRateMap: screen ? rate?.buffer : nil, warpRect: rr, olderColor: oldColor,
+                            into: dst, commandBuffer: cmd)
+                // The output holds the source's top-left ow×oh at 1:1: the composite's grid is built against
+                // the source, normalised to that part (the same route a MetalFX copy takes).
+                let origin = MfxOrigin(source: s.tex, content: SIMD2<Float>(Float(ow), Float(oh)))
+                mfxUpgraded[id] = out
+                mfxOrigin[ObjectIdentifier(out)] = origin
+                if !fgDoneSwap.contains(where: { $0.0 == id }) { fgDoneSwap.append((id, out, origin)) }
+                made += 1
+            }
+            if made > 0 {
+                KleptonFrameGen.noteMade()
+                fgSay("first", "first generated picture (\(made) eye picture(s))")
+            }
+        }
+
         if staleInARow == 0 {
             // A new game picture: keep its pyramid, the one before it becomes "older".
             fgTimes = (fgTimes.newer, fgPresentation)
@@ -3174,16 +3261,59 @@ final class KleptonCompositor {
                 let parity = (fgParity[s.key] ?? 0) ^ 1
                 fgParity[s.key] = parity
                 let r = rect(s.eye, v, s.sub)
-                let pyr = fg.pyramid(of: v, rect: r, key: "\(s.key).\(parity)", commandBuffer: cmd)
+                // A foveated eye's pyramid is of its screen, read through the map (fgScreenSpace).
+                let screen = fgScreenSpace && rate != nil
+                let pyr = fg.pyramid(of: v, rect: screen ? SIMD4(0, 0, Int32(v.width), Int32(v.height)) : r,
+                                     key: "\(s.key).\(parity)", rateMap: screen ? rate?.buffer : nil, rateLayer: s.eye,
+                                     commandBuffer: cmd)
                 let side = FgSide(pyramid: pyr, q: s.q, tangents: s.tangents, topDown: s.topDown, width: v.width, height: v.height,
                                   rect: r)
                 let prev = fgHist[s.key]?.newer
                 // A picture of another size (a resolution step) cannot be compared: no older one then.
                 fgHist[s.key] = (prev.flatMap { $0.width == side.width && $0.height == side.height && $0.rect == side.rect ? $0 : nil }, side)
             }
+            // Interpolation ("between"): this drawable shows the middle between the two newest pictures,
+            // and the newest itself follows on the next one – real in-betweens, as DLSS makes them, one
+            // display frame later (10 ms at 100 Hz). Only where the game takes two display frames or
+            // more a picture: at the display's rate (visionOS halved it to the game's 50) every drawable
+            // has a new picture, the newest would never be shown and every one would be a middle – 50
+            // made a second and none of them more than the game drew (headset, 2026-10-28).
+            if KleptonFrameGen.interp {
+                let span = fgTimes.newer - fgTimes.older
+                if fgPeriod > 0, fgTimes.older > 0, span > fgPeriod * 1.5, span < 0.060 {
+                    generateAll(phase: -0.5)
+                    // ...and this picture's colours kept for the next one, after the pass above has read the last.
+                    if let blit = cmd.makeBlitCommandEncoder() {
+                        for s in srcs {
+                            guard let pyr = fgHist[s.key]?.newer.pyramid else { continue }
+                            let all = (0..<2).map { rect($0, s.tex) }
+                            let ow = rate == nil ? s.tex.width : Int(all.map { $0.z }.max() ?? 0)
+                            let oh = rate == nil ? s.tex.height : Int(all.map { $0.w }.max() ?? 0)
+                            var prev = fgPrev[s.key]
+                            if prev == nil || prev!.width != ow || prev!.height != oh || prev!.pixelFormat != s.tex.pixelFormat {
+                                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: s.tex.pixelFormat, width: ow, height: oh,
+                                                                                 mipmapped: false)
+                                d.usage = [.shaderRead, .pixelFormatView]; d.storageMode = .private
+                                prev = device.makeTexture(descriptor: d)
+                                fgPrev[s.key] = prev
+                                if let prev { fgSay("prev \(s.key) \(ow)x\(oh)", "older colours \(s.key): \(ow)x\(oh), \(prev.allocatedSize >> 20) MiB") }
+                            }
+                            guard let prev else { continue }
+                            blit.copy(from: s.tex, sourceSlice: s.slice, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                                      sourceSize: MTLSize(width: ow, height: oh, depth: 1),
+                                      to: prev, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                            fgPrevOf[s.key] = ObjectIdentifier(pyr)
+                        }
+                        blit.endEncoding()
+                    }
+                } else {
+                    fgSay("same rate", "the game keeps up with the display – nothing to put between its pictures")
+                }
+            }
             return
         }
-        guard KleptonFrameGen.live else { return }
+        // With interpolation the repeat IS the newest picture, shown a display frame late.
+        guard KleptonFrameGen.mode == .ahead else { return }
         // Where this drawable lies between the two newest game pictures, measured on the display's own
         // clock. Nothing to make when the game stalled (a gap over 60 ms is a hitch, not a rate) or
         // when the times are not known yet.
@@ -3191,64 +3321,7 @@ final class KleptonCompositor {
         guard fgTimes.older > 0, span > 0.004, span < 0.060 else { return }
         let phase = Float(min(1.0, max(0.0, (fgPresentation - fgTimes.newer) / span)))
         guard phase > 0.05 else { return }
-        var made = 0
-        for s in srcs {
-            guard let h = fgHist[s.key], let older = h.older, h.newer.width == s.tex.width, h.newer.height == s.tex.height,
-                  h.newer.rect == rect(s.eye, s.tex, s.sub) else { continue }
-            let id = ObjectIdentifier(s.tex)
-            // Both eyes of a 2-slice array share one output; a texture per eye gets one each.
-            let outKey = s.tex.arrayLength > 1 ? String(s.key.split(separator: ".").first ?? "") + "/a" : s.key
-            // The larger of the eyes' drawn parts, for both: they differ by a few pixels in a level
-            // (2340 vs 2352), and an output sized per eye was rebuilt every frame – black half-made
-            // pictures and a new unwarp grid each time (headset, 2026-10-28). The same rule as mfxContent.
-            // Without a rate map the output is the whole texture: a picture in a corner (Source 2's rect)
-            // is written where it lies.
-            let all = (0..<2).map { rect($0, s.tex) }
-            let ow = rate == nil ? s.tex.width : Int(all.map { $0.z }.max() ?? 0)
-            let oh = rate == nil ? s.tex.height : Int(all.map { $0.w }.max() ?? 0)
-            var out = fgOut[outKey]
-            if out == nil || out!.width != ow || out!.height != oh || out!.pixelFormat != s.tex.pixelFormat
-                || out!.arrayLength != s.tex.arrayLength {
-                let d = MTLTextureDescriptor()
-                d.textureType = .type2DArray; d.pixelFormat = s.tex.pixelFormat
-                d.width = ow; d.height = oh; d.arrayLength = s.tex.arrayLength
-                d.usage = [.shaderRead, .shaderWrite, .pixelFormatView]; d.storageMode = .private
-                out = device.makeTexture(descriptor: d)
-                fgOut[outKey] = out
-                if let out { fgSay("out \(outKey) \(ow)x\(oh)", "output \(outKey): \(ow)x\(oh), \(out.arrayLength) slice(s), \(out.allocatedSize >> 20) MiB") }
-            }
-            guard let out, let src = view2D(s.tex, s.slice), let dst = view2D(out, s.slice) else { continue }
-            if s.tex.arrayLength > 1, srcs.filter({ $0.tex === s.tex }).count < s.tex.arrayLength {
-                // A slice nobody here writes would show whatever the copy held: copy the source first.
-                if let blit = cmd.makeBlitCommandEncoder() {
-                    for sl in 0..<s.tex.arrayLength {
-                        blit.copy(from: s.tex, sourceSlice: sl, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                                  sourceSize: MTLSize(width: ow, height: oh, depth: 1),
-                                  to: out, destinationSlice: sl, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
-                    }
-                    blit.endEncoding()
-                }
-            }
-            // The turn in the picture's own pixels: the rate map's screen (= the texture) for a foveated
-            // eye, else the rect the frustum was drawn into.
-            let rr = h.newer.rect
-            let rsize = rate != nil ? SIMD2(Float(src.width), Float(src.height)) : SIMD2(Float(rr.z), Float(rr.w))
-            let rot = KLFrameGen.rotationMap(from: h.newer.q, to: older.q, tangents: h.newer.tangents,
-                                             size: rsize, topDown: h.newer.topDown)
-            fg.generate(older: older.pyramid, newer: h.newer.pyramid, newerColor: src, phase: phase,
-                        rotation: rot, rateMap: rate?.buffer, rateLayer: s.eye, into: dst, commandBuffer: cmd)
-            // The output holds the source's top-left ow×oh at 1:1: the composite's grid is built against
-            // the source, normalised to that part (the same route a MetalFX copy takes).
-            let origin = MfxOrigin(source: s.tex, content: SIMD2<Float>(Float(ow), Float(oh)))
-            mfxUpgraded[id] = out
-            mfxOrigin[ObjectIdentifier(out)] = origin
-            if !fgDoneSwap.contains(where: { $0.0 == id }) { fgDoneSwap.append((id, out, origin)) }
-            made += 1
-        }
-        if made > 0 {
-            KleptonFrameGen.noteMade()
-            fgSay("first", "first generated picture (\(made) eye picture(s))")
-        }
+        generateAll(phase: phase)
     }
 
     private func mfxPrepass(stage: Int, on cmd: any MTLCommandBuffer) {
@@ -4637,23 +4710,30 @@ final class KleptonCompositor {
         // The upscale as the compositor said it last, and whether a tap of Create + Options switches it
         // (KleptonMetalFX.tapToggle). A switch is drawn at once rather than with the next second's
         // sample — whoever tapped is looking for it.
-        struct Upscale: Equatable { var tap = false, state = -1, outW = 0, outH = 0, path = "", note = "" }
+        struct Upscale: Equatable { var tap = false, state = -1, outW = 0, outH = 0, path = "", note = "",
+                                    frameGen = 0, frameGenTap = false }
         func upscaleNow() -> Upscale {
             var u = kl_metrics()
             kl_metrics_upscale_now(&u)
-            return Upscale(tap: KleptonMetalFX.canUpscale, state: Int(u.upscale),
+            // The tap cycles frame generation instead where it was chosen or MetalFX has nothing to switch
+            // (KleptonMetalFX.tapToggle).
+            let tap = KleptonTapAction.resolved
+            let fgTap = tap == .frameGen
+            return Upscale(tap: KleptonMetalFX.canUpscale && tap == .metalFX, state: Int(u.upscale),
                            outW: Int(u.out_w), outH: Int(u.out_h),
                            path: withUnsafeBytes(of: &u.path) {
                                String(cString: $0.bindMemory(to: CChar.self).baseAddress!)
                            },
                            note: withUnsafeBytes(of: &u.upscale_note) {
                                String(cString: $0.bindMemory(to: CChar.self).baseAddress!)
-                           })
+                           },
+                           frameGen: KleptonFrameGen.mode.rawValue, frameGenTap: fgTap)
         }
         func put(_ u: Upscale, into s: inout KLMetricsSample) {
             s.metalfxTap = u.tap
             s.upscale = u.state; s.outW = u.outW; s.outH = u.outH
             s.path = u.path; s.upscaleNote = u.note
+            s.frameGen = u.frameGen; s.frameGenTap = u.frameGenTap
         }
         var upscale = Upscale()
         let timer = DispatchSource.makeTimerSource(queue: statsQueue)
@@ -4685,6 +4765,10 @@ final class KleptonCompositor {
                 s.memUsedMB = Int(m.mem_used_mb); s.memLeftMB = Int(m.mem_left_mb)
                 s.thermal = ProcessInfo.processInfo.thermalState.rawValue
                 s.eyeW = Int(m.eye_w); s.eyeH = Int(m.eye_h)
+                // Generated pictures are each shown once (none is made for a display frame that brings a
+                // new game picture anyway), so what the eye gets is the game's plus those.
+                s.generated = Float(KleptonFrameGen.ratePerSecond())
+                s.shown = min(s.displayHz, s.fps + s.generated)
                 // The upscale as it is now rather than as the sample took it, so a tap is not undone by a
                 // sample a quarter of a second old.
                 put(u, into: &s)

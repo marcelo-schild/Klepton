@@ -9,3 +9,8 @@ swiftc -O -swift-version 5 -target arm64-apple-macos14.0 \
   -framework Metal -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers \
   -o build/framegen
 echo "built build/framegen"
+swiftc -O -swift-version 5 -target arm64-apple-macos14.0 \
+  visionos/Sources/KleptonFrameGen.swift tools/framegen/synthetic/main.swift \
+  -framework Metal -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers \
+  -o build/framegen_synthetic
+echo "built build/framegen_synthetic"

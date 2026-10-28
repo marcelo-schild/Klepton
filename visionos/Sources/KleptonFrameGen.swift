@@ -41,6 +41,7 @@ final class KLFrameGen {
     /// whether the field is median-smoothed. Tunables for the lab (tools/framegen --tune).
     static var zeroBias: Float = 0.01
     static var smooth = true
+    static var smoothCoarse = false
     /// Motion below this many pixels (after the turn is taken out) is left alone: the search's
     /// own error, not something moving. Without it a picture that only turned came out worse
     /// than the timewarped repeat (Beat Saber's menu, 2026-10-28).
@@ -96,15 +97,25 @@ final class KLFrameGen {
 
     /// The pyramid of `source` (a 2D texture, or one slice viewed as 2D) inside `rect`, in storage
     /// named `key` – reused, so two keys ping-pong for "older" and "newer".
+    ///
+    /// With `rateMap` the source was drawn through that rasterization rate map and `rect` is in the
+    /// map's SCREEN pixels: the pyramid is the picture as it looks, evenly spread, each cell read
+    /// from where the map put it (KL_FRAMEGEN_SCREEN). A third of the cost of searching the squeezed
+    /// pixels with the map, but a synthetic test found fast things at the edge of the view worse
+    /// there, where the squeezed picture makes their motion small – so it is a lever, not the rule.
     func pyramid(of source: MTLTexture, rect: SIMD4<Int32>? = nil, key: String,
+                 rateMap: MTLBuffer? = nil, rateLayer: Int = 0,
                  commandBuffer cb: MTLCommandBuffer) -> Pyramid {
         let r = rect ?? SIMD4<Int32>(0, 0, Int32(source.width), Int32(source.height))
         let w = Int(r.z), h = Int(r.w), f = Self.finestLevel(width: w), top = max(f + 2, Self.levels)
         let levels = (f...top).map { texture("\(key).\($0)", max(1, w >> $0), max(1, h >> $0), .r16Float) }
         if let enc = cb.makeComputeCommandEncoder() {
             var lp = SIMD4<Int32>(r.x, r.y, Int32(1 << f), 0)
+            var lm = SIMD4<Int32>(rateMap == nil ? 0 : 1, Int32(rateLayer), 0, 0)
             enc.setTexture(source, index: 0); enc.setTexture(levels[0], index: 1)
             enc.setBytes(&lp, length: 16, index: 0)
+            if let rateMap { enc.setBuffer(rateMap, offset: 0, index: 1) } else { enc.setBytes(&lm, length: 16, index: 1) }
+            enc.setBytes(&lm, length: 16, index: 2)
             dispatch(enc, luma, levels[0].width, levels[0].height)
             for i in 1..<levels.count {
                 enc.setTexture(levels[i - 1], index: 0); enc.setTexture(levels[i], index: 1)
@@ -129,8 +140,18 @@ final class KLFrameGen {
     /// 6888×5525 texture (headset, 2026-10-28). `rotation` is then in the map's SCREEN pixels, and the
     /// search converts with the map (physical → screen → turn → physical). Without it a turning head
     /// came out in patches. The buffer is `MTLRasterizationRateMap.copyParameterData`.
+    ///
+    /// `olderColor`: for a picture between the two (negative phase), `older`'s colours, in the same
+    /// layout as `newerColor`. What the newer picture has already covered – the background behind the
+    /// edge a thing moves away from – is only in the older one; without it a moving block came out
+    /// stretched on that side.
+    ///
+    /// `screenRateMap` instead: the pyramids were made in the map's screen pixels (`pyramid`'s
+    /// `rateMap`), so the search is the plain one and only the warp goes through the map – each
+    /// pixel of `warpRect` (the physical part) to the screen, along the motion, and back.
     func generate(older: Pyramid, newer: Pyramid, newerColor: MTLTexture, phase: Float,
                   rotation: simd_float3x3? = nil, rateMap: MTLBuffer? = nil, rateLayer: Int = 0,
+                  screenRateMap: MTLBuffer? = nil, warpRect: SIMD4<Int32>? = nil, olderColor: MTLTexture? = nil,
                   into out: MTLTexture, commandBuffer cb: MTLCommandBuffer) {
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         guard older.finest == newer.finest, older.top == newer.top else { enc.endEncoding(); return }
@@ -161,7 +182,10 @@ final class KLFrameGen {
             enc.setComputePipelineState(search)
             enc.dispatchThreadgroups(MTLSize(width: bw, height: bh, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: side * side, height: 1, depth: 1))
-            if Self.smooth {
+            // Only the finest level is cleaned: on the coarser ones a thing near by is one or two blocks
+            // (a box passing close, 80 px a game frame), and cleaning there took its motion away before
+            // the finer levels could refine it.
+            if Self.smooth, l == f || Self.smoothCoarse {
                 let smoothed = texture("s\(l)", bw, bh, .rg16Float)
                 enc.setTexture(field, index: 0); enc.setTexture(smoothed, index: 1)
                 dispatch(enc, median, bw, bh)
@@ -174,12 +198,18 @@ final class KLFrameGen {
         // The search already took the turn out (above): the field is only what moved besides it.
         var wp = SIMD4<Float>(phase, Float(Self.block << f), Float(1 << f), 0)
         var minMove = Self.minMotion
-        var rr = newer.rect
+        var rr = warpRect ?? newer.rect
         var rot = rotation ?? matrix_identity_float3x3
+        // `olderColor` (between two pictures only): `older`'s own colours, laid out as `newerColor`.
+        let useOld = olderColor != nil && phase < 0
+        var wm = SIMD4<Int32>(screenRateMap == nil ? 0 : 1, Int32(rateLayer), useOld ? 1 : 0, 0)
         enc.setTexture(newerColor, index: 0); enc.setTexture(prior!, index: 1); enc.setTexture(out, index: 2)
+        enc.setTexture(useOld ? olderColor : newerColor, index: 3)
         enc.setBytes(&wp, length: 16, index: 0); enc.setBytes(&rr, length: 16, index: 1)
         enc.setBytes(&rot, length: MemoryLayout<simd_float3x3>.stride, index: 2)
         enc.setBytes(&minMove, length: 4, index: 3)
+        if let screenRateMap { enc.setBuffer(screenRateMap, offset: 0, index: 4) } else { enc.setBytes(&wm, length: 16, index: 4) }
+        enc.setBytes(&wm, length: 16, index: 5)
         dispatch(enc, warp, Int(rr.z), Int(rr.w))
         enc.endEncoding()
     }
@@ -237,9 +267,12 @@ final class KLFrameGen {
     }
 
     // Luminance of a rectangle of the source at 1/s size (s = 1 << finest): the mean of each s×s cell.
+    // lm.x != 0: the rectangle is in a rate map's screen pixels, each point read where the map put it.
     kernel void fg_luma(texture2d<float, access::read> src [[texture(0)]],
                         texture2d<half, access::write> dst [[texture(1)]],
-                        constant int4 &p [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {
+                        constant int4 &p [[buffer(0)]],
+                        constant rasterization_rate_map_data *rmd [[buffer(1)]],
+                        constant int4 &lm [[buffer(2)]], uint2 g [[thread_position_in_grid]]) {
         if (g.x >= dst.get_width() || g.y >= dst.get_height()) return;
         int s = p.z; float y = 0;
         uint2 m = uint2(src.get_width() - 1, src.get_height() - 1);
@@ -247,7 +280,11 @@ final class KLFrameGen {
         int n = min(s, 4), step = s / n;
         for (int j = 0; j < n; j++) for (int i = 0; i < n; i++) {
             int2 at = int2(g) * s + int2(i, j) * step + step / 2 + p.xy;
-            float3 c = src.read(min(uint2(at), m)).rgb;
+            if (lm.x != 0) {
+                rasterization_rate_map_decoder map(*rmd);
+                at = int2(map.map_screen_to_physical_coordinates(float2(at) + 0.5, uint(lm.y)));
+            }
+            float3 c = src.read(min(uint2(max(at, int2(0))), m)).rgb;
             y += dot(c, float3(0.2126, 0.7152, 0.0722));
         }
         dst.write(half4(half(y / float(n * n))), g);
@@ -335,15 +372,23 @@ final class KLFrameGen {
         }
     }
 
+    // The field cleaned of lone blocks: a block keeps its vector when two of its eight neighbours agree
+    // with it (within a pixel of this level), else it takes the 3×3 median. A plain median made the
+    // edge blocks of anything a few blocks wide take the still background's zero – the middle moved,
+    // the outline stayed, and an arrow on a block came out bent (Beat Saber, worst at the edge of a
+    // foveated eye, where a block holds the most; headset and a synthetic test, 2026-10-28).
     kernel void fg_median(texture2d<half, access::read> src [[texture(0)]],
                           texture2d<half, access::write> dst [[texture(1)]], uint2 g [[thread_position_in_grid]]) {
         if (g.x >= dst.get_width() || g.y >= dst.get_height()) return;
         int2 m = int2(src.get_width() - 1, src.get_height() - 1);
-        float xs[9], ys[9]; int n = 0;
+        float xs[9], ys[9]; int n = 0, agree = 0;
+        float2 c = float2(src.read(g).rg);
         for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
             float2 v = float2(src.read(uint2(clamp(int2(g) + int2(dx, dy), int2(0), m))).rg);
             xs[n] = v.x; ys[n] = v.y; n++;
+            if ((dx != 0 || dy != 0) && all(abs(v - c) <= 1.0)) agree++;
         }
+        if (agree >= 2) { dst.write(half4(half2(c), 0, 0), g); return; }
         for (int i = 0; i < 9; i++) for (int j = i + 1; j < 9; j++) {
             if (xs[j] < xs[i]) { float t = xs[i]; xs[i] = xs[j]; xs[j] = t; }
             if (ys[j] < ys[i]) { float t = ys[i]; ys[i] = ys[j]; ys[j] = t; }
@@ -351,42 +396,123 @@ final class KLFrameGen {
         dst.write(half4(half(xs[4]), half(ys[4]), 0, 0), g);
     }
 
-    // NEW moved on by phase × its motion: each output pixel takes NEW from where its content was.
-    // The field is per 8×8 block at full size; it is read bilinearly between block centres.
-    kernel void fg_warp(texture2d<float, access::sample> newT [[texture(0)]],
-                        texture2d<half, access::read> field [[texture(1)]],
-                        texture2d<float, access::write> out [[texture(2)]],
-                        constant float4 &p [[buffer(0)]], constant int4 &r [[buffer(1)]],
-                        constant float3x3 &rot [[buffer(2)]], constant float &minMove [[buffer(3)]],
-                        uint2 g [[thread_position_in_grid]]) {
-        if (int(g.x) >= r.z || int(g.y) >= r.w) return;
-        float B = p.y;
-        float2 fp = (float2(g) + 0.5) / B - 0.5;
+    // The field at a position (full-size pixels; screen pixels with a map), read bilinearly between
+    // block centres, in full-size pixels.
+    static float2 fg_field_at(texture2d<half, access::read> field, float2 pos, float B, float scale) {
+        float2 fp = pos / B - 0.5;
         int2 m = int2(field.get_width() - 1, field.get_height() - 1);
         int2 f0 = clamp(int2(floor(fp)), int2(0), m), f1 = clamp(f0 + 1, int2(0), m);
         float2 t = clamp(fp - floor(fp), 0.0, 1.0);
         float2 v00 = float2(field.read(uint2(f0)).rg), v10 = float2(field.read(uint2(f1.x, f0.y)).rg);
         float2 v01 = float2(field.read(uint2(f0.x, f1.y)).rg), v11 = float2(field.read(uint2(f1)).rg);
+        return mix(mix(v00, v10, t.x), mix(v01, v11, t.x), t.y) * scale;
+    }
+
+    // A position of the field's pixels (screen pixels with a map, else pixels of the rectangle) in the
+    // texture, inside this eye's rectangle: across the seam is the other eye.
+    static float2 fg_tex_pos(float2 at, int4 r, int4 wm, constant rasterization_rate_map_data *rmd) {
+        if (wm.x != 0) {
+            rasterization_rate_map_decoder map(*rmd);
+            at = map.map_screen_to_physical_coordinates(at, uint(wm.y));
+        } else {
+            at += float2(r.xy);
+        }
+        return clamp(at, float2(r.xy) + 0.5, float2(r.xy + r.zw) - 0.5);
+    }
+
+    // NEW moved on by phase × its motion: each output pixel takes NEW from where its content was.
+    // The field is per block of NEW, at NEW's positions – not at the output's: the output pixel p shows
+    // what lay at q = p - phase·v(q) in NEW. Each of the four blocks around p offers its vector; the
+    // one that still holds where it points to (v(q) ≈ itself) is taken, and of several that hold, the
+    // largest – the thing in front, which covers the still background it moves over. Read at p alone,
+    // a moving block's outline stayed behind on one side and was stretched on the other.
+    //
+    // Between two pictures with OLD's colours (wm.z) the test is finer than a block: a vector is right
+    // where NEW at p - phase·v and OLD at p - (1 + phase)·v show the same, and the pixel is the mix of
+    // the two. Where no vector makes them agree, one of the two pictures has covered what belongs
+    // here: NEW, when the slowest vector around (the background's) does not hold in NEW's field – then
+    // OLD shows it, moved by that vector; else NEW does.
+    kernel void fg_warp(texture2d<float, access::sample> newT [[texture(0)]],
+                        texture2d<half, access::read> field [[texture(1)]],
+                        texture2d<float, access::write> out [[texture(2)]],
+                        texture2d<float, access::sample> oldT [[texture(3)]],
+                        constant float4 &p [[buffer(0)]], constant int4 &r [[buffer(1)]],
+                        constant float3x3 &rot [[buffer(2)]], constant float &minMove [[buffer(3)]],
+                        constant rasterization_rate_map_data *rmd [[buffer(4)]],
+                        constant int4 &wm [[buffer(5)]],
+                        uint2 g [[thread_position_in_grid]]) {
+        if (int(g.x) >= r.z || int(g.y) >= r.w) return;
+        float B = p.y;
+        // wm.x != 0: this pixel is a physical one of a rate map whose screen the field was found in.
+        float2 here = float2(g) + 0.5;
+        float2 scr = here;
+        if (wm.x != 0) {
+            rasterization_rate_map_decoder map(*rmd);
+            scr = map.map_physical_to_screen_coordinates(here + float2(r.xy), uint(wm.y));
+        }
+        float2 fp = scr / B - 0.5;
+        int2 m = int2(field.get_width() - 1, field.get_height() - 1);
+        int2 f0 = clamp(int2(floor(fp)), int2(0), m), f1 = clamp(f0 + 1, int2(0), m);
+        float2 c[4] = { float2(field.read(uint2(f0)).rg), float2(field.read(uint2(f1.x, f0.y)).rg),
+                        float2(field.read(uint2(f0.x, f1.y)).rg), float2(field.read(uint2(f1)).rg) };
+        uint2 at = uint2(int2(g) + r.xy);
         // Most of a picture does not move: copy those pixels as they are.
-        if (all(v00 == 0) && all(v10 == 0) && all(v01 == 0) && all(v11 == 0)) {
-            uint2 at = uint2(int2(g) + r.xy);
+        if (all(c[0] == 0) && all(c[1] == 0) && all(c[2] == 0) && all(c[3] == 0)) {
             out.write(newT.read(at), at);
             return;
         }
-        float2 v = mix(mix(v00, v10, t.x), mix(v01, v11, t.x), t.y);
+        float phase = p.x, scale = p.z;
         constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::linear);
-        v *= p.z;                                   // pixels of the full picture
-        float2 here = float2(g) + 0.5;
-        if (p.w != 0) {
+        // A vector holds where it points to when the field there is within a pixel and a half of the
+        // level searched (its own resolution) of it.
+        float tol = 1.5 * scale;
+        float2 slow = c[0];
+        for (int k = 1; k < 4; k++) if (length(c[k]) < length(slow)) slow = c[k];
+        slow *= scale;
+        if (length(slow) < minMove) slow = 0;
+
+        if (wm.z != 0) {
+            float bestScore = 1e9; float4 bestN = 0, bestO = 0;
+            // Only the blocks' own vectors: one blended between them (half a block's motion) found false
+            // agreement on a plain surface – red at both ends – and left a strip of it behind.
+            for (int k = 0; k < 4; k++) {
+                float2 cand = c[k] * scale;
+                if (length(cand) < minMove) cand = 0;
+                float4 n = newT.sample(s, fg_tex_pos(scr - phase * cand, r, wm, rmd));
+                float4 o = oldT.sample(s, fg_tex_pos(scr - (1.0 + phase) * cand, r, wm, rmd));
+                float held = length(fg_field_at(field, scr - phase * cand, B, scale) - cand) / scale;
+                float score = dot(abs(n.rgb - o.rgb), float3(1)) + 0.01 * min(held, 4.0);
+                if (score < bestScore) { bestScore = score; bestN = n; bestO = o; }
+            }
+            float4 result;
+            if (bestScore < 0.15) {
+                result = mix(bestO, bestN, 1.0 + phase);
+            } else if (length(fg_field_at(field, scr - phase * slow, B, scale) - slow) <= tol) {
+                result = newT.sample(s, fg_tex_pos(scr - phase * slow, r, wm, rmd));
+            } else {
+                result = oldT.sample(s, fg_tex_pos(scr - (1.0 + phase) * slow, r, wm, rmd));
+            }
+            out.write(result, at);
+            return;
+        }
+
+        float2 v = fg_field_at(field, scr, B, scale);
+        float bestErr = 1e9, bestLen = -1;
+        for (int k = 0; k < 5; k++) {
+            float2 cand = k < 4 ? c[k] * scale : fg_field_at(field, scr, B, scale);
+            float2 there = fg_field_at(field, scr - phase * cand, B, scale);
+            float err = length(there - cand), len = length(cand);
+            bool holds = err <= tol;
+            bool better = holds ? (bestErr > tol || len > bestLen + 0.5) : (bestErr > tol && err < bestErr);
+            if (better) { bestErr = err; bestLen = len; v = holds ? there : cand; }
+        }
+        if (length(v) < minMove) v = 0;
+        if (wm.x == 0 && p.w != 0) {
             // Take out what the head's turn explains: that part the timewarp does.
             float3 h = rot * float3(here, 1.0);
             v -= here - h.xy / h.z;
         }
-        if (length(v) < minMove) v = 0;
-        float2 pos = float2(r.xy) + here - p.x * v;
-        // Stay inside this eye's rectangle: across the seam is the other eye.
-        pos = clamp(pos, float2(r.xy) + 0.5, float2(r.xy + r.zw) - 0.5);
-        out.write(newT.sample(s, pos), uint2(int2(g) + r.xy));
+        out.write(newT.sample(s, fg_tex_pos(scr - phase * v, r, wm, rmd)), at);
     }
     """
 }

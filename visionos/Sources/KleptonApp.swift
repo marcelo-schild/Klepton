@@ -611,18 +611,7 @@ struct PlayerSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             KleptonControllerSettingsView()
-            // Alyx has its own page for the picture (AlyxPanel), with one choice
-            // where this has two dials; both at once were two places to set the
-            // same thing. These two stay reachable under Advanced. Its Picture
-            // box holds Resolution and MetalFX, the same as every other game's
-            // (they were only under Advanced there), outside the Graphics
-            // presets, which neither hide nor lock them.
-            if klIsAlyx() {
-                GroupBox(klT("Picture", "Bild")) {
-                    PicturePrimary(hintFont: .callout)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
+            // Alyx's page shows AlyxPanel instead of this view, with these in its own boxes.
             if !klIsAlyx() {
             GroupBox(klT("Picture", "Bild")) {
                 VStack(alignment: .leading, spacing: 10) {
@@ -694,18 +683,17 @@ struct PlayerSettingsView: View {
             // except a mixed-reality one, whose room needs the mixed space.
             if Immersive.wanted, !KleptonRendering.targetIsMixedReality {
                 GroupBox(klT("Frame rate", "Bildrate")) {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Picker(klT("Frame rate", "Bildrate"), selection: $rendering.maxRate) {
-                            Text(klT("Up to 100", "Bis 100")).tag(100)
-                            Text(klT("Up to 120", "Bis 120")).tag(120)
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        Text(klT("Up to 100 is the default. Up to 120 is smoother where the game manages it and the Vision Pro's display can do it. When a game cannot keep up, the Vision Pro halves the rate for a while: to 50 from 100, to 60 from 120.",
-                                 "Bis 100 ist der Standard. Bis 120 ist flüssiger, wo das Spiel es schafft und das Display der Vision Pro es kann. Kommt ein Spiel nicht mit, halbiert die Vision Pro die Rate eine Weile: von 100 auf 50, von 120 auf 60."))
-                            .font(.callout).foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    FrameRatePicker().frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            // Frame generation (KleptonFrameGen), for every game that shows a picture of its own – among
+            // the main settings, where its owner wanted it ("nicht erst bei erweitert"). In the game a
+            // tap of Create + Options with the performance panel shown cycles the three, to compare
+            // (KleptonTapAction: unless the game's setting has the tap do something else). Not for a
+            // mixed-reality game: a moved in-between picture moves the edges to the room as well.
+            if Immersive.wanted, !KleptonRendering.targetIsMixedReality {
+                GroupBox(klT("Frame generation", "Zwischenbilder")) {
+                    FrameGenPicker().frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             // Alyx hides the player's arms whatever this says (see
@@ -723,36 +711,88 @@ struct PlayerSettingsView: View {
                 }
             }
             if controllerMode == KleptonControllerMode.standard.rawValue {
-            GroupBox(klT("Game controller", "Gamecontroller")) {
-                // Looked up again every two seconds: a controller is paired and
-                // switched on while this page is open as often as before it.
-                TimelineView(.periodic(from: .now, by: 2)) { _ in
-                    VStack(alignment: .leading, spacing: 10) {
-                        if let name = KleptonControllers.connectedGamepadName() {
-                            Label(klT("\(name) is connected.", "\(name) ist verbunden."), systemImage: "gamecontroller.fill")
-                        } else {
-                            Label(klT("No game controller connected. Pair one under Settings › Bluetooth on the Vision Pro.",
-                                      "Kein Gamecontroller verbunden. Koppeln unter Einstellungen › Bluetooth auf der Vision Pro."),
-                                  systemImage: "gamecontroller")
-                                .foregroundStyle(.secondary)
-                        }
-                        // The four face buttons are read off this game's own
-                        // layout, so the sentence cannot say something the
-                        // controller does not do.
-                        let m = KleptonControllers.faceMap
-                        let faces = "✕ = \(m.cross.uppercased()), ○ = \(m.circle.uppercased()), □ = \(m.square.uppercased()), △ = \(m.triangle.uppercased())"
-                        Text(klT("An ordinary controller works together with your hands: your hands show the game where they are and pinch to grab, the controller adds the sticks and buttons. Both sticks work as they are. The buttons stand for those of the VR controllers: \(faces); L2 and R2 are the triggers, L1 and R1 the grip buttons, Options the menu.",
-                                 "Ein gewöhnlicher Controller arbeitet mit deinen Händen zusammen: Die Hände zeigen dem Spiel, wo sie sind, und greifen per Fingertipp; der Controller bringt Sticks und Tasten mit. Beide Sticks gelten unverändert. Die Tasten stehen für die der VR-Controller: \(faces); L2 und R2 sind die Trigger, L1 und R1 die Grifftasten, Options das Menü."))
-                            .font(.callout).foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
+                GroupBox(klT("Game controller", "Gamecontroller")) { GamepadStatusView() }
             }
             Label(klT("Changes to the picture apply the next time you start the game.",
                       "Änderungen am Bild gelten ab dem nächsten Start des Spiels."),
                   systemImage: "info.circle")
                 .font(.callout).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// The frame-rate choice (KleptonRendering.maxRate): its picker and what it does.
+struct FrameRatePicker: View {
+    @ObservedObject private var rendering = KleptonRendering.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Picker(klT("Frame rate", "Bildrate"), selection: $rendering.maxRate) {
+                Text(klT("Up to 100", "Bis 100")).tag(100)
+                Text(klT("Up to 120", "Bis 120")).tag(120)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            Text(klT("Up to 100 is the default. Up to 120 is smoother where the game manages it and the Vision Pro's display can do it. When a game cannot keep up, the Vision Pro halves the rate for a while: to 50 from 100, to 60 from 120.",
+                     "Bis 100 ist der Standard. Bis 120 ist flüssiger, wo das Spiel es schafft und das Display der Vision Pro es kann. Kommt ein Spiel nicht mit, halbiert die Vision Pro die Rate eine Weile: von 100 auf 50, von 120 auf 60."))
+                .font(.callout).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// The frame-generation choice (KleptonRendering.frameGen): its three modes and what they do.
+struct FrameGenPicker: View {
+    @ObservedObject private var rendering = KleptonRendering.shared
+    @ObservedObject private var metalfx = KleptonMetalFX.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Picker(klT("Frame generation", "Zwischenbilder"), selection: $rendering.frameGen) {
+                Text(klT("Off", "Aus")).tag(KleptonFrameGen.Mode.off.rawValue)
+                Text(klT("Ahead", "Vorausberechnet")).tag(KleptonFrameGen.Mode.ahead.rawValue)
+                Text(klT("In between", "Dazwischen")).tag(KleptonFrameGen.Mode.between.rawValue)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            Text(klT("For a game that draws fewer pictures than the display shows. Ahead: where the game has no new picture, one is made from its last two, moved on to the moment it is shown. In between: the middle between the game's last two pictures, as DLSS makes them – smoother, and what the game draws comes 10 ms later; the head's movement stays as quick. With the performance panel shown (Create and Options held together), a short tap of the two cycles the three – what the tap does can be set under the panel's switch.",
+                     "Für ein Spiel, das weniger Bilder zeichnet, als das Display zeigt. Vorausberechnet: Wo das Spiel kein neues Bild hat, wird eins aus seinen letzten beiden errechnet, bis zu dem Moment weitergerückt, in dem es gezeigt wird. Dazwischen: die Mitte zwischen den letzten beiden Bildern des Spiels, wie DLSS sie macht – weicher, und was das Spiel zeichnet, kommt 10 ms später; die Kopfbewegung bleibt so schnell. Bei eingeblendeter Leistungsanzeige (Create und Options zusammen gehalten) wechselt ein kurzer Tipp auf beide zwischen den dreien – was der Tipp tut, lässt sich unter dem Schalter der Anzeige einstellen."))
+                .font(.callout).foregroundStyle(.secondary)
+            // The compositor makes no in-between picture where MetalFX swapped the eye's picture
+            // (encodeComposite): the two would fight over the swap.
+            if rendering.frameGen != KleptonFrameGen.Mode.off.rawValue, metalfx.enabled {
+                Text(klT("While MetalFX upscaling is on, no in-between pictures are made – choose one of the two.",
+                         "Solange MetalFX-Hochskalieren an ist, entstehen keine Zwischenbilder – eins von beiden wählen."))
+                    .font(.callout).foregroundStyle(.orange)
+            }
+        }
+    }
+}
+
+/// Whether an ordinary game controller is connected, and which of its buttons stands for which.
+/// Looked up again every two seconds: a controller is paired and switched on while the page is
+/// open as often as before it.
+struct GamepadStatusView: View {
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 2)) { _ in
+            VStack(alignment: .leading, spacing: 10) {
+                if let name = KleptonControllers.connectedGamepadName() {
+                    Label(klT("\(name) is connected.", "\(name) ist verbunden."), systemImage: "gamecontroller.fill")
+                } else {
+                    Label(klT("No game controller connected. Pair one under Settings › Bluetooth on the Vision Pro.",
+                              "Kein Gamecontroller verbunden. Koppeln unter Einstellungen › Bluetooth auf der Vision Pro."),
+                          systemImage: "gamecontroller")
+                        .foregroundStyle(.secondary)
+                }
+                // The four face buttons are read off this game's own
+                // layout, so the sentence cannot say something the
+                // controller does not do.
+                let m = KleptonControllers.faceMap
+                let faces = "✕ = \(m.cross.uppercased()), ○ = \(m.circle.uppercased()), □ = \(m.square.uppercased()), △ = \(m.triangle.uppercased())"
+                Text(klT("An ordinary controller works together with your hands: your hands show the game where they are and pinch to grab, the controller adds the sticks and buttons. Both sticks work as they are. The buttons stand for those of the VR controllers: \(faces); L2 and R2 are the triggers, L1 and R1 the grip buttons, Options the menu.",
+                         "Ein gewöhnlicher Controller arbeitet mit deinen Händen zusammen: Die Hände zeigen dem Spiel, wo sie sind, und greifen per Fingertipp; der Controller bringt Sticks und Tasten mit. Beide Sticks gelten unverändert. Die Tasten stehen für die der VR-Controller: \(faces); L2 und R2 sind die Trigger, L1 und R1 die Grifftasten, Options das Menü."))
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
@@ -1189,18 +1229,28 @@ struct BootView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     if isLauncher { LauncherPanel() }
+                    // Alyx's page is its own (AlyxPanel), down to its language, which
+                    // the game picks itself (AlyxLanguage) and the general one does not reach.
                     if klIsAlyx() { AlyxPanel(started: running || finished || run.started) }
-                    PlayerSettingsView()
+                    else { PlayerSettingsView() }
                     RoomSettingsView(measure: { showSettings = false; openRoom(.setup) })
                     PlayerNameView()
-                    GameLanguageView()
+                    if !klIsAlyx() { GameLanguageView() }
                     WalkaboutUnlockView()
                     if micUpFront { GroupBox { MicView() } }
                     // Everything a player does not need to understand to play: the
                     // dials of the port itself, and the report of this run.
                     DisclosureGroup(klT("Advanced", "Erweitert")) {
                         VStack(alignment: .leading, spacing: 14) {
-                            GroupBox(klT("Picture, in detail", "Bild, im Einzelnen")) { RenderingView() }
+                            if klIsAlyx() {
+                                GroupBox(klT("Performance panel", "Leistungsanzeige")) { AlyxPerformancePanelView() }
+                            }
+                            GroupBox(klT("Picture, in detail", "Bild, im Einzelnen")) {
+                                VStack(alignment: .leading, spacing: 14) {
+                                    RenderingView()
+                                    if klIsAlyx() { AlyxLeanDepthView() }
+                                }
+                            }
                             // Not for Alyx: its own KL_OVRP_EYE_MAX (klAlyxApply) would win over it.
                             if !klIsAlyx() {
                                 GroupBox(klT("Max resolution per eye", "Maximale Auflösung je Auge")) { EyeMaxView() }
@@ -1300,8 +1350,11 @@ struct BootView: View {
 
             // Resolution and MetalFX in view, as on a player's settings page:
             // the two dials of the picture's size, not folded away in Rendering.
-            GroupBox(klT("Picture", "Bild")) { PicturePrimary(hintFont: .caption) }
-                .font(.callout)
+            // Alyx has them under its Graphics' "Custom".
+            if !klIsAlyx() {
+                GroupBox(klT("Picture", "Bild")) { PicturePrimary(hintFont: .caption) }
+                    .font(.callout)
+            }
 
             // The controller-alignment sliders, in THIS window because it stays
             // open beside the immersive space — so the guest keeps rendering

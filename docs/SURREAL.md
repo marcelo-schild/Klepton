@@ -72,7 +72,7 @@ The interoperability reference describes a custom service `6E401001-B5A3-F393-E0
 | Left menu / right capture | raw Start `0x100000` / Back `0x200000` |
 | Trigger / grip | analog index / hand trigger; raw digital threshold 0.55 |
 | Sticks | center 128, signed normalization, radial 0.12 dead zone, unit-circle clamp, optional invert Y |
-| Capacitive touch | unavailable in the described input packet; zero, never fabricated |
+| Capacitive touch | unavailable in the described input packet; only touches the input proves are set — pressed face buttons and stick, and a stick pushed past the dead zone (Half-Life: Alyx's teleport is a SteamVR dpad with `sub_mode: touch`) |
 
 Buttons use a 13-byte packet (uint64 time, flags, trigger, grip, stick X/Y). Pose packets contain uint64 nanosecond time and 17 float32 values: position, xyzw quaternion, confidence, linear/angular velocity, acceleration. Invalid lengths, nonfinite numbers and degenerate quaternions are rejected. Z is reflected on position/linear vectors; X/Y are negated on quaternion imaginary components and angular velocity, preserving the axial-vector convention. Orientations are normalized.
 

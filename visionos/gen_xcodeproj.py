@@ -274,7 +274,12 @@ _svr_wanted = CONTROLLER_MODE == "surreal" and os.environ.get("KLEPTON_SURREAL_S
 _svr_fetched = os.path.isdir(_svr_dir) and any(
     n.startswith(".klepton-fetched-") for n in os.listdir(_svr_dir))
 if _svr_wanted and not _svr_fetched and __name__ == "__main__":
-    if subprocess.run([os.path.join(HERE, "..", "tools", "surreal_sdk_fetch.sh")]).returncode != 0:
+    # Its progress goes to stderr, like everything else this says: run.sh reads the generator's
+    # stdout through `| head -1`, and the fetch's second line then hit a closed pipe – `set -e`
+    # ended it right after the download, and every first Surreal build stopped here (AVP Play's
+    # installer, 2026-10-29).
+    if subprocess.run([os.path.join(HERE, "..", "tools", "surreal_sdk_fetch.sh")],
+                      stdout=sys.stderr).returncode != 0:
         sys.exit("!! a Surreal Touch build needs Surreal Interactive's SDK, and it could not be "
                  "fetched (above). Check the connection and build again, stage it with "
                  "`make surreal-sdk`, or set KLEPTON_SURREAL_SDK=0 to build with Klepton's "

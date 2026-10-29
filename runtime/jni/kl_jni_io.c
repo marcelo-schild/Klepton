@@ -179,7 +179,11 @@ static int klj_zip_throws(void) {
     static int v = -1;
     if (v < 0) {
         const char *t = kl_driver_target_name();
-        int dflt = t && strcmp(t, "x2104963472963790") == 0;   // Pistol Whip
+        // Pistol Whip and Drop Dead: Dual Strike Edition — both ship a main OBB and
+        // no patch OBB, and Drop Dead's log stops on the same "mismatching GUID ...
+        // got ''" with the game sitting on its logo.
+        int dflt = t && (strcmp(t, "x2104963472963790") == 0    // Pistol Whip
+                      || strcmp(t, "x1935017546592600") == 0);  // Drop Dead: Dual Strike
         v = kl_env_on("KL_JNI_ZIP_THROW", dflt);
     }
     return v;

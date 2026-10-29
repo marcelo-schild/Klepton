@@ -1959,6 +1959,16 @@ int kl_app_guest_start(void) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+    // Drop Dead: Dual Strike Edition (x1935017546592600) overflowed this thread's
+    // stack the moment the player took hold of the first weapon: the crash report
+    // (SIGILL on the stack guard page, headset 2026-10-28) is TextMeshProUGUI
+    // .GenerateTextMesh calling down a deep chain on the guest's main thread, in
+    // a title that ran fine on Quest because Android's main thread has 8 MB of
+    // stack while a plain Darwin thread has 512 KB. Give THIS title the 8 MB its
+    // platform gives the main thread. Per target: other titles are known to run
+    // inside the default, and a bigger stack is address space they do not need.
+    if (g_target->name && strcmp(g_target->name, "x1935017546592600") == 0)
+        pthread_attr_setstacksize(&attr, 8u * 1024u * 1024u);
     int rc = pthread_create(&g_guest.thread, &attr, guest_thread, NULL);
     pthread_attr_destroy(&attr);
     if (rc != 0) {

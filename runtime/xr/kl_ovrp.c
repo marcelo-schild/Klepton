@@ -2063,8 +2063,12 @@ static int klovrp_unify_default(void) {
     // window said 4096 (the owner on device, 2026-10-20: "die auflösung ist 4096
     // aber er rendert 5193"). Told the union, it draws each eye full width with
     // one cone: the area the setting names, both eyes complete.
+    // Contractors (x2436897736439055, UE 4.27 Oculus) is Walkabout's shape from
+    // Unreal: its 3379-wide eye becomes a 4224 texture (x1.25), and `render
+    // viewport: eye0 0,0 4224x2710 eye1 0,0 4224x2710`. On device each eye alone
+    // looked right and the two together did not overlay (2026-10-28).
     static const char *on[] = { "intotheradius", "x5817243991680545", "walkabout", "x3634830803298285", "x9531494193591052",
-                                "x8012387035448196" };
+                                "x8012387035448196", "x2436897736439055" };
     const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;
@@ -3520,10 +3524,22 @@ static void klovrp_one_pose_open(int frame_index) {
 // from the start is simply "forward", and looking anywhere else means turning
 // afterwards.
 static void klovrp_headless_pose(void) {
-    static int state;                       // 0 unread, 1 none, 2 first pose, 3 second pose
+    static int state;                       // 0 unread, 1 none, 2 first pose, 3 second pose, 4 sweeping
     static float p[9];
     static int nparam;
     static uint64_t t0;
+    // KL_OVRP_HEAD_SWEEP=<deg>,<s>[,<from>]: the head turns left and right about the KL_OVRP_HEAD
+    // yaw, <deg> each way over a period of <s> seconds, from <from> seconds after the head is put
+    // (a Mac run that needs the head to move once it is past the menus: the motion vectors of
+    // XR_FB_space_warp, moonshot s3-framegen).
+    static float sweep[3];
+    if (state == 4) {
+        float t = (float)((double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9) - sweep[2];
+        float yaw = p[3] + (t > 0 ? sweep[0] * sinf(6.2831853f * t / sweep[1]) : 0.0f);
+        float half = yaw * 0.008726646f;
+        kl_ovrp_set_head_pose(p[0], p[1], p[2], 0, sinf(half), 0, cosf(half));
+        return;
+    }
     if (state == 1 || state == 3) return;
     if (!state) {
         // KL_OVRP_HEAD_AFTER=<s>: no head at all until then (a Mac run that must
@@ -3549,6 +3565,12 @@ static void klovrp_headless_pose(void) {
         fprintf(stderr, "  [ovrp] KL_OVRP_HEAD: no frontend, head put at (%.2f %.2f %.2f) yaw %.0f\n",
                 (double)p[0], (double)p[1], (double)p[2], (double)p[3]);
         state = nparam >= 6 ? 2 : 3;
+        const char *sw = kl_env_str("KL_OVRP_HEAD_SWEEP", NULL);
+        if (sw && sscanf(sw, "%f,%f,%f", &sweep[0], &sweep[1], &sweep[2]) >= 2 && sweep[1] > 0) {
+            state = 4;
+            fprintf(stderr, "  [ovrp] KL_OVRP_HEAD_SWEEP: the head turns %.1f deg each way every %.2f s, "
+                            "from %.0f s on\n", (double)sweep[0], (double)sweep[1], (double)sweep[2]);
+        }
         return;
     }
     if ((double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9 < (double)p[4]) return;
@@ -8608,14 +8630,17 @@ static void klovrp_record_overlays(const void *layer_submits, int count) {
 // enqueue set is aged on the OpenXR frame boundary (kl_ovrp_openxr_frame_end),
 // so panels the guest stops filing still come down. Fluid (x6946182742093178)
 // draws its whole browser UI as such panels over a black eye picture: without
-// it, black from start to finish (2026-10-21).
+// it, black from start to finish (2026-10-21). Spatial Zombies (x24151641901194680)
+// files its menu as such a Cylinder: the pointer reached it and clicked, and
+// nothing was drawn (2026-10-28).
 static void klovrp_overlays_publish(const kl_ovrp_overlay *v, int n);
 static int klovrp_enq_with_xr(void) {
     static int v = -1;
     if (v < 0) {
         const char *t = kl_driver_target_name();
         v = kl_env_on("KL_OVRP_ENQ_WITH_XR", t && (!strcmp(t, "x2094303753986147") ||
-                                                    !strcmp(t, "x6946182742093178")));
+                                                    !strcmp(t, "x6946182742093178") ||
+                                                    !strcmp(t, "x24151641901194680")));
         if (v) fprintf(stderr, "  [ovrp] enqueued panels ride on the OpenXR frame "
                                "(KL_OVRP_ENQ_WITH_XR)\n");
     }
@@ -8817,7 +8842,11 @@ static int klovrp_pt_on(void) {
                                                     // Angry Birds VR: Isle of Pigs has a
                                                     // mixed reality mode; asked for by the
                                                     // owner (2026-10-18).
-                                                    !strcmp(t, "x2718606324833775")));
+                                                    !strcmp(t, "x2718606324833775") ||
+                                                    // Spatial Zombies is mixed reality
+                                                    // only; without it the room was black
+                                                    // (2026-10-28).
+                                                    !strcmp(t, "x24151641901194680")));
         if (on)
             fprintf(stderr, "  [ovrp] passthrough: offered to the guest — the room shows "
                             "through the eye picture while it submits a passthrough layer\n");
@@ -8877,6 +8906,11 @@ static void klovrp_pt_resumed(int layer_id) {
 // one keeps its eye alpha as it was.
 void kl_ovrp_openxr_frame_end(void) {
     extern void kl_reproject_set_eye_alpha(int mode);
+    // An OpenXR guest's frames are counted here, so a KL_OVRP_POKE press timed in frames (`f<n>`)
+    // fires on one too: the same number its KL_VK_OUT captures carry (xr_f<n>_*.png). Before, the
+    // counter only moved on ovrp_EndFrame and such a press never came (HITMAN 3 VR: Reloaded on the
+    // Mac, 2026-10-28).
+    __atomic_fetch_add(&g_vk_frame, 1, __ATOMIC_RELAXED);
     // Enqueued panels riding on OpenXR frames age on this boundary — see
     // kl_ovrp_overlays_external.
     if (klovrp_enq_with_xr()) klovrp_enq_age();
@@ -8886,11 +8920,13 @@ void kl_ovrp_openxr_frame_end(void) {
     // the compositor with no MTLTexture and was dropped — Fluid
     // (x6946182742093178), whose whole UI is two such Quads, stayed black
     // (2026-10-21).
-    //   KL_OVRP_ENQ_MIRROR_XR=0|1 — default 1 for Fluid, else 0.
+    // Spatial Zombies (x24151641901194680, GLES) is the same with its menu.
+    //   KL_OVRP_ENQ_MIRROR_XR=0|1 — default 1 for Fluid and Spatial Zombies, else 0.
     static int mirror = -1;
     if (mirror < 0) {
         const char *t = kl_driver_target_name();
-        mirror = kl_env_on("KL_OVRP_ENQ_MIRROR_XR", t && !strcmp(t, "x6946182742093178"));
+        mirror = kl_env_on("KL_OVRP_ENQ_MIRROR_XR", t && (!strcmp(t, "x6946182742093178") ||
+                                                           !strcmp(t, "x24151641901194680")));
     }
     if (mirror && klovrp_enq_with_xr()) klovrp_mirror_enq_gl();
     if (!klovrp_pt_on() || g_pt_enq_since >= 1000000u) return;
@@ -9029,6 +9065,7 @@ static uint64_t klovrp_ShutdownInsightPassthrough(void) {
 // Plane frames follow the scene convention: the plane in local XY, +Z its
 // normal — up for the floor, down for the ceiling, into the room for a wall.
 //   KL_OVRP_SCENE_ROOM=0|1 — default 1 for Synth Riders (x2436558143118760),
+//       DreamSpace (x9449316705178989) and Spatial Zombies (x24151641901194680),
 //       else 0, where every one of these says UNSUPPORTED as before.
 //   KL_OVRP_ROOM=<w>x<d>x<h> — the box in metres, default 4x4x2.6, where no
 //       plane has been seen.
@@ -9037,8 +9074,12 @@ static int klovrp_scene_on(void) {
     if (on < 0) {
         const char *t = kl_driver_target_name();
         // DreamSpace (x9449316705178989) is a mixed-reality home built on rooms.
+        // Spatial Zombies (x24151641901194680): MR Utility Kit on Unity's OpenXR
+        // plugin, which asked for xrDiscoverSpacesMETA ~3700 times a run, was
+        // told it is not there, and never left its empty start scene (2026-10-28).
         on = kl_env_on("KL_OVRP_SCENE_ROOM", t && (!strcmp(t, "x2436558143118760") ||
-                                                   !strcmp(t, "x9449316705178989")));
+                                                   !strcmp(t, "x9449316705178989") ||
+                                                   !strcmp(t, "x24151641901194680")));
         if (on) fprintf(stderr, "  [ovrp] scene: an emulated room is offered (KL_OVRP_SCENE_ROOM)\n");
     }
     return on;
@@ -10622,6 +10663,32 @@ static uint64_t klovrp_EnqueueSubmitLayer2(uint32_t flags, void *texL, void *tex
         o->tex_h    = l->desc.texture_size.h;
         if (pose)  memcpy(o->pose, pose, sizeof o->pose);
         if (scale) { o->size[0] = scale[0]; o->size[1] = scale[1]; }
+        // A Cylinder filed here has no union arm to read its shape from: OVROverlay
+        // passes it in the scale — arc width, height, radius, in metres. Left at
+        // zero, kl_overlay_build refused every such panel, and Spatial Zombies'
+        // whole menu (a Cylinder) was never drawn while its pointer clicked on it
+        // (2026-10-28).
+        //   KL_OVRP_ENQ_CYLINDER=0|1 — default 1 for Spatial Zombies
+        //       (x24151641901194680), else 0, where an enqueued cylinder stays
+        //       uncomposited as before.
+        static int enq_cyl = -1;
+        if (enq_cyl < 0) {
+            const char *t = kl_driver_target_name();
+            enq_cyl = kl_env_on("KL_OVRP_ENQ_CYLINDER", t && !strcmp(t, "x24151641901194680"));
+        }
+        if (enq_cyl && o->shape == 1 && scale && klovrp_plausible_metres(scale[0]) &&
+            klovrp_plausible_metres(scale[1]) && klovrp_plausible_metres(scale[2])) {
+            o->cyl[0] = scale[0]; o->cyl[1] = scale[1]; o->cyl[2] = scale[2];
+            static int said[128];
+            if ((unsigned)layer_id < 128 && !said[layer_id]) {
+                said[layer_id] = 1;
+                fprintf(stderr, "  [ovrp] EnqueueSubmitLayer2: cylinder layer %d: arc %.3f m, "
+                                "height %.3f m, radius %.3f m (%.1f degrees) at (%.2f, %.2f, %.2f)%s\n",
+                        layer_id, scale[0], scale[1], scale[2], scale[0] / scale[2] * 57.29578f,
+                        pose ? pose[4] : 0.f, pose ? pose[5] : 0.f, pose ? pose[6] : 0.f,
+                        o->head_locked ? " head-locked" : "");
+            }
+        }
         o->flags       = (int)flags;
         o->head_locked = ((int)flags & KLOVRP_SUBMIT_HEAD_LOCKED) != 0;
         // Row 0 is the top of the picture on a Vulkan guest — UNLESS the layer

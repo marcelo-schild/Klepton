@@ -1657,6 +1657,151 @@ static int klfb_rewrite_ro_ssbo(char *buf, size_t cap) {
     }
     return nb;
 }
+// Warhammer 40,000: Battle Sister's renderer (PixelToys' BLAST) lights its
+// levels through reflection probes held in a samplerCubeArray, with each
+// probe's HDR decode in a read-only storage buffer — ES 3.2 and 3.1, both
+// refused by this ES 3.0 backend ("'BLAST_ReflectionProbes' : syntax error"),
+// so every surface of a level failed to compile and drew black while only its
+// particles showed (2026-10-28). The array is declared a plain samplerCube so
+// the shader compiles, and every sample of it becomes kl_probe_env (below), so
+// the sampler is unused and holds no texture unit that a 2D array of the same
+// shader could be refused for sharing. The block becomes a constant of the same
+// element type giving an HDR decode that leaves the colour as it is. Lightmaps,
+// albedo, normals and the main light are untouched. Only these exact names, and only
+// where KL_GLFB_PROBE_CUBE_ARRAY is on (default for x3231001163584154).
+static int klfb_probe_cube_array_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_GLFB_PROBE_CUBE_ARRAY", t && strcmp(t, "x3231001163584154") == 0);
+    }
+    return on;
+}
+static int klfb_rewrite_probe_cube_array(char *buf, size_t cap) {
+    static const char decl[] = "samplerCubeArray BLAST_ReflectionProbes;";
+    // The layout list still carries its `binding = N` here (klfb_rewrite_glsl
+    // drops it later), so the block is found by what follows the list.
+    static const char blk[]  = "readonly buffer BLAST_ReflectionProbeHDRData {";
+    // A constant, not a uniform: Unity refuses a struct uniform outside a block
+    // ("struct parameter ... resides outside of a uniform block").
+    static const char uni[]  = "const BLAST_ReflectionProbeHDRData_type BLAST_ReflectionProbeHDRData_buf[1] = "
+                               "BLAST_ReflectionProbeHDRData_type[1](BLAST_ReflectionProbeHDRData_type("
+                               "uint[4](0x3f800000u, 0x3f800000u, 0u, 0u)));";
+    // The probe read as the scene's ambient light (its spherical harmonics) in
+    // the reflected direction, not as black: a metal has no diffuse colour, so
+    // with no reflection at all every metal surface came out black (2026-10-28).
+    // With the decode words above (multiplier 1, exponent 1, w 0) the shader
+    // takes this colour as it is.
+    static const char env_sh[] =
+        "vec4 kl_probe_env(vec3 d) { vec4 n = vec4(normalize(d), 1.0);\n"
+        "    return vec4(max(vec3(dot(unity_SHAr, n), dot(unity_SHAg, n), dot(unity_SHAb, n)), vec3(0.0)), 1.0); }\n";
+    static const char env_flat[] = "vec4 kl_probe_env(vec3 d) { return vec4(0.25, 0.25, 0.25, 1.0); }\n";
+    int n = 0, sampled = 0;
+    char *d = strstr(buf, decl);
+    if (d) {
+        memcpy(d, "samplerCube     ", 16);           // same length as samplerCubeArray
+        n++;
+        static const char *const calls[] = { "textureLod(BLAST_ReflectionProbes, ",
+                                             "texture(BLAST_ReflectionProbes, " };
+        for (int c = 0; c < 2; c++) {
+            for (char *p = buf; (p = strstr(p, calls[c])); ) {
+                char *a = p + strlen(calls[c]), *e = a;
+                int depth = 0;
+                for (; *e; e++) {
+                    if (*e == '(' || *e == '[') depth++;
+                    else if ((*e == ')' || *e == ']') && depth) depth--;
+                    else if ((*e == ',' || *e == ')') && !depth) break;
+                }
+                if (!*e || e == a) return n;
+                char *close = e;                   // the call's own ')', past a lod argument
+                if (*close == ',') {
+                    depth = 0;
+                    for (close++; *close; close++) {
+                        if (*close == '(' || *close == '[') depth++;
+                        else if ((*close == ')' || *close == ']') && depth) depth--;
+                        else if (*close == ')' && !depth) break;
+                    }
+                    if (!*close) return n;
+                }
+                char ins[256];
+                if (snprintf(ins, sizeof ins, "kl_probe_env((%.*s).xyz)", (int)(e - a), a) >= (int)sizeof ins) return n;
+                char *after = klfb_splice(buf, cap, p, (size_t)(close + 1 - p), ins);
+                if (!after) return n;
+                if (!sampled++) {
+                    char *m = strstr(buf, "void main(");
+                    const char *env = strstr(buf, "unity_SHAr") && strstr(buf, "unity_SHAg") &&
+                                      strstr(buf, "unity_SHAb") ? env_sh : env_flat;
+                    if (!m || m > p || !klfb_splice(buf, cap, m, 0, env)) return n;
+                    after += strlen(env);             // the call sits after main
+                }
+                p = after;
+                n++;
+            }
+        }
+    }
+    char *b = strstr(buf, blk);
+    if (b) {
+        char *l = b;
+        while (l > buf && l[-1] != '\n') l--;
+        if (strncmp(l, "layout(std430", 13) != 0) return n;
+        b = l;
+        char *e = strstr(b, "};");
+        if (!e || !klfb_splice(buf, cap, b, (size_t)(e + 2 - b), uni)) return n;
+        n++;
+    }
+    return n;
+}
+// ...and the same shaders' last step: the colour is looked up in _GradingLut, a
+// 3D colour-grading table the post-processing stack fills with a compute kernel
+// (BlendLUTs). This ES 3.0 context has no compute stage (glCreateShader(COMPUTE)
+// is 0), the table stays black, and so did every graded surface — the level
+// black, its particles alone in colour (2026-10-28). The lookup becomes the
+// identity, `vec4(coordinate, 1.0)`: the shader takes the square root before
+// it and squares after, so the colour comes out as it went in, without the
+// game's grading. KL_GLFB_NO_GRADING_LUT (default for x3231001163584154).
+static int klfb_no_grading_lut_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_GLFB_NO_GRADING_LUT", t && strcmp(t, "x3231001163584154") == 0);
+    }
+    return on;
+}
+static int klfb_rewrite_grading_lut(char *buf, size_t cap) {
+    static const char *const calls[] = { "textureLod(_GradingLut, ", "texture(_GradingLut, " };
+    int n = 0;
+    for (int c = 0; c < 2; c++) {
+        for (char *p = buf; (p = strstr(p, calls[c])); ) {
+            char *a = p + strlen(calls[c]), *e = a;
+            int depth = 0;
+            for (; *e; e++) {
+                if (*e == '(' || *e == '[') depth++;
+                else if ((*e == ')' || *e == ']') && depth) depth--;
+                else if ((*e == ',' || *e == ')') && !depth) break;
+            }
+            if (!*e || e == a) return n;
+            char *close = e;                       // the call's own ')', past a lod argument
+            if (*close == ',') {
+                depth = 0;
+                for (close++; *close; close++) {
+                    if (*close == '(' || *close == '[') depth++;
+                    else if ((*close == ')' || *close == ']') && depth) depth--;
+                    else if (*close == ')' && !depth) break;
+                }
+                if (!*close) return n;
+            }
+            char ins[256];
+            if (snprintf(ins, sizeof ins, "vec4(%.*s, 1.0)", (int)(e - a), a) >= (int)sizeof ins) return n;
+            char *after = klfb_splice(buf, cap, p, (size_t)(close + 1 - p), ins);
+            if (!after) return n;
+            p = after;
+            n++;
+        }
+    }
+    return n;
+}
 // bitfieldExtract is ES 3.1 as well, and the same title's soil shaders unpack
 // bytes with it ("'bitfieldExtract' : no matching overloaded function found").
 // Every call becomes kl_bfe, defined just ahead of main for the scalar types
@@ -3126,6 +3271,22 @@ static void klfb_ShaderSource(uint32_t shader, int32_t count,
                         fprintf(stderr, "  [glfb] shader %u: %d read-only storage buffer(s) read as "
                                         "textures, %d bitfieldExtract call(s) replaced\n", shader, nsb, nbf); }
                 }
+            }
+            if (klfb_probe_cube_array_on() && klfb_rewrite_probe_cube_array(buf, cap) > 0) {
+                off = strlen(buf);
+                dbg_modified = 1;
+                static int said;
+                if (said < 4) { said++;
+                    fprintf(stderr, "  [glfb] shader %u: BLAST reflection probes read as ambient light "
+                                    "(cube-map array and storage buffer, KL_GLFB_PROBE_CUBE_ARRAY)\n", shader); }
+            }
+            if (klfb_no_grading_lut_on() && klfb_rewrite_grading_lut(buf, cap) > 0) {
+                off = strlen(buf);
+                dbg_modified = 1;
+                static int said;
+                if (said < 4) { said++;
+                    fprintf(stderr, "  [glfb] shader %u: _GradingLut read as the identity "
+                                    "(no compute stage to fill it, KL_GLFB_NO_GRADING_LUT)\n", shader); }
             }
             char *rewritten = klfb_rewrite_glsl(buf, cap, shader);
             int stored = 0;
@@ -9293,7 +9454,12 @@ static int klfb_cimg_on(void) {
                                                       strcmp(t, "x6963344583787383") == 0 ||
                                                       strcmp(t, "x3386618894743567") == 0 ||
                                                       strcmp(t, "x1906871599408213") == 0 ||
-                                                      strcmp(t, "x5190288877703616") == 0));
+                                                      strcmp(t, "x5190288877703616") == 0 ||
+                                                      // Warhammer 40,000: Battle Sister
+                                                      // (Unity) copies its level's textures
+                                                      // into 2D arrays while loading, and
+                                                      // its floors stayed black (2026-10-28).
+                                                      strcmp(t, "x3231001163584154") == 0));
         if (on) fprintf(stderr, "  [glfb] glCopyImageSubData emulated (compressed "
                                 "uploads shadowed on the CPU)\n");
     }
@@ -9488,7 +9654,11 @@ static void klfb_CopyImageSubData_impl(uint32_t src, uint32_t stgt, int32_t slev
         return;
     }
     if (sx < 0 || sy < 0 || dx < 0 || dy < 0 || w <= 0 || h <= 0) return;   // GL_INVALID_VALUE on a real driver
-    if (stgt != 0x0DE1 || dtgt != 0x0DE1 || sz || dz || d != 1 ||
+    // 2D and 2D-array slices both ways (a slice is a layer index in z); a
+    // compressed slice of an array source has no shadow and fails as before.
+    int sarr = stgt == 0x8C1A /* TEXTURE_2D_ARRAY */, darr = dtgt == 0x8C1A;
+    if ((stgt != 0x0DE1 && !sarr) || (dtgt != 0x0DE1 && !darr) ||
+        (sz && !sarr) || (dz && !darr) || sz < 0 || dz < 0 || d != 1 ||
         slevel < 0 || dlevel < 0 || slevel >= KLFB_CIMG_LEVELS ||
         dlevel >= KLFB_CIMG_LEVELS) {
         if (!passed++)
@@ -9501,6 +9671,8 @@ static void klfb_CopyImageSubData_impl(uint32_t src, uint32_t stgt, int32_t slev
     }
     copies++;
     uint32_t prev = klfb_bound_tex2d();
+    int32_t prev_arr = 0;
+    if (darr && a_glGetIntegerv) a_glGetIntegerv(0x8C1D /* TEXTURE_BINDING_2D_ARRAY */, &prev_arr);
     static void (*bind)(uint32_t, uint32_t);
     if (!bind) bind = asym("glBindTexture");
 
@@ -9508,7 +9680,7 @@ static void klfb_CopyImageSubData_impl(uint32_t src, uint32_t stgt, int32_t slev
     uint8_t *buf = NULL;
     uint32_t fmt = 0;
     pthread_mutex_lock(&g_cimg_lock);
-    klfb_cimg **s = klfb_cimg_slot(src, 0);
+    klfb_cimg **s = sarr ? NULL : klfb_cimg_slot(src, 0);
     if (s && (*s)->lv[slevel]) {
         int bw, bh, bpb, bx = 0;
         klfb_cimg *e = *s;
@@ -9523,7 +9695,7 @@ static void klfb_CopyImageSubData_impl(uint32_t src, uint32_t stgt, int32_t slev
                     memcpy(buf + (size_t)r * rw * bpb,
                            e->lv[slevel] + ((size_t)(y0 + r) * bx + x0) * bpb,
                            (size_t)rw * bpb);
-            if (buf) {
+            if (buf && !darr) {
                 klfb_cimg **ds = klfb_cimg_slot(dst, 0);
                 if (ds && (*ds)->fmt == fmt && dlevel < (*ds)->levels)
                     klfb_cimg_put(*ds, dlevel, dx, dy, w, h, buf);
@@ -9540,14 +9712,17 @@ static void klfb_CopyImageSubData_impl(uint32_t src, uint32_t stgt, int32_t slev
         if (!bindbuf) bindbuf = asym("glBindBuffer");
         if (a_glGetIntegerv) a_glGetIntegerv(0x88EF, &pbo);
         if (pbo && bindbuf) bindbuf(0x88EC, 0);
-        if (bind) bind(0x0DE1, dst);
-        if (g_real_CompressedTexSubImage2D) {
+        if (bind) bind(dtgt, dst);
+        if (darr ? g_real_CompressedTexSubImage3D != NULL : g_real_CompressedTexSubImage2D != NULL) {
             const void *src = buf;
             void *padded = klfb_sim_pad_compressed(fmt, w, h, bytes, &src);
-            g_real_CompressedTexSubImage2D(0x0DE1, dlevel, dx, dy, w, h, fmt, bytes, src);
+            if (darr)
+                g_real_CompressedTexSubImage3D(dtgt, dlevel, dx, dy, dz, w, h, 1, fmt, bytes, src);
+            else
+                g_real_CompressedTexSubImage2D(0x0DE1, dlevel, dx, dy, w, h, fmt, bytes, src);
             free(padded);
         }
-        if (bind) bind(0x0DE1, prev);
+        if (bind) bind(dtgt, darr ? (uint32_t)prev_arr : prev);
         if (pbo && bindbuf) bindbuf(0x88EC, (uint32_t)pbo);
         free(buf);
         compressed++;
@@ -9561,21 +9736,28 @@ static void klfb_CopyImageSubData_impl(uint32_t src, uint32_t stgt, int32_t slev
         static void (*fbtex)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
         static void (*copysub)(uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
                                int32_t, int32_t);
+        static void (*fblayer)(uint32_t, uint32_t, uint32_t, int32_t, int32_t);
+        static void (*copysub3)(uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
+                                int32_t, int32_t, int32_t);
         if (!genfb) {
             genfb = asym("glGenFramebuffers"); delfb = asym("glDeleteFramebuffers");
             bindfb = asym("glBindFramebuffer"); fbtex = asym("glFramebufferTexture2D");
             copysub = asym("glCopyTexSubImage2D");
+            fblayer = asym("glFramebufferTextureLayer"); copysub3 = asym("glCopyTexSubImage3D");
         }
-        if (genfb && delfb && bindfb && fbtex && copysub && bind) {
+        if (genfb && delfb && bindfb && fbtex && copysub && bind &&
+            (!sarr || fblayer) && (!darr || copysub3)) {
             int32_t rfb = 0;
             if (a_glGetIntegerv) a_glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &rfb);
             uint32_t fb = 0;
             genfb(1, &fb);
             bindfb(0x8CA8 /* READ_FRAMEBUFFER */, fb);
-            fbtex(0x8CA8, 0x8CE0 /* COLOR_ATTACHMENT0 */, 0x0DE1, src, slevel);
-            bind(0x0DE1, dst);
-            copysub(0x0DE1, dlevel, dx, dy, sx, sy, w, h);
-            bind(0x0DE1, prev);
+            if (sarr) fblayer(0x8CA8, 0x8CE0 /* COLOR_ATTACHMENT0 */, src, slevel, sz);
+            else      fbtex(0x8CA8, 0x8CE0 /* COLOR_ATTACHMENT0 */, 0x0DE1, src, slevel);
+            bind(dtgt, dst);
+            if (darr) copysub3(dtgt, dlevel, dx, dy, dz, sx, sy, w, h);
+            else      copysub(0x0DE1, dlevel, dx, dy, sx, sy, w, h);
+            bind(dtgt, darr ? (uint32_t)prev_arr : prev);
             bindfb(0x8CA8, (uint32_t)rfb);
             delfb(1, &fb);
             viafbo++;

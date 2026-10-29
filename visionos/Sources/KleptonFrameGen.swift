@@ -25,7 +25,7 @@ import simd
 
 final class KLFrameGen {
     let device: MTLDevice
-    private let luma, down, search, median, warp, turn: MTLComputePipelineState
+    private let luma, down, search, median, warp, turn, mvfield, mvwritten: MTLComputePipelineState
     private var cache: [String: MTLTexture] = [:]
     /// Pyramid levels below full size. 3 = the coarsest search runs at 1/8.
     static let levels = 3
@@ -46,6 +46,14 @@ final class KLFrameGen {
     /// own error, not something moving. Without it a picture that only turned came out worse
     /// than the timewarped repeat (Beat Saber's menu, 2026-10-28).
     static var minMotion: Float = 1.5
+    /// The same for a field from the game's own vectors (motionField). At 1.5 most of a slowly turning
+    /// head's motion – a pixel or two a frame – was dropped (Assassin's Creed Nexus on the Mac, before
+    /// the turn was taken out). With the turn out, what still stands is left with 0.3–0.6 px of the
+    /// turn's own inexactness, and at 0.25 that sent most of the picture down the expensive path for an
+    /// in-between moved by a sixth of a pixel: 0.75 leaves 96 % of Nexus's Animus still instead of 69 %,
+    /// 1.05 instead of 1.57 ms an eye at 2880x2400 on an M4 (2026-10-29); on the headset's 5184x3286
+    /// eyes the composite had taken 16 of a 10 ms display frame.
+    static var gameMinMotion: Float = 0.75
 
     init(device: MTLDevice) throws {
         self.device = device
@@ -55,6 +63,8 @@ final class KLFrameGen {
         }
         luma = try pipe("fg_luma"); down = try pipe("fg_down"); search = try pipe("fg_search")
         median = try pipe("fg_median"); warp = try pipe("fg_warp"); turn = try pipe("fg_turn")
+        mvfield = try pipe("fg_mvfield")
+        mvwritten = try pipe("fg_mvwritten")
     }
 
     private func texture(_ key: String, _ w: Int, _ h: Int, _ format: MTLPixelFormat) -> MTLTexture {
@@ -196,22 +206,85 @@ final class KLFrameGen {
         }
         // The field is per block of the finest level searched, in that level's pixels.
         // The search already took the turn out (above): the field is only what moved besides it.
-        var wp = SIMD4<Float>(phase, Float(Self.block << f), Float(1 << f), 0)
-        var minMove = Self.minMotion
-        var rr = warpRect ?? newer.rect
+        warpPass(enc, field: prior!, cell: SIMD2(repeating: Float(Self.block << f)), scale: Float(1 << f), minMove: Self.minMotion, phase: phase,
+                 rect: warpRect ?? newer.rect, rotation: rotation, screenRateMap: screenRateMap, rateLayer: rateLayer,
+                 newerColor: newerColor, olderColor: olderColor, into: out)
+        enc.endEncoding()
+    }
+
+    /// The picture `phase` of a game frame after the newest from a field the game gave (motionField)
+    /// instead of one searched: no pyramid, no search, only the warp. `screenRateMap` as in `generate`
+    /// – the game's vectors are in the picture's screen pixels.
+    /// `shownColumns`: the columns of `warpRect` anyone will see (from, to); the others are not written.
+    func generate(field: MTLTexture, cell: SIMD2<Float>, newerColor: MTLTexture, phase: Float, warpRect: SIMD4<Int32>,
+                  shownColumns: SIMD2<Float>? = nil,
+                  screenRateMap: MTLBuffer? = nil, rateLayer: Int = 0, olderColor: MTLTexture? = nil,
+                  into out: MTLTexture, commandBuffer cb: MTLCommandBuffer) {
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        warpPass(enc, field: field, cell: cell, scale: 1, minMove: Self.gameMinMotion, phase: phase, rect: warpRect, rotation: nil,
+                 screenRateMap: screenRateMap, rateLayer: rateLayer, newerColor: newerColor, olderColor: olderColor, into: out,
+                 shownColumns: shownColumns)
+        enc.endEncoding()
+    }
+
+    /// The field from the game's own motion vectors (XR_FB_space_warp) rather than a search: one vector
+    /// per motion-vector texel, in pixels of the picture, the head's turn taken out as the search does.
+    /// `motion` (a 2D texture or one slice of one) holds in `mvRect` how what is at each texel moved since
+    /// the previous frame, as the game states it; `toPixels` turns its x and y into pixels of the picture
+    /// (new place minus old), `cell` is how many picture pixels one texel covers across and down – not
+    /// always the same: Assassin's Creed Nexus has 960x771 of them for a 4800x3081 eye. `rotation` maps a
+    /// picture pixel of the newer frame to where the same direction lay in the older one (rotationMap);
+    /// nil when the game's vectors leave the head's turn out already.
+    func motionField(from motion: MTLTexture, mvRect: SIMD4<Int32>, toPixels: SIMD2<Float>, cell: SIMD2<Float>,
+                     rotation: simd_float3x3?, key: String, commandBuffer cb: MTLCommandBuffer) -> MTLTexture? {
+        guard mvRect.z > 0, mvRect.w > 0, let enc = cb.makeComputeCommandEncoder() else { return nil }
+        let field = texture("mv.\(key)", Int(mvRect.z), Int(mvRect.w), .rg16Float)
+        var r = mvRect
+        var k = SIMD4<Float>(toPixels.x, toPixels.y, cell.x, rotation == nil ? 0 : cell.y)
+        var rot = rotation ?? matrix_identity_float3x3
+        var minMove = Self.gameMinMotion
+        enc.setTexture(motion, index: 0); enc.setTexture(field, index: 1)
+        enc.setBytes(&r, length: 16, index: 0); enc.setBytes(&k, length: 16, index: 1)
+        enc.setBytes(&rot, length: MemoryLayout<simd_float3x3>.stride, index: 2)
+        enc.setBytes(&minMove, length: 4, index: 3)
+        dispatch(enc, mvfield, Int(mvRect.z), Int(mvRect.w))
+        enc.endEncoding()
+        return field
+    }
+
+    /// Whether the game drew into `motion` at all: every 8th texel looked at, those not (0,0,0,0) counted
+    /// into `count` (a shared 4-byte buffer the caller has zeroed). An OVRPlugin game that asks for the
+    /// space-warp images but never turns Application SpaceWarp on leaves them untouched – PowerWash
+    /// Simulator VR on the Mac, head turning – where one that draws clears them to alpha 1 (Assassin's
+    /// Creed Nexus, LEGO Bricktales). Not for OpenXR's: HITMAN 3 writes its vectors with alpha 0.
+    func countWritten(_ motion: MTLTexture, into count: MTLBuffer, commandBuffer cb: MTLCommandBuffer) {
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setTexture(motion, index: 0); enc.setBuffer(count, offset: 0, index: 0)
+        dispatch(enc, mvwritten, (motion.width + 7) / 8, (motion.height + 7) / 8)
+        enc.endEncoding()
+    }
+
+    private func warpPass(_ enc: MTLComputeCommandEncoder, field: MTLTexture, cell: SIMD2<Float>, scale: Float, minMove: Float,
+                          phase: Float, rect: SIMD4<Int32>, rotation: simd_float3x3?, screenRateMap: MTLBuffer?, rateLayer: Int,
+                          newerColor: MTLTexture, olderColor: MTLTexture?, into out: MTLTexture,
+                          shownColumns: SIMD2<Float>? = nil) {
+        var wp = SIMD4<Float>(phase, cell.x, scale, 0)
+        var cells = SIMD4<Float>(cell.x, cell.y, shownColumns?.x ?? 0, shownColumns?.y ?? 0)
+        var minMove = minMove
+        var rr = rect
         var rot = rotation ?? matrix_identity_float3x3
         // `olderColor` (between two pictures only): `older`'s own colours, laid out as `newerColor`.
         let useOld = olderColor != nil && phase < 0
         var wm = SIMD4<Int32>(screenRateMap == nil ? 0 : 1, Int32(rateLayer), useOld ? 1 : 0, 0)
-        enc.setTexture(newerColor, index: 0); enc.setTexture(prior!, index: 1); enc.setTexture(out, index: 2)
+        enc.setTexture(newerColor, index: 0); enc.setTexture(field, index: 1); enc.setTexture(out, index: 2)
         enc.setTexture(useOld ? olderColor : newerColor, index: 3)
         enc.setBytes(&wp, length: 16, index: 0); enc.setBytes(&rr, length: 16, index: 1)
         enc.setBytes(&rot, length: MemoryLayout<simd_float3x3>.stride, index: 2)
         enc.setBytes(&minMove, length: 4, index: 3)
         if let screenRateMap { enc.setBuffer(screenRateMap, offset: 0, index: 4) } else { enc.setBytes(&wm, length: 16, index: 4) }
         enc.setBytes(&wm, length: 16, index: 5)
+        enc.setBytes(&cells, length: 16, index: 6)
         dispatch(enc, warp, Int(rr.z), Int(rr.w))
-        enc.endEncoding()
     }
 
     /// `source` as seen after the head turned: each output pixel takes the source at `rotation`
@@ -396,9 +469,40 @@ final class KLFrameGen {
         dst.write(half4(half(xs[4]), half(ys[4]), 0, 0), g);
     }
 
+    // The field from the game's motion vectors (motionField): per texel of mv's rect, its x and y in
+    // picture pixels (k.xy), less what the head's turn explains (k.w != 0; rot maps a pixel of the newer
+    // picture to the older one), at the texel's centre, a texel k.z picture pixels wide and k.w high.
+    kernel void fg_mvwritten(texture2d<float, access::read> mv [[texture(0)]], device atomic_uint *n [[buffer(0)]],
+                             uint2 g [[thread_position_in_grid]]) {
+        uint2 p = g * 8;
+        if (p.x >= mv.get_width() || p.y >= mv.get_height()) return;
+        if (any(mv.read(p) != 0)) atomic_fetch_add_explicit(n, 1, memory_order_relaxed);
+    }
+
+    kernel void fg_mvfield(texture2d<float, access::read> mv [[texture(0)]],
+                           texture2d<half, access::write> field [[texture(1)]],
+                           constant int4 &r [[buffer(0)]], constant float4 &k [[buffer(1)]],
+                           constant float3x3 &rot [[buffer(2)]], constant float &minMove [[buffer(3)]],
+                           uint2 g [[thread_position_in_grid]]) {
+        if (int(g.x) >= r.z || int(g.y) >= r.w) return;
+        float2 raw = mv.read(uint2(int2(g) + r.xy)).xy;
+        // Exactly zero: nothing was drawn into the vectors here – Assassin's Creed Nexus's sky and fog, a
+        // third of its picture. That moves with the head alone, which the timewarp does; taking the turn
+        // out of a zero pushed the sky back by half a turn in every in-between (headset, 2026-10-29).
+        if (all(raw == 0)) { field.write(half4(0), g); return; }
+        float2 v = raw * k.xy;
+        if (k.w != 0) {
+            float2 P = (float2(g) + 0.5) * k.zw;
+            float3 h = rot * float3(P, 1.0);
+            v -= P - h.xy / h.z;
+        }
+        if (!all(isfinite(v)) || length(v) < minMove) v = 0;
+        field.write(half4(half2(v), 0, 0), g);
+    }
+
     // The field at a position (full-size pixels; screen pixels with a map), read bilinearly between
     // block centres, in full-size pixels.
-    static float2 fg_field_at(texture2d<half, access::read> field, float2 pos, float B, float scale) {
+    static float2 fg_field_at(texture2d<half, access::read> field, float2 pos, float2 B, float scale) {
         float2 fp = pos / B - 0.5;
         int2 m = int2(field.get_width() - 1, field.get_height() - 1);
         int2 f0 = clamp(int2(floor(fp)), int2(0), m), f1 = clamp(f0 + 1, int2(0), m);
@@ -440,9 +544,12 @@ final class KLFrameGen {
                         constant float3x3 &rot [[buffer(2)]], constant float &minMove [[buffer(3)]],
                         constant rasterization_rate_map_data *rmd [[buffer(4)]],
                         constant int4 &wm [[buffer(5)]],
+                        constant float4 &cells [[buffer(6)]],
                         uint2 g [[thread_position_in_grid]]) {
         if (int(g.x) >= r.z || int(g.y) >= r.w) return;
-        float B = p.y;
+        // cells.zw: the columns of the rectangle that are shown (zw = 0: all); the rest is left unwritten.
+        if (cells.w > 0 && (float(g.x) < cells.z || float(g.x) >= cells.w)) return;
+        float2 B = cells.xy;
         // wm.x != 0: this pixel is a physical one of a rate map whose screen the field was found in.
         float2 here = float2(g) + 0.5;
         float2 scr = here;

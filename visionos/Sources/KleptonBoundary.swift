@@ -53,6 +53,12 @@ final class KLBoundary {
     private var watching = false
     private var lastNear: Float = 0
     private var lastShowsRoom = false
+    // Every known room visionOS has placed, by id, with its distance field once
+    // asked for (under lock), and where the head last was in ARKit's frame.
+    private var placed: [UUID: (room: KLRoomRecord, rawFromRoom: simd_float4x4)] = [:]
+    private var sdfOf: [UUID: [Float]] = [:]
+    private var lastHead: SIMD3<Float>?
+    private var nextRoomCheck = 0
 
     /// nil where there is nothing to show: the switch is off, the setting is
     /// off, or no room has been measured.
@@ -151,22 +157,74 @@ final class KLBoundary {
             NSLog("[room] play area: the room's anchor is %.2f m above this space's floor — put on the floor", m.columns.3.y)
         }
         m.columns.3.y = 0
-        handRoomToGame(room, rawFromRoom: m)
-        if var cur = current, cur.room.id == roomID {
-            cur.rawFromRoom = m
-            lock.lock(); active = cur; lock.unlock()
+        // Several measured rooms each get their anchor back, and every one of them
+        // used to be made the play area and handed to the game in turn — the last
+        // to be updated won, whether or not the player stood in it. Spatial Zombies
+        // (2026-10-28) was given the room next door, 4 m away, and played its
+        // whole round outside it. A room becomes the play area when there is none
+        // yet or when the head is in it and not in the current one; the others
+        // are kept, so the head walking into one finds it (roomCheck).
+        lock.lock()
+        placed[roomID] = (room, m)
+        let head = lastHead
+        lock.unlock()
+        if let cur = current, cur.room.id == roomID {
+            handRoomToGame(room, rawFromRoom: m)
+            var c = cur
+            c.rawFromRoom = m
+            lock.lock(); if active?.room.id == roomID { active = c }; lock.unlock()
             return
         }
+        if let cur = current {
+            guard let head, contains(room, m, head), !contains(cur.room, cur.rawFromRoom, head) else { return }
+        }
+        activate(room, m)
+    }
+
+    /// Is the head (ARKit's frame) inside this room's play area?
+    private func contains(_ room: KLRoomRecord, _ rawFromRoom: simd_float4x4, _ head: SIMD3<Float>) -> Bool {
+        lock.lock(); var sdf = sdfOf[room.id]; lock.unlock()
+        if sdf == nil {
+            let mask = room.playMask()
+            var f = [Float](repeating: 0, count: mask.count)
+            mask.withUnsafeBufferPointer { m in f.withUnsafeMutableBufferPointer { o in kl_room_sdf(room.grid, m.baseAddress, o.baseAddress) } }
+            lock.lock(); sdfOf[room.id] = f; lock.unlock()
+            sdf = f
+        }
+        let r = rawFromRoom.inverse * SIMD4<Float>(head, 1)
+        return sdf!.withUnsafeBufferPointer { kl_room_sdf_at(room.grid, $0.baseAddress, r.x, r.z) } > 0
+    }
+
+    private func activate(_ room: KLRoomRecord, _ m: simd_float4x4) {
+        handRoomToGame(room, rawFromRoom: m)
         let mask = room.playMask()
         var sdf = [Float](repeating: 0, count: mask.count)
         mask.withUnsafeBufferPointer { m in sdf.withUnsafeMutableBufferPointer { s in kl_room_sdf(room.grid, m.baseAddress, s.baseAddress) } }
         let (buf, count) = makeWalls(room, mask: mask)
         lock.lock()
         active = Active(room: room, rawFromRoom: m, sdf: sdf, wallVerts: buf, wallCount: count)
+        sdfOf[room.id] = sdf
         lock.unlock()
-        NSLog("[room] play area: in room %@ (%.1f m², %d wall vertices)", roomID.uuidString, room.areaM2, count)
+        NSLog("[room] play area: in room %@ (%.1f m², %d wall vertices)", room.id.uuidString, room.areaM2, count)
         let ext = room.playExtent
         kl_ovrp_set_play_area(ext.width, ext.depth)
+    }
+
+    /// About twice a second: the head left the play area for another placed room
+    /// it stands in — that room is the play area now, and the game's room.
+    private func roomCheck(_ head: SIMD3<Float>, _ a: Active) {
+        lock.lock()
+        lastHead = head
+        nextRoomCheck -= 1
+        let due = nextRoomCheck <= 0
+        if due { nextRoomCheck = 45 }
+        let others = placed.values.filter { $0.room.id != a.room.id }
+        lock.unlock()
+        guard due, !stationary, !others.isEmpty, !contains(a.room, a.rawFromRoom, head) else { return }
+        if let o = others.first(where: { contains($0.room, $0.rawFromRoom, head) }) {
+            NSLog("[room] play area: the head is in room %@, not in %@ — switching", o.room.id.uuidString, a.room.id.uuidString)
+            activate(o.room, o.rawFromRoom)
+        }
     }
 
     /// The measured room for a game that asks for one (kl_ovrp's emulated room —
@@ -316,6 +374,7 @@ final class KLBoundary {
                 gameShowsRoom: Bool, depthState: MTLDepthStencilState?) {
         lock.lock(); let a = active; lock.unlock()
         guard let a, !views.isEmpty else { return }
+        if let head = points.first { roomCheck(head, a) }
         if gameShowsRoom {
             if !lastShowsRoom { NSLog("[room] play area: the game shows the room (passthrough) — no wall, no fade") }
             lastShowsRoom = true

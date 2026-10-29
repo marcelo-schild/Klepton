@@ -318,6 +318,7 @@ final class KleptonRendering: ObservableObject {
             || t == "x8387152738076399"
             || t == "x6521909757843713"     // LEGO Bricktales: its AR mode (2026-10-17)
             || t == "x2718606324833775"     // Angry Birds VR: its mixed reality mode (2026-10-18)
+            || t == "x24151641901194680"    // Spatial Zombies: mixed reality only (2026-10-28)
             || klEnvOn("KL_OVRP_PASSTHROUGH", default: false)
     }()
     @Published var maxRate: Int {
@@ -1632,6 +1633,28 @@ enum KleptonFrameGen {
     }
     static var isOn: Bool { mode != .off }
     static var interp: Bool { mode == .between }
+
+    /// KL_FRAMEGEN_MV=0: search the motion even where the game hands its own vectors over
+    /// (XR_FB_space_warp, HITMAN 3 VR: Reloaded). Default on: the game knows how every pixel moved,
+    /// thin and fast things included, and a picture costs no pyramid and no search.
+    static let gameVectors = klEnvOn("KL_FRAMEGEN_MV", default: true)
+    /// How the game's vectors become pixels of a picture whose row 0 is the top (new place minus old):
+    /// their x and y times the picture's width and height times these. They are the change of the
+    /// normalised device position, −1…1 across with y UP: measured on HITMAN 3 VR: Reloaded's own
+    /// frames on the Mac (2026-10-28) – a frame moved by its vectors matched the next one best at
+    /// exactly (0.5, −0.5): luma error 0.0017 against 0.0202 unmoved, 0.0106 with y the other way.
+    /// KL_FRAMEGEN_MV_SCALE="x,y" for the lab.
+    static let gameVectorScale: SIMD2<Float> = {
+        if let e = getenv("KL_FRAMEGEN_MV_SCALE") {
+            let v = String(cString: e).split(separator: ",").compactMap { Float($0) }
+            if v.count == 2 { return SIMD2(v[0], v[1]) }
+        }
+        return SIMD2(0.5, -0.5)
+    }()
+    /// Whether the game's vectors include what the head's turn moved – they do: the whole picture moved
+    /// by them on a Mac run whose head turned and nothing else did (HITMAN, 2026-10-28). That part is
+    /// taken out, as from a searched field: the timewarp does it. KL_FRAMEGEN_MV_HEAD=0 keeps it.
+    static let gameVectorsHaveHead = klEnvOn("KL_FRAMEGEN_MV_HEAD", default: true)
 
     /// A tap of Create + Options: off → ahead → between → off.
     static func cycle() {

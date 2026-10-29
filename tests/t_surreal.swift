@@ -51,7 +51,13 @@ struct SurrealTests {
             let st = SurrealWire.buttons(buttonPacket(flags: 15, trigger: 127, grip: 255), hand: hand, settings: settings)!
             // Literal Oculus RAW masks, deliberately independent of the implementation constants.
             expect(st.buttons == (hand == .left ? 0x30100700 : 0x0C200007), "Oculus raw masks for faces, menu, stick, trigger, grip")
-            expect(st.touches == 0, "No invented touch sensor state")
+            expect(st.touches == (hand == .left ? 0x700 : 0x7), "Pressed faces and stick are touched; menu and grip are not")
+            let idle = SurrealWire.buttons(buttonPacket(trigger: 127, grip: 255), hand: hand, settings: settings)!
+            expect(idle.touches == 0, "No invented touch without a press or a push")
+            let pushed = SurrealWire.buttons(buttonPacket(y: 255), hand: hand, settings: settings)!
+            expect(pushed.touches == (hand == .left ? 0x400 : 0x4), "A pushed stick is touched (Alyx teleport: dpad sub_mode touch)")
+            let resting = SurrealWire.buttons(buttonPacket(x: 133, y: 124), hand: hand, settings: settings)!
+            expect(resting.touches == 0, "A stick inside the dead zone is not touched")
             near(st.indexTrigger, 1, "Trigger full scale"); near(st.handTrigger, 1, "Grip clamps")
         }
         let half = SurrealWire.buttons(buttonPacket(trigger: 64, grip: 32), hand: .left, settings: settings)!
@@ -97,6 +103,11 @@ struct SurrealTests {
         let stale = cache.sample(reference: nil, at: 11, now: 11, settings: settings, alignmentTarget: forward)
         expect(stale.buttons == 0 && stale.indexTrigger == 0 && stale.handTrigger == 0 && stale.stick == .zero, "Lost tracking releases every input")
         expect(cache.registration == nil, "Stale tracking requires calibration")
+        // Grip still held, no new input packet: the stream resumes and the grip is still down.
+        cache.receivePose(posePacket(ticks: 2_000_000_000), at: 11.0)
+        let resumed = cache.sample(reference: reference, at: 11.0, now: 11.0, settings: settings, alignmentTarget: forward)
+        expect(resumed.buttons & 0x100 != 0 && resumed.handTrigger > 0.55,
+               "A button held through a pose gap is still held when the stream resumes")
         cache.disconnect()
         let disconnected = cache.sample(reference: reference, at: 12, now: 12, settings: settings, alignmentTarget: forward)
         expect(disconnected.buttons == 0 && disconnected.position == [0, -10, 0], "Disconnect parks unused hand; never injects hand pinch")
@@ -107,6 +118,7 @@ struct SurrealTests {
         expect(pulse == [0x18, 10, 0, 0x34, 0x12, 0x88, 0x13, 170, 0, 100, 0, 0, 0], "Haptic wire format and units")
         let badPulse = SurrealWire.vibration(sequence: 0, amplitude: .nan, duration: .infinity)
         expect(badPulse.count == 13, "Invalid haptic values do not trap")
+        testResetGesture()
         expect(Array(SurrealWire.tlv(type: SurrealWire.modeRequest, sequence: 0)) == [0x0D, 2, 0, 0, 0], "Mode request wire format")
         expect(Array(SurrealWire.tlv(type: SurrealWire.modeSet, sequence: 0x0201, data: [SurrealWire.controllerMode]))
                == [0x0C, 3, 0, 0x01, 0x02, 0x00], "Set controller mode wire format")
@@ -178,7 +190,9 @@ struct SurrealTests {
         let stale = cache.sample(reference: reference, at: 20.4, now: 20.4, settings: settings, alignmentTarget: forward)
         expect(stale.position == [0, -10, 0] && stale.buttons == 0 && stale.handTrigger == 0,
                "A visible hand cannot keep a stale BLE controller active")
-        expect(cache.registration == nil && !cache.hasInput, "BLE timeout clears hybrid calibration and inputs")
+        expect(cache.registration == nil, "BLE timeout clears hybrid calibration")
+        expect(cache.hasInput && cache.input.handTrigger == 1,
+               "BLE timeout keeps the button snapshot; input is only notified on change")
         cache.disconnect()
         expect(cache.sample(reference: reference, at: 20.5, now: 20.5, settings: settings, alignmentTarget: forward).position == [0, -10, 0],
                "A visible hand cannot replace a disconnected controller")
@@ -267,6 +281,37 @@ struct SurrealTests {
             expect(result.position == [1.1, 2, 3] && result.handTrigger == 1,
                    "Fixed rotation calibration preserves live hand position and physical grip")
         }
+    }
+
+    static func testResetGesture() {
+        // One squeeze = press then release; hands alternate 0.1 s apart.
+        func squeeze(_ g: inout SurrealResetGesture, _ hand: Int, at t: Double) -> Bool {
+            let fired = g.update(hand: hand, grip: 0.9, at: t)
+            _ = g.update(hand: hand, grip: 0.1, at: t + 0.05)
+            return fired
+        }
+        var g = SurrealResetGesture()
+        var fired = 0
+        for i in 0..<5 { for h in 0...1 { if squeeze(&g, h, at: Double(i) * 0.4 + Double(h) * 0.1) { fired += 1 } } }
+        expect(fired == 1, "Five squeezes on both controllers reset once")
+        var held = SurrealResetGesture()
+        var heldFired = false
+        for i in 0..<20 { heldFired = heldFired || held.update(hand: 0, grip: 0.9, at: Double(i) * 0.05)
+                                   || held.update(hand: 1, grip: 0.9, at: Double(i) * 0.05) }
+        expect(!heldFired, "A held grip is one squeeze, not five")
+        var oneHand = SurrealResetGesture()
+        var oneFired = false
+        for i in 0..<10 { oneFired = squeeze(&oneHand, 0, at: Double(i) * 0.2) || oneFired }
+        expect(!oneFired, "One controller alone does not reset")
+        var slow = SurrealResetGesture()
+        var slowFired = false
+        for i in 0..<5 { for h in 0...1 { slowFired = squeeze(&slow, h, at: Double(i) * 1.0 + Double(h) * 0.1) || slowFired } }
+        expect(!slowFired, "Squeezes spread over more than three seconds do not reset")
+        var light = SurrealResetGesture()
+        var lightFired = false
+        for i in 0..<5 { for h in 0...1 { lightFired = light.update(hand: h, grip: 0.4, at: Double(i) * 0.4) || lightFired
+                                          _ = light.update(hand: h, grip: 0.1, at: Double(i) * 0.4 + 0.05) } }
+        expect(!lightFired, "Light squeezes below the press threshold do not count")
     }
 
     static func testAimOffsets() {

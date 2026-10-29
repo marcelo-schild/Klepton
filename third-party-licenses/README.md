@@ -7,6 +7,7 @@ prebuilt third-party libraries:
 |---|---|---|---|
 | ANGLE (libEGL, libGLESv2), with the changes in `angle-patches/klepton.patch` | `vendor/out/xros`, `vendor/out/xrsim` | BSD-3-Clause | `ANGLE-LICENSE.txt` |
 | MoltenVK | `vendor-moltenvk/out` | Apache-2.0 | `MoltenVK-LICENSE.txt` |
+| Surreal Interactive's visionOS SDK (`surreal_interactive_openxr_framework`, github.com/surreal-interactive/SwiftSDKBinary at a42deb0), linked into Surreal Touch builds only | `visionos/Frameworks/surreal_interactive_openxr_framework.xcframework` (fetched by `tools/surreal_sdk_fetch.sh`) | Apache-2.0 | `SurrealInteractiveSDK-LICENSE.txt` |
 
 It also carries third-party source that is compiled with the runtime:
 

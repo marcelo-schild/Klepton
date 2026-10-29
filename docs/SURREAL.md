@@ -12,10 +12,12 @@ Inspected on 2026-10-14:
 | myMartek/Klepton, avp-play | `be35c2542b93766543218a876ab08e55bd45ef8b` (published source snapshot of toolchain 507) |
 | globo128/OpenSurreal | `f4dd94de16d1f628d901a6eea25cdaa4648b70fa` (reference only) |
 | shinyquagsire23/SurrealTouch_re | `0bba3170c189c318b373c130560d76090304ab60` (reference only; control message types, inspected 2026-10-23) |
+| surreal-interactive/SwiftSDKBinary | `a42deb007c7f12afb543b235b75464e86e00125a` (Apache-2.0; linked into Surreal builds, see below) |
+| surreal-interactive/SDK | Unity SDK, `Assets/SVR/Scripts/Core/SVRInputApi.cs` (Apache-2.0; the C API signatures, inspected 2026-10-28) |
 
 OpenSurreal has no LICENSE/COPYING file or express redistribution grant in this revision. Its source was inspected to establish its public APIs and interoperability facts, including UUIDs, packet layouts, handedness naming and coordinate conventions. **None of its implementation, UI, spatial session or package is copied, vendored, linked or downloaded by this build.** This is not a claim that the reference project is permissively licensed or that this was a clean-room process. Obtain an explicit license before replacing this backend with OpenSurreal or distributing any of that project's code. SurrealTouch_re likewise has no license file; only the control message type numbers and TLV header layout were taken from its notes, and none of its code is used.
 
-New implementation files follow this repository's MIT license. There is no new third-party runtime dependency. Apple CoreBluetooth, ARKit, QuartzCore and SwiftUI are SDK frameworks. Existing ANGLE/MoltenVK licensing remains in `third-party-licenses`; the validation build uses their prebuilt slices from AVP Play release v1.1.15, toolchain `507-1954ecf`, verified against the release sidecar SHA-256.
+New implementation files follow this repository's MIT license. The one third-party runtime dependency is Surreal Interactive's own SDK (Apache-2.0, `third-party-licenses/SurrealInteractiveSDK-LICENSE.txt`), in Surreal builds only. Apple CoreBluetooth, ARKit, QuartzCore and SwiftUI are SDK frameworks. Existing ANGLE/MoltenVK licensing remains in `third-party-licenses`; the validation build uses their prebuilt slices from AVP Play release v1.1.15, toolchain `507-1954ecf`, verified against the release sidecar SHA-256.
 
 ## Selection and precedence
 
@@ -26,9 +28,24 @@ New implementation files follow this repository's MIT license. There is no new t
 - Standard follows the original Sense/hand/gamepad code. Surreal bypasses Sense polling, gamepad polling, accessory-provider discovery and pinch events. A missing controller is released and parked out of view; the other remains usable.
 - Both routes use `submit(_:hand:)` and the existing `kl_ovrp_set_hand_motion` / `kl_ovrp_set_controller_input` seam. Game haptics are pulled from the same existing runtime queue.
 
+## Pose source: Surreal Interactive's SDK
+
+A Surreal build (`KLEPTON_CONTROLLER_MODE=surreal`) takes its controller poses, buttons and haptics from Surreal Interactive's own visionOS SDK (`KleptonSurrealSDK.swift`), not from the Bluetooth backend described below. A Standard build neither fetches nor links it, and in Standard mode nothing calls it.
+
+Why: the controllers track themselves, and their tracking frame drifts away from the headset's. With only the backend below, which can register a controller only from a still grip hold, the hands ended 15–45 cm off near the head and 20–30 cm off in fast swings on a Vision Pro (Half-Life: Alyx, 2026-10-28): ammo from the backpack failed more than half the time and throws went sideways. The SDK solves that alignment continuously — clock sync with the controllers, the latency between them and hand tracking, the controller-to-world and hand-to-controller transforms, whether a controller is held — and on the same hardware the hands stayed with the player's own.
+
+- **A build-time decision.** Building a game for Surreal Touch is the decision to use the SDK; nothing checks or switches at run time. `gen_xcodeproj.py` fetches it the first time a Surreal build does not have it (`tools/surreal_sdk_fetch.sh`, also `make surreal-sdk` to stage it ahead of time): Surreal's `SwiftSDKBinary` at a pinned commit, verified by SHA-256, into `visionos/Frameworks/` (gitignored). A Surreal build that cannot have it stops with the reason rather than quietly shipping the Bluetooth backend. `KLEPTON_SURREAL_SDK=0` is the one way to build Surreal without it, on purpose.
+- **How it is linked.** A static framework: linked, never embedded, with `-framework Accelerate` for its solver, and `KL_SURREAL_SDK` as the Swift condition that lets `KleptonSurrealSDK.swift` call it. Its OpenXR half is not used and not linked (nothing references it); `kl_surreal_sdk.h` declares the small C API the same archive exports, with the signatures of Surreal's Unity SDK.
+- **What it owns.** Its own CoreBluetooth central (it connects the controllers paired in Settings → Bluetooth) and its own ARKit hand-tracking session. `KleptonControllers` therefore disconnects `KleptonSurrealBackend` before starting it, and the launcher does not connect the backend at all in such a build: its Surreal panel says the controllers are connected and aligned by Surreal's software when the game starts, and keeps only the two button settings (analog full scale, invert stick Y), which the SDK's buttons go through as well. Hand tracking in `KleptonCompositor` keeps running alongside it.
+- **Per frame.** As Surreal's Unity integration does: `SVRPollDevicePose` at `SVRTimeNow()`, and each poll reported with `SVRRenderFinish` three frames later, which is how the SDK learns the render latency it predicts across. Buttons arrive through `SVRSetButtonCallback` and go through the same 13-byte decoding as the backend, so the Touch mapping, analog scale, dead zone and stick touch are identical.
+- **Three facts found on hardware.** The C API is the one Unity consumes, so its poses are left-handed with +Z forward; ARKit is right-handed with −Z forward, and z is mirrored (position and linear velocity negate z, orientation and angular velocity negate x and y). Until it has aligned a controller it answers position (100, 100, 100), which is treated as untracked. And `SVRStart` creates a new provider, so `SVRSetButtonCallback` must come after it — set before, no button ever arrives.
+- **The backend.** `KleptonSurrealBackend` stays for a Surreal build made with `KLEPTON_SURREAL_SDK=0`, and for a Standard build switched to Surreal on the headset, which has no SDK.
+
+Connection events go to `Documents/surreal-sdk.log`, written off the render thread.
+
 ## Pairing and calibration
 
-In the game launcher, open Settings → Controllers, select Surreal Touch, turn on the controllers and select Discover. Connect the explicitly identified left and right devices. Names without an unambiguous Surreal Touch L/R token are rejected rather than guessed. Pairing, connection, battery (optional SIG battery service), input values, recalibration and vibration controls live on Vision Pro.
+This section and the ones after it describe the Bluetooth backend (`KleptonSurrealBackend`), which a Surreal build uses only when built without the SDK. In the game launcher, open Settings → Controllers, select Surreal Touch, turn on the controllers and select Discover. Connect the explicitly identified left and right devices. Names without an unambiguous Surreal Touch L/R token are rejected rather than guessed. Pairing, connection, battery (optional SIG battery service), input values, recalibration and vibration controls live on Vision Pro.
 
 The last successful peripheral UUID for each hand is remembered locally. Reconnect retrieves those UUIDs without scanning. A lost link clears that hand immediately and retries on the BLE queue. Disconnect cancels retry for that hand. Bluetooth permission/power failures clear input and report status. There is no pairing on the Mac.
 
@@ -37,6 +54,8 @@ Subscribing alone does not start the input stream. Until it receives a control m
 Discover includes peripherals already connected by visionOS, because system-connected controllers may no longer advertise. A system Bluetooth connection alone is not enough: select the controller in this app so it can subscribe to pose and button notifications. Disconnect and Vibration test appear only for a ready controller; an in-progress connection has a separate Cancel connection action. Connection events and first packet lengths are written to the local `Documents/surreal-ble.log` (capped at 256 KiB per launch) for hardware diagnostics. Pose/button streams are not logged per frame, and this logging never runs on the render thread.
 
 After Start, hold each controller still with the corresponding hand visible and squeeze its grip. This explicitly registers the controller's native frame into the world. A reconnect, timestamp reset or stale/invalid pose requires calibration again. Initial calibration is intentionally not persisted across ARKit world origins or controller power cycles.
+
+To recalibrate without leaving the game, squeeze the grip five times on both controllers within three seconds. A squeeze is a press above 0.55 after a release below 0.35, so a held grip counts once and light touches do not count. Both controllers vibrate and the registration of both is discarded, as with **Reset forward alignment**; calibrate again as after Start. The game also receives those squeezes, so do it with empty hands. The gesture is traced to `surreal-ble.log`.
 
 `KleptonCompositor` remains the sole ARKit-session owner. Its existing predicted hand anchors are converted by the existing `gripPose` convention and supplied to the Surreal cache. No second HandTrackingProvider or WorldTrackingProvider is started. World registration is gently corrected while the grip is held and native speed is below 0.35 m/s and 1.5 rad/s. Fast motion and occluded hands use the controller's native pose relative to the last registration. Releasing the grip freezes registration, so an empty hand cannot drag a controller sitting nearby.
 
@@ -72,7 +91,7 @@ The interoperability reference describes a custom service `6E401001-B5A3-F393-E0
 | Left menu / right capture | raw Start `0x100000` / Back `0x200000` |
 | Trigger / grip | analog index / hand trigger; raw digital threshold 0.55 |
 | Sticks | center 128, signed normalization, radial 0.12 dead zone, unit-circle clamp, optional invert Y |
-| Capacitive touch | unavailable in the described input packet; zero, never fabricated |
+| Capacitive touch | unavailable in the described input packet; only touches the input proves are set — pressed face buttons and stick, and a stick pushed past the dead zone (Half-Life: Alyx's teleport is a SteamVR dpad with `sub_mode: touch`) |
 
 Buttons use a 13-byte packet (uint64 time, flags, trigger, grip, stick X/Y). Pose packets contain uint64 nanosecond time and 17 float32 values: position, xyzw quaternion, confidence, linear/angular velocity, acceleration. Invalid lengths, nonfinite numbers and degenerate quaternions are rejected. Z is reflected on position/linear vectors; X/Y are negated on quaternion imaginary components and angular velocity, preserving the axial-vector convention. Orientations are normalized.
 
@@ -84,7 +103,7 @@ Haptics encode the device's 13-byte command, with normalized amplitude mapped to
 
 CoreBluetooth owns a dedicated serial queue. The renderer reads a short lock-protected value cache; it never waits for BLE operations or dispatches synchronously to that queue. Packet parsing happens before taking the renderer's cache lock. Haptics use a replaceable pending slot rather than accumulating delayed work.
 
-A constant-memory lower-envelope estimator maps device nanosecond timestamps onto `CACurrentMediaTime`, with clock reset detection and a small clock-drift allowance. One-way BLE timing cannot determine absolute transport delay. Pose prediction uses world-aligned linear/angular velocities and the frame presentation timestamp, capped at 35 ms; it never extrapolates backward. Registration-frame translation/rotation rates are included in published velocities while correcting. Samples older than 250 ms release buttons and analogs and discard registration. Input snapshots are retained between change notifications while a valid pose stream is live.
+A constant-memory lower-envelope estimator maps device nanosecond timestamps onto `CACurrentMediaTime`, with clock reset detection and a small clock-drift allowance. One-way BLE timing cannot determine absolute transport delay. Pose prediction uses world-aligned linear/angular velocities and the frame presentation timestamp, capped at 35 ms; it never extrapolates backward. Registration-frame translation/rotation rates are included in published velocities while correcting. Samples older than 250 ms release buttons and analogs and discard registration. Input snapshots are retained between change notifications, including across a stale pose stream or clock reset, because a button held through the gap sends nothing new; only disconnect clears them. Pose gaps, clock resets, pose-confidence changes and grip press/release are traced to `surreal-ble.log` from the BLE queue.
 
 ## Build and validation
 

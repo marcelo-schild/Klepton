@@ -33,12 +33,22 @@ struct KleptonControllerSettingsView: View {
             .disabled(session.started || session.adjustingControllers)
             .onChange(of: mode) { _, value in
                 value.save()
-                backend.setEnabled(value == .surreal)
+                backend.setEnabled(value == .surreal && !KleptonSurrealSDK.enabled)
             }
             Text(klT("Choose before starting. To change after playing, quit and reopen this game. Your choice is kept for this game.",
                      "Vor dem Start wählen. Nach dem Spielen das Spiel beenden und erneut öffnen. Die Wahl wird für dieses Spiel gespeichert."))
                 .font(.callout).foregroundStyle(.secondary)
-            if mode == .surreal {
+            if mode == .surreal, KleptonSurrealSDK.enabled {
+                // KleptonSurrealSDK: nothing below this branch is used, but the button settings.
+                Text(klT("Surreal Interactive's own software connects the controllers when the game starts and aligns them by itself. They only need to be paired in Settings → Bluetooth and turned on; there is nothing to pair or calibrate here.",
+                         "Die Software von Surreal Interactive verbindet die Controller beim Spielstart und richtet sie selbst aus. Sie müssen nur in den Einstellungen unter Bluetooth gekoppelt und eingeschaltet sein; hier gibt es nichts zu koppeln oder zu kalibrieren."))
+                    .font(.callout).foregroundStyle(.secondary)
+                DisclosureGroup(klT("Advanced input settings", "Erweiterte Eingabeeinstellungen")) {
+                    VStack(alignment: .leading) { buttonSettings }
+                        .onChange(of: analogScale) { _, _ in applySettings() }
+                        .onChange(of: invertY) { _, _ in applySettings() }
+                }
+            } else if mode == .surreal {
                 Toggle(klT("Position from hand tracking", "Position aus Handtracking"), isOn: $positionFromHands)
                     .disabled(session.started || session.adjustingControllers)
                     .onChange(of: positionFromHands) { _, _ in applySettings() }
@@ -123,10 +133,7 @@ struct KleptonControllerSettingsView: View {
                     .font(.callout).foregroundStyle(.secondary)
                 DisclosureGroup(klT("Advanced input settings", "Erweiterte Eingabeeinstellungen")) {
                     VStack(alignment: .leading) {
-                        Picker(klT("Trigger / grip full scale", "Trigger-/Griff-Maximalwert"), selection: $analogScale) {
-                            Text("127").tag(127.0); Text("255").tag(255.0)
-                        }
-                        Toggle(klT("Invert stick Y", "Stick-Y umkehren"), isOn: $invertY)
+                        buttonSettings
                         if !positionFromHands {
                         Text(klT("Grip pitch: \(Int(gripPitch))°", "Griffneigung: \(Int(gripPitch))°"))
                         Slider(value: $gripPitch, in: -90...90, step: 1)
@@ -145,8 +152,17 @@ struct KleptonControllerSettingsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .onAppear {
             applySettings()
-            if !session.started { backend.setEnabled(mode == .surreal) }
+            // With Surreal Interactive's SDK the game connects the controllers itself; the
+            // launcher must not hold them first.
+            if !session.started { backend.setEnabled(mode == .surreal && !KleptonSurrealSDK.enabled) }
         }
+    }
+    /// The two settings that apply to the buttons whichever source reads them.
+    @ViewBuilder private var buttonSettings: some View {
+        Picker(klT("Trigger / grip full scale", "Trigger-/Griff-Maximalwert"), selection: $analogScale) {
+            Text("127").tag(127.0); Text("255").tag(255.0)
+        }
+        Toggle(klT("Invert stick Y", "Stick-Y umkehren"), isOn: $invertY)
     }
     private func applySettings() {
         backend.setSettings(.stored())

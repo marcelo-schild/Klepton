@@ -396,6 +396,19 @@ typedef struct { int32_t type; const void *next;
                  const XrCompositionLayerProjectionView *views;
                } XrCompositionLayerProjection;
 
+// XR_FB_space_warp's input, chained onto a projection view: where the game
+// drew this view's motion vectors and depth, and how its app space moved since
+// the previous frame. The motion vectors are an RGBA16F image (a quarter of the
+// eye, as recommended in klxr_fill_space_warp_props), the depth an ordinary
+// depth swapchain with the projection's near and far planes.
+typedef struct { int32_t type; const void *next;
+                 uint64_t layerFlags;
+                 XrSwapchainSubImage motionVectorSubImage;
+                 XrPosef appSpaceDeltaPose;
+                 XrSwapchainSubImage depthSubImage;
+                 float minDepth, maxDepth, nearZ, farZ;
+               } XrCompositionLayerSpaceWarpInfoFB;
+
 // A flat panel in space: one swapchain image, one pose, one size in metres.
 // `eyeVisibility` is BOTH(0) / LEFT(1) / RIGHT(2) — a guest showing different
 // pixels to each eye submits two of these rather than one with two views, which
@@ -1286,6 +1299,20 @@ static void klxr_note_frame_chains(const XrFrameEndInfo *info, uint64_t frame) {
         }
     }
     pthread_mutex_unlock(&g_frame_chain_mu);
+}
+
+// The XrCompositionLayerSpaceWarpInfoFB on a projection view's chain, copied
+// into `out`; 0 when there is none. Read the way klxr_note_chain_types reads
+// (vm_read_overwrite, at most 8 nodes): the chain is the guest's memory.
+static int klxr_space_warp_info(const void *next, XrCompositionLayerSpaceWarpInfoFB *out) {
+    for (int depth = 0; next && depth < 8; depth++) {
+        vm_size_t got = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)next, sizeof *out,
+                              (vm_address_t)out, &got) != KERN_SUCCESS || got != sizeof *out) return 0;
+        if (out->type == 1000171000) return 1;
+        next = out->next;
+    }
+    return 0;
 }
 
 // ...and the one chained struct that must NOT merely be logged. The guest asks
@@ -2688,17 +2715,20 @@ enum { KLXR_REF_SPACE_ANCHOR = 0x6b6c5000, KLXR_ANCHOR_MAX = 64 };
 // DreamSpace asked for it ~4000 times a run and never reached xrBeginSession: a
 // black picture with its music playing (2026-10-16). Fluid (x6946182742093178,
 // Unity OpenXR, api 1.1.54) did the same: ~6000 refusals, no xrBeginSession,
-// black (2026-10-21).
-//   KL_XR_LOCAL_FLOOR=0|1 — default 1 for DreamSpace (x9449316705178989) and
-//       Fluid (x6946182742093178), else 0: a guest that runs today keeps the
-//       reference spaces it was given.
+// black (2026-10-21). Spatial Zombies (x24151641901194680, Unity 6000.6 +
+// OpenXR, api 1.1.54) again: ~2400 refusals, no xrBeginSession, a black picture
+// with its music looping (2026-10-28).
+//   KL_XR_LOCAL_FLOOR=0|1 — default 1 for DreamSpace (x9449316705178989),
+//       Fluid (x6946182742093178) and Spatial Zombies (x24151641901194680),
+//       else 0: a guest that runs today keeps the reference spaces it was given.
 static int klxr_local_floor_on(void) {
     static int on = -1;
     if (on < 0) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
         on = kl_env_on("KL_XR_LOCAL_FLOOR", t && (!strcmp(t, "x9449316705178989") ||
-                                                  !strcmp(t, "x6946182742093178")));
+                                                  !strcmp(t, "x6946182742093178") ||
+                                                  !strcmp(t, "x24151641901194680")));
     }
     // Core from 1.1 on; before that it is an extension we do not advertise.
     uint64_t v = (uint64_t)g_instance.api_version;
@@ -6919,6 +6949,85 @@ static void klxr_defer_submit(const klxr_publication *pub) {
     if (pub->eye_layer) kl_interstitial_done();
 }
 
+// One projection view's XrCompositionLayerSpaceWarpInfoFB (moonshot s3-framegen:
+// frame generation from the game's own motion vectors). Named once per layer
+// and eye — sizes, formats, planes, the app-space delta — and, with
+// KL_XR_SPACEWARP_OUT=<dir>, the motion vectors and depth written raw every
+// KL_VK_OUT_EVERY-th frame (Mac lab; tools/framegen reads them).
+static void klxr_space_warp_seen(klxr_session *s, uint32_t li, uint32_t v,
+                                 const XrCompositionLayerSpaceWarpInfoFB *sw, kl_ovrp_proj_layer *pl) {
+    klxr_swapchain *mv = klxr_swapchain_of(sw->motionVectorSubImage.swapchain);
+    klxr_swapchain *dp = klxr_swapchain_of(sw->depthSubImage.swapchain);
+    // For the compositor's frame generation: the images this frame's views carry, beside the layer.
+    if (pl && v < 2 && mv && mv->last_released >= 0 && mv->last_released < mv->count &&
+        mv->session && mv->session->gfx == KLXR_GFX_VULKAN) {
+        pl->sw_mv[v] = kl_vulkan_xr_image_mtl(mv->vk_img[mv->last_released]);
+        pl->sw_mv_slice[v] = mv->array_size > 1 ? (int)sw->motionVectorSubImage.imageArrayIndex : 0;
+        const XrRect2Di *r = &sw->motionVectorSubImage.imageRect;
+        float *pr = pl->sw_mv_rect[v];
+        pr[0] = pr[1] = pr[2] = pr[3] = 0.0f;
+        if (mv->width > 0 && mv->height > 0 && r->offset.x >= 0 && r->offset.y >= 0 &&
+            r->extent.width > 0 && r->extent.height > 0 &&
+            (uint32_t)(r->offset.x + r->extent.width) <= mv->width &&
+            (uint32_t)(r->offset.y + r->extent.height) <= mv->height) {
+            pr[0] = (float)r->offset.x / (float)mv->width;
+            pr[1] = (float)r->offset.y / (float)mv->height;
+            pr[2] = (float)(r->offset.x + r->extent.width) / (float)mv->width;
+            pr[3] = (float)(r->offset.y + r->extent.height) / (float)mv->height;
+        }
+        if (dp && dp->last_released >= 0 && dp->last_released < dp->count) {
+            pl->sw_depth[v] = kl_vulkan_xr_image_mtl(dp->vk_img[dp->last_released]);
+            pl->sw_depth_slice[v] = dp->array_size > 1 ? (int)sw->depthSubImage.imageArrayIndex : 0;
+        }
+        pl->sw_planes[0] = sw->minDepth; pl->sw_planes[1] = sw->maxDepth;
+        pl->sw_planes[2] = sw->nearZ;    pl->sw_planes[3] = sw->farZ;
+        const XrPosef *dl = &sw->appSpaceDeltaPose;
+        pl->sw_delta[0] = dl->position.x; pl->sw_delta[1] = dl->position.y; pl->sw_delta[2] = dl->position.z;
+        pl->sw_delta[3] = dl->orientation.x; pl->sw_delta[4] = dl->orientation.y;
+        pl->sw_delta[5] = dl->orientation.z; pl->sw_delta[6] = dl->orientation.w;
+    }
+    static unsigned said;
+    unsigned bit = 1u << ((li * 2 + v) & 31);
+    if (!(said & bit)) {
+        said |= bit;
+        const XrRect2Di *mr = &sw->motionVectorSubImage.imageRect, *dr = &sw->depthSubImage.imageRect;
+        const XrPosef *dl = &sw->appSpaceDeltaPose;
+        fprintf(stderr, "  [xr] space warp on layer %u eye %u: flags %#llx, motion vectors %ux%u fmt %lld "
+                        "rect %d,%d %dx%d slice %u; depth %ux%u fmt %lld rect %d,%d %dx%d slice %u; "
+                        "depth %.3f..%.3f, near %.4f far %.1f; app delta q(%.4f %.4f %.4f %.4f) "
+                        "p(%.4f %.4f %.4f)\n",
+                li, v, (unsigned long long)sw->layerFlags,
+                mv ? mv->width : 0, mv ? mv->height : 0, mv ? (long long)mv->format : 0,
+                mr->offset.x, mr->offset.y, mr->extent.width, mr->extent.height,
+                sw->motionVectorSubImage.imageArrayIndex,
+                dp ? dp->width : 0, dp ? dp->height : 0, dp ? (long long)dp->format : 0,
+                dr->offset.x, dr->offset.y, dr->extent.width, dr->extent.height,
+                sw->depthSubImage.imageArrayIndex,
+                (double)sw->minDepth, (double)sw->maxDepth, (double)sw->nearZ, (double)sw->farZ,
+                (double)dl->orientation.x, (double)dl->orientation.y, (double)dl->orientation.z,
+                (double)dl->orientation.w, (double)dl->position.x, (double)dl->position.y,
+                (double)dl->position.z);
+    }
+    static const char *dir = (const char *)-1;
+    if (dir == (const char *)-1) dir = kl_env_str("KL_XR_SPACEWARP_OUT", NULL);
+    if (!dir || !mv || !dp || mv->last_released < 0 || dp->last_released < 0) return;
+    int every = kl_env_int("KL_VK_OUT_EVERY", 1), run = kl_env_int("KL_VK_OUT_RUN", 1);
+    unsigned f = (unsigned)s->frames_ended;
+    if (every > 1 && f % (unsigned)every >= (unsigned)(run < 1 ? 1 : run)) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/sw_f%05u_layer%u_eye%u_mv_%ux%u.rgba16f", dir, f, li, v, mv->width, mv->height);
+    kl_vulkan_xr_image_capture_raw(mv->vk_img[mv->last_released], mv->width, mv->height, 8, 0,
+                                   sw->motionVectorSubImage.imageArrayIndex, path);
+    snprintf(path, sizeof path, "%s/sw_f%05u_layer%u_eye%u_depth_%ux%u.f32", dir, f, li, v, dp->width, dp->height);
+    kl_vulkan_xr_image_capture_raw(dp->vk_img[dp->last_released], dp->width, dp->height, 4, 1,
+                                   sw->depthSubImage.imageArrayIndex, path);
+    const XrPosef *dl = &sw->appSpaceDeltaPose;
+    fprintf(stderr, "  [xr] space warp f%u layer %u eye %u: near %.4f far %.1f, app delta q(%.4f %.4f %.4f %.4f) "
+                    "p(%.4f %.4f %.4f)\n", f, li, v, (double)sw->nearZ, (double)sw->farZ,
+            (double)dl->orientation.x, (double)dl->orientation.y, (double)dl->orientation.z,
+            (double)dl->orientation.w, (double)dl->position.x, (double)dl->position.y, (double)dl->position.z);
+}
+
 static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // The stall watch's heartbeat (runtime/diag/kl_stall.c; KL_STALL_MS).
     { extern void kl_stall_frame(void); kl_stall_frame(); }
@@ -7747,6 +7856,10 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                                            sc->height, (long long)sc->format,
                                            proj->views[v].subImage.imageArrayIndex,
                                            (unsigned)s->frames_ended, (int)v, (int)li);
+            {
+                XrCompositionLayerSpaceWarpInfoFB sw;
+                if (klxr_space_warp_info(proj->views[v].next, &sw)) klxr_space_warp_seen(s, li, v, &sw, pl_cur);
+            }
             // Already this eye. For a Vulkan swapchain that is "already published
             // for this eye": an array swapchain is both eyes' at once, and asking
             // whether it was last seen as the OTHER one is true every frame.

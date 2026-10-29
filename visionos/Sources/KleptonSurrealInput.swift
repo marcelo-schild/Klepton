@@ -99,7 +99,14 @@ enum SurrealWire {
         if result.stick.y < -0.7 { result.buttons |= left ? OVRPRawButton.lThumbstickDown : OVRPRawButton.rThumbstickDown }
         if result.stick.x < -0.7 { result.buttons |= left ? OVRPRawButton.lThumbstickLeft : OVRPRawButton.rThumbstickLeft }
         if result.stick.x > 0.7 { result.buttons |= left ? OVRPRawButton.lThumbstickRight : OVRPRawButton.rThumbstickRight }
-        // The documented packet has no capacitive-touch fields. Do not invent touches.
+        // The documented packet has no capacitive-touch fields. Only touches the input
+        // itself proves are reported: a pressed face button or stick, and a stick pushed
+        // past the dead zone. Half-Life: Alyx's teleport is a SteamVR dpad with sub_mode
+        // "touch", which ignores a pushed stick unless /input/thumbstick/touch is set.
+        let stickBit = left ? OVRPRawButton.lThumbstick : OVRPRawButton.rThumbstick
+        let touchable = stickBit | (left ? OVRPRawButton.x | OVRPRawButton.y : OVRPRawButton.a | OVRPRawButton.b)
+        result.touches = result.buttons & touchable
+        if result.stick != .zero { result.touches |= stickBit }
         return result
     }
     static func vibration(sequence: UInt16, amplitude: Float, duration: Float, frequency: Float = 170) -> Data {
@@ -191,6 +198,32 @@ struct SurrealOrientationCalibration {
 }
 
 /// All calls made while the backend's lock is held. No Bluetooth calls under that lock.
+/// Five grip squeezes on BOTH controllers within three seconds: the in-game way to throw
+/// away registration when the controllers have drifted, without going back to the launcher.
+/// A squeeze is a press above 0.55 after a release below 0.35, so a held grip counts once.
+struct SurrealResetGesture {
+    static let squeezes = 5
+    static let window: Double = 3
+    private var pressed = [false, false]
+    private var presses: [[Double]] = [[], []]
+
+    /// Feed every input packet; true once, when the gesture completes.
+    mutating func update(hand: Int, grip: Float, at time: Double) -> Bool {
+        guard (0...1).contains(hand), grip.isFinite else { return false }
+        if pressed[hand] {
+            if grip < 0.35 { pressed[hand] = false }
+            return false
+        }
+        guard grip > 0.55 else { return false }
+        pressed[hand] = true
+        presses[hand].append(time)
+        for h in 0...1 { presses[h].removeAll { time - $0 > Self.window } }
+        guard presses.allSatisfy({ $0.count >= Self.squeezes }) else { return false }
+        presses = [[], []]
+        return true
+    }
+}
+
 struct SurrealHandCache {
     var deviceID: UUID?
     var connected = false
@@ -219,12 +252,17 @@ struct SurrealHandCache {
         guard let next = SurrealPose(data) else { return }
         receivePose(next, at: now)
     }
-    mutating func receivePose(_ decoded: SurrealPose, at now: Double) {
+    /// True when the packet reset the clock (and so the registration).
+    @discardableResult
+    mutating func receivePose(_ decoded: SurrealPose, at now: Double) -> Bool {
         var next = decoded
         let stamp = clock.stamp(next.ticks, arrival: now)
-        if stamp.reset { resetTracking(); input = KleptonHandState(); hasInput = false }
+        // Keep `input`: buttons are notified only on change, so a grip held through
+        // the reset sends nothing new and would read as released until it moved.
+        if stamp.reset { resetTracking() }
         next.time = stamp.time
         pose = next; receivedAt = now
+        return stamp.reset
     }
     mutating func sample(reference: simd_float4x4?, at time: Double, now: Double,
                          settings: SurrealInputSettings,
@@ -237,8 +275,11 @@ struct SurrealHandCache {
         // confidence, but still requires fresh packets with a valid quaternion.
         guard let pose, now - receivedAt < 0.25,
               settings.positionFromHands || pose.confidence > 0 else {
+            // Released while lost, but the snapshot stays: input is notified only on
+            // change, so clearing it lost a grip held through a short pose gap for good.
+            // Disconnect still clears it.
             status = "Tracking lost — inputs released"
-            resetTracking(); input = KleptonHandState(); hasInput = false
+            resetTracking()
             return released
         }
         let body = pose.predicted(at: time)

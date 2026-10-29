@@ -434,8 +434,18 @@ final class KleptonControllers {
 
     init() {
         surreal.setSettings(.stored())
-        surreal.setEnabled(mode == .surreal)
+        if usesSurrealSDK {
+            // The SDK owns the controllers' Bluetooth: our backend lets go of them first
+            // (the launcher may have connected it for pairing).
+            surreal.setEnabled(false)
+            KleptonSurrealSDK.shared.start(settings: .stored())
+        } else {
+            surreal.setEnabled(mode == .surreal)
+        }
     }
+    /// Surreal mode through Surreal Interactive's SDK rather than KleptonSurrealBackend.
+    /// Never in Standard mode, and never in a build without the SDK.
+    private let usesSurrealSDK = KleptonControllerMode.selected() == .surreal && KleptonSurrealSDK.enabled
 
     // 0 = left, 1 = right, matching kl_ovrp's hand indices (nodes 3 and 4).
     private var state: [KleptonHandState] = [KleptonHandState(), KleptonHandState()]
@@ -1688,7 +1698,10 @@ final class KleptonControllers {
             let live = kl_ovrp_haptics_pull(Int32(hand), &amplitude, &seconds) != 0
             guard Self.hapticsEnabled else { continue }
             if mode == .surreal {
-                if live { surreal.vibrate(hand: hand, amplitude: amplitude, duration: seconds) }
+                if live {
+                    if usesSurrealSDK { KleptonSurrealSDK.shared.vibrate(hand: hand, amplitude: amplitude, duration: seconds) }
+                    else { surreal.vibrate(hand: hand, amplitude: amplitude, duration: seconds) }
+                }
                 continue
             }
             let level = live ? min(max(amplitude * Self.gain, 0), 1) : 0
@@ -2311,6 +2324,11 @@ final class KleptonControllers {
     /// and describe the same instant the head pose does.
     func update(leftHand: HandAnchor?, rightHand: HandAnchor?,
                 at presentationTime: TimeInterval, headTransform: simd_float4x4? = nil) {
+        if usesSurrealSDK {
+            // Already aligned and predicted by the SDK; the hand anchors are its business.
+            for hand in 0...1 { submit(KleptonSurrealSDK.shared.sample(hand: hand), hand: hand) }
+            return
+        }
         if mode == .surreal {
             let handPositionOnly = surreal.snapshot().settings.positionFromHands
             let alignmentTarget = headTransform.flatMap { SurrealControllerOrientation.forward(head: $0) }

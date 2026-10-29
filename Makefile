@@ -1784,6 +1784,14 @@ angle-status:
 #
 # vendor-moltenvk/ is gitignored exactly as vendor/ is — the tracked artifacts
 # are the two scripts and the version+sha256 pin inside mvk_fetch.sh.
+# Surreal Interactive's visionOS SDK, the pose source of a Surreal Touch build.
+# gen_xcodeproj.py fetches it by itself for KLEPTON_CONTROLLER_MODE=surreal; this
+# is for staging it ahead of time (a toolchain that ships with it, an offline
+# build). Pinned and verified in the script; visionos/Frameworks/ is gitignored.
+.PHONY: surreal-sdk
+surreal-sdk:
+	@./tools/surreal_sdk_fetch.sh
+
 .PHONY: mvk mvk-fetch mvk-retarget mvk-check mvk-status
 mvk-fetch:
 	@./tools/mvk_fetch.sh

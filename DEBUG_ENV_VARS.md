@@ -141,8 +141,9 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   of `KL_MIXED_BLACK` is left out. Default 1 for TRIANGLE STRATEGY
   (`x5340130476095884`), Demeo (`x3634830803298285`), Richie's Plank Experience
   (`x1642239225880682`), Synth Riders (`x2436558143118760`), LES MILLS BODYCOMBAT
-  (`x4015163475201433`), DreamSpace (`x9449316705178989`) and Cubism
-  (`x2264524423619421`), 0 for everyone else,
+  (`x4015163475201433`), DreamSpace (`x9449316705178989`), Cubism
+  (`x2264524423619421`) and Spatial Zombies (`x24151641901194680`), 0 for
+  everyone else,
   who are told "unsupported" as before. A layer filed through
   `ovrp_EnqueueSubmitLayer2` (Unity) counts like one in `ovrp_EndFrame4`'s
   list; for a guest on Meta's OpenXR backend (frames end in `xrEndFrame`,
@@ -161,8 +162,9 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   ovrp_* scene calls and, for a guest on Meta's OpenXR backend, to the OpenXR
   scene entry points (`xrDiscoverSpacesMETA`, `xrGetSpaceRoomLayoutFB`, the
   FB spatial-entity component queries; `kl_openxr.c`), which are "not served"
-  where it is off. Default 1 for Synth Riders (`x2436558143118760`) and
-  DreamSpace (`x9449316705178989`, Meta's MR Utility Kit), else 0.
+  where it is off. Default 1 for Synth Riders (`x2436558143118760`),
+  DreamSpace (`x9449316705178989`, Meta's MR Utility Kit) and Spatial Zombies
+  (`x24151641901194680`, the same kit on Unity's OpenXR plugin), else 0.
 - `KL_PLAT_USER_NAME=<name>` / `KL_PLAT_USER_ID=<number>` — (`kl_ovrplat.c`)
   the offline user's name and id (`KL_PLAT_USER`). The name is what the start
   window's "Player name" holds: the display name as typed, the Oculus ID the
@@ -241,6 +243,9 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   complete", a black picture with its music playing), and
   for iB Cricket (`x5437449896288644`, Unity 6000.0 + the Oculus XR plugin),
   whose eye framebuffers were incomplete on every frame (a plain pink screen).
+  On by default for Spatial Zombies (`x24151641901194680`, Unity 6000.6 +
+  OpenXR, SinglePassInstanced) as well: without the names Unity looked for
+  `STEREO_INSTANCING_ON` shader variants the game does not ship.
 - `KL_NET_NO_META=0|1` — (`runtime/libc/kl_shim.c`) names under oculus.com,
   oculuscdn.com, facebook.com, facebook.net, fbcdn.net and meta.com do not
   resolve (`EAI_NONAME`, as on a headset without a network); every other host
@@ -371,14 +376,17 @@ answers GL and kl_glfb never initializes.
   the whole string.
 - `KL_GL_BACKEND_EXT=1` — also name what ANGLE's own extension string has.
   The GL description then repeats a short candidate list
-  (`GL_EXT_texture_format_BGRA8888`, the DXT/BC family, and
-  `GL_EXT_texture_filter_anisotropic`) when, and only when, ANGLE names them;
+  (`GL_EXT_texture_format_BGRA8888`, the DXT/BC family,
+  `GL_EXT_texture_filter_anisotropic` and `GL_KHR_texture_compression_astc_hdr`)
+  when, and only when, ANGLE names them;
   `[glfb] backend extensions adopted:` lists what was taken. Once anything is
   adopted, `MAX_TEXTURE_MAX_ANISOTROPY` and the compressed-format pair are
   answered by ANGLE instead of the table. **Off by default in this fork**
   (upstream of here it is on, with `KL_GL_NO_BACKEND_EXT=1` as the way back):
   every verified game was verified against the core-only description, and a
-  Unity guest that is shown anisotropic filtering starts using it.
+  Unity guest that is shown anisotropic filtering starts using it. On by
+  default for Warhammer 40,000: Battle Sister (`x3231001163584154`), whose
+  lightmaps are HDR ASTC.
 - `KL_GLFB_DEPTH_LINEAR=0` — rewrite a LINEAR filter on a depth texture whose
   compare mode is NONE to NEAREST (ES leaves that sample undefined and Metal
   returns 0, which reads as "everything is in shadow"); restored if the guest
@@ -395,7 +403,9 @@ answers GL and kl_glfb never initializes.
 - `KL_GLFB_PROGRAM_BINARY=0` — refuse `glProgramBinary` outright, leaving the
   program unlinked so the guest recompiles from source. By default the binary
   is forwarded and a rejected one (LINK_STATUS 0) is named in the log and
-  counted in the exit report.
+  counted in the exit report. Default 0 for Warhammer 40,000: Battle Sister
+  (`x3231001163584154`), whose shaders are rewritten at `glShaderSource`: a
+  cached binary would keep an earlier toolchain's version of them.
 - `KL_GLFB_ERRPROBE=1` — bracket draws and blits with `glGetError` and print
   the first 20 with the state around them (draw FBO, program, viewport;
   `glCheckFramebufferStatus` on 0x506). Consumes the pending error. Also
@@ -619,8 +629,12 @@ answers GL and kl_glfb never initializes.
   resident. Default 1 for the same two titles and the other Unreal titles
   named in `klfb_cimg_on`, among them `x5190288877703616` (Saints & Sinners -
   Chapter 2, whose textures were all purple without it) — Unreal's texture
-  streaming needs it — else 0; the call itself always goes through a thunk
-  that reads its stack arguments the way the guest pushed them.
+  streaming needs it — and `x3231001163584154` (Warhammer 40,000: Battle
+  Sister, a Unity title that copies textures into 2D arrays while loading a
+  level), else 0. Copies between 2D textures and 2D-array slices are handled;
+  a compressed source must be a 2D texture (the shadow is kept per 2D
+  level); the call itself always goes through a thunk that reads its stack
+  arguments the way the guest pushed them.
 - `KL_GLFB_TB_MANY=0|1` — keep up to 8192 textures over buffers (and 8192
   buffers) fresh in the texel-buffer emulation instead of 1024. Past the
   limit a texel buffer's 2D stand-in keeps its first contents, and what is
@@ -900,8 +914,24 @@ The guest's own memory management, and the three seams that used to disable it.
 - `KL_FS_REL_SDCARD=0|1` — resolve a relative path that begins with `sdcard/`
   (or another spelling of external storage) as the absolute one, as it is on a
   device where the app's working directory is `/`. AC Nexus opens its animator
-  controller bundle that way. Default 1 for `x5812519008825194` and
-  `x2773034772778845` (Premium Bowling: every hall's scene bundle), else 0.
+  controller bundle that way. Default 1 for `x5812519008825194`,
+  `x2773034772778845` (Premium Bowling: every hall's scene bundle) and
+  `x3231001163584154` (Battle Sister: its five store bundles), else 0.
+- `KL_GLFB_PROBE_CUBE_ARRAY=0|1` — (`runtime/gfx/kl_glfb.c`) rewrite the
+  reflection-probe part of PixelToys' BLAST shaders, a `samplerCubeArray` and
+  a read-only storage buffer (ES 3.2 / 3.1, refused by the ES 3.0 backend), as
+  an unused `samplerCube` (so it holds no texture unit) whose every sample is
+  the scene's ambient light (`unity_SHA*`) in the reflected direction, and a
+  constant of the buffer's type that leaves it undecoded: the level draws with
+  approximate reflections instead of not at all, and its metal is not black.
+  Default 1 for Warhammer 40,000: Battle Sister (`x3231001163584154`), whose every level
+  surface was black, else 0.
+- `KL_GLFB_NO_GRADING_LUT=0|1` — (`runtime/gfx/kl_glfb.c`) read a shader's
+  `_GradingLut` lookup (a 3D colour-grading table filled by a compute kernel,
+  which this ES 3.0 context cannot run, so it stays black) as the identity:
+  colours as they are, without the game's grading. Default 1 for Warhammer
+  40,000: Battle Sister (`x3231001163584154`), whose level surfaces were black,
+  else 0.
 - `KL_GLFB_BIND_PINS=0|1` — (`runtime/gfx/kl_glfb.c`) hand the uniform
   locations a shader pins (`layout(location = N) uniform …`,
   `UNITY_LOCATION(N)`) to the linker with `glBindUniformLocationCHROMIUM`
@@ -1764,6 +1794,11 @@ puts the camera on the ground with its hands underneath it.
 - `KL_OVRP_HEAD=x,y,z[,yaw]` — a head pose for a run with no frontend (metres,
   yaw in degrees). Without it an OpenXR guest's head is on the floor at the
   origin, which Half-Life: Alyx answers with its orange out-of-bounds fade.
+- `KL_OVRP_HEAD_SWEEP=<deg>,<s>[,<from>]` — with `KL_OVRP_HEAD`: the head turns
+  left and right about its yaw, `<deg>` each way over a period of `<s>` seconds,
+  from `<from>` seconds after the head is put (default 0, so scripted menu
+  presses can come first), so a Mac run has a moving head (frame generation,
+  motion vectors).
 - `KL_VK_ASYNC_PIPES=0|1|2` — graphics pipelines are compiled on worker threads
   instead of in the call that creates them (default 1 for `alyx`, else 0). The
   creating call waits at most `KL_VK_ASYNC_WAIT_MS` (default 8, and a tenth of
@@ -1873,7 +1908,8 @@ puts the camera on the ground with its hands underneath it.
   (2026-08-13, user-confirmed), so 1 is now purely the A/B — and the answer for
   any guest ever found that collapses the cones without submitting per-eye
   rects, which would be unservable any other way. Later defaults: on for
-  Into The Radius, Walkabout, Demeo, Ghost Town and, under the profile for
+  Into The Radius, Walkabout, Demeo, Ghost Town, Contractors
+  (`x2436897736439055`, UE 4.27) and, under the profile for
   untested games, every Unity title shipping libOculusXRPlugin — except Angry
   Birds VR (`x2718606324833775`), which places each eye itself and looked flat
   with the union (2026-10-18).
@@ -2192,13 +2228,20 @@ puts the camera on the ground with its hands underneath it.
   OVRPlugin still files OVROverlay panels through `ovrp_EnqueueSubmitLayer2`:
   keep that set and publish it with each `xrEndFrame`'s own quads instead of
   letting the OpenXR frame replace it. Default 1 for Mission: ISS
-  (`x2094303753986147`) and Fluid (`x6946182742093178`), whose panels were
-  black between frames, else 0.
+  (`x2094303753986147`), Fluid (`x6946182742093178`) and Spatial Zombies
+  (`x24151641901194680`, its menu is a Cylinder), whose panels were black
+  between frames or never shown, else 0.
 - `KL_OVRP_ENQ_MIRROR_XR=0|1` — (`kl_ovrp.c`, `kl_ovrp_openxr_frame_end`) with
   `KL_OVRP_ENQ_WITH_XR` on a GLES guest, copy the enqueued panels' images for
   the compositor at each `xrEndFrame`, as `ovrp_EndFrame` does on the OVRPlugin
   path; without it they arrive with no MTLTexture and are not composited.
-  Default 1 for Fluid (`x6946182742093178`), else 0.
+  Default 1 for Fluid (`x6946182742093178`) and Spatial Zombies
+  (`x24151641901194680`), else 0.
+- `KL_OVRP_ENQ_CYLINDER=0|1` — (`kl_ovrp.c`, `klovrp_EnqueueSubmitLayer2`) give
+  a Cylinder filed through `ovrp_EnqueueSubmitLayer2` its shape from the scale
+  OVROverlay passes (arc width, height, radius, in metres); without it the
+  compositor has no cylinder to build and the panel is not drawn. Default 1 for
+  Spatial Zombies (`x24151641901194680`, its menu is one), else 0.
 - `KL_OVRP_ENQ_RETIRE=0|1` — a panel the guest destroys (`ovrp_DestroyLayer`,
   or `ovrp_EnqueueDestroyLayer` with the id behind a pointer, as Ghost Town's
   plugin passes it) is taken out of the visible set and the batch being
@@ -2390,6 +2433,20 @@ that reports what came due since the frontend last asked. Platform-independent
   `[cp] THE PANEL IS NO LONGER RUNNING AT THE RATE WE LATCHED` — six seconds of
   cadence more than 10% off the latched period. Detection only: the guest read
   its rate once and cannot be re-told.
+- `KL_XR_SPACEWARP_OUT=<dir>` — Mac lab: write the motion vectors (raw RGBA16F,
+  `sw_f<frame>_layer<l>_eye<e>_mv_<w>x<h>.rgba16f`) and depth (raw float,
+  `..._depth_<w>x<h>.f32`) a game chains onto its projection views with
+  XR_FB_space_warp, every `KL_VK_OUT_EVERY`-th frame. Without it the space-warp
+  info is only named once per layer and eye (`[xr] space warp on layer ...`).
+  For an OVRPlugin game with Application SpaceWarp (Assassin's Creed Nexus) the
+  vectors of the stage `KL_VK_OUT` captures are written beside its eye pictures
+  (`sw_f<frame>_s<stage>_eye<e>_mv_<w>x<h>.rgba16f`).
+- `KL_FRAMEGEN_MV=0` — frame generation searches the motion even where the game
+  hands its own vectors over (XR_FB_space_warp, or OVRPlugin's SpaceWarp
+  textures). Default on. `KL_FRAMEGEN_MV_SCALE=x,y` (default `0.5,-0.5`, measured
+  on HITMAN 3 and Assassin's Creed Nexus) and `KL_FRAMEGEN_MV_HEAD=0` (the
+  vectors leave the head's turn out) are levers for a game that states them
+  otherwise.
 - `KL_XR_LAYERS=0` — flatten the guest's projection layers into one eye picture
   instead of compositing each as its own quad (default 1, the per-layer
   composite).
@@ -3325,9 +3382,9 @@ front door is a knob, not a build. `build_run_host.sh`'s flags map onto these:
   set (its Quest controller models sat above PSVR2 Sense controllers).
 - `KL_XR_LOCAL_FLOOR=0|1` — (`kl_openxr.c`) offer the LOCAL_FLOOR reference
   space (core in OpenXR 1.1; here the pose STAGE has) to an instance created
-  with apiVersion >= 1.1. Default 1 for DreamSpace (`x9449316705178989`) and
-  Fluid (`x6946182742093178`), which never began their sessions without it,
-  else 0.
+  with apiVersion >= 1.1. Default 1 for DreamSpace (`x9449316705178989`),
+  Fluid (`x6946182742093178`) and Spatial Zombies (`x24151641901194680`), which
+  never began their sessions without it, else 0.
 
   **A pitch alone rotates where the controller points and not where it PIVOTS.**
   The frame turns about the origin the platform gave us, so the point that
@@ -3417,6 +3474,9 @@ vendored the whole path refuses by name and none of these do anything.
   "drawn but stale".
 - `KL_VK_OUT_EVERY=N` — capture every Nth frame (default 1). A full eye pair is
   ~21 MB of readback, so 1 is only for short runs.
+- `KL_VK_OUT_RUN=N` — with `KL_VK_OUT_EVERY`, capture N frames in a row each
+  time (default 1), so two consecutive frames can be compared (motion between
+  them). Also applies to `KL_XR_SPACEWARP_OUT`.
 - `KL_VK_EYE_CLEAR=0` — leave a freshly allocated Vulkan eye image as Metal hands
   it over. Default on: every new eye image is cleared to transparent black first,
   because an uncleared one shows whatever its memory held (old frames, different
@@ -4554,6 +4614,10 @@ off from the launch environment as documented above.
   launch); a player's build never shows it and ignores it in `KLTestOn`. The
   first one is `KL_FOVE_SUBPASS_HELPERS=0` (an A/B control that turns a fix
   OFF, so it has no place in a player's Test group).
+- `KLEPTON_FRAMEGEN=off|ahead|between` (build/install environment, read by
+  `visionos/gen_xcodeproj.py`) — the frame generation a tester's install starts
+  at: it replaces the target's `framegen` as `KLFrameGenDefault`; a choice made
+  in the game's start window still wins. Unset: the target's default.
 - `KLEPTON_RENDER_SCALE=<0.5..1.0>` (build/install environment, read by
   `visionos/gen_xcodeproj.py`) — the render scale the game starts at: it
   replaces the target's `render_scale` as `KL_RENDER_SCALE_DEFAULT` /

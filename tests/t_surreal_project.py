@@ -12,14 +12,23 @@ ROOT = Path(__file__).resolve().parents[1]
 GEN = ROOT / "visionos/gen_xcodeproj.py"
 
 
-def generate(mode=None):
+def generate(mode=None, sdk=False, env_extra=None):
     env = dict(os.environ, KLEPTON_TARGET="beatsaber", KLEPTON_TEAM="TESTTEAM00",
                KLEPTON_BUNDLE_ID="example.existing.beatsaber", KLEPTON_START_SCREEN="1")
     env.pop("KLEPTON_CONTROLLER_MODE", None)
+    env.pop("KLEPTON_SURREAL_SDK", None)
     if mode is not None:
         env["KLEPTON_CONTROLLER_MODE"] = mode
+    env.update(env_extra or {})
+    # Surreal Interactive's SDK is present or absent as the test says, whatever this
+    # checkout has fetched (a test load never fetches: only the generator's main does).
+    fake_sdk = ("import os; _n='surreal_interactive_openxr_framework'; "
+                "_f,_d,_l=os.path.isfile,os.path.isdir,os.listdir; "
+                "os.path.isfile=lambda p:(%r if _n in str(p) else _f(p)); "
+                "os.path.isdir=lambda p:(%r if _n in str(p) else _d(p)); "
+                "os.listdir=lambda p:(['.klepton-fetched-test'] if _n in str(p) else _l(p)); " % (sdk, sdk))
     # Importing builds exactly the PBX string main writes, without requiring guest dylibs.
-    code = "import runpy,json,sys; sys.path.insert(0,%r); import targets; targets.libs_for=lambda _: 'libsynthetic'; m=runpy.run_path(%r); print(json.dumps({'pbx':m['PBX'],'swift':m['SWIFT'],'privacy':m['USAGE_DESCRIPTIONS'],'entitlements':m['ENTITLEMENTS_FILE']}))" % (str(GEN.parent), str(GEN))
+    code = fake_sdk + "import runpy,json,sys; sys.path.insert(0,%r); import targets; targets.libs_for=lambda _: 'libsynthetic'; m=runpy.run_path(%r); print(json.dumps({'pbx':m['PBX'],'swift':m['SWIFT'],'privacy':m['USAGE_DESCRIPTIONS'],'entitlements':m['ENTITLEMENTS_FILE']}))" % (str(GEN.parent), str(GEN))
     result = subprocess.run([sys.executable, "-c", code], env=env, cwd=ROOT, capture_output=True, text=True)
     if result.returncode:
         raise ValueError(result.stderr)
@@ -35,13 +44,30 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(standard["swift"], surreal["swift"])
         for name in ["KleptonControllers.swift", "KleptonControllerInput.swift", "KleptonControllerMode.swift",
                      "KleptonSurrealInput.swift", "KleptonSurrealBackend.swift", "KleptonSurrealView.swift",
-                     "KleptonSurrealAim.swift", "KleptonSurrealAimView.swift"]:
+                     "KleptonSurrealAim.swift", "KleptonSurrealAimView.swift", "KleptonSurrealSDK.swift"]:
             self.assertIn(name, surreal["swift"])
             self.assertTrue((ROOT / "visionos/Sources" / name).is_file())
         # Only the default changes: identity, entitlements, signing flags and framework list stay identical.
         self.assertEqual(standard["pbx"], surreal["pbx"].replace('KL_CONTROLLER_MODE_DEFAULT = "surreal";', 'KL_CONTROLLER_MODE_DEFAULT = "standard";'))
         self.assertIn("example.existing.beatsaber", surreal["pbx"])
         self.assertNotIn("OpenSurreal", surreal["pbx"])
+
+    def test_surreal_sdk_only_in_surreal_builds(self):
+        sdk = "surreal_interactive_openxr_framework.xcframework"
+        standard = generate(sdk=True)["pbx"]
+        for absent in [sdk, "KL_SURREAL_SDK", "-framework Accelerate"]:
+            self.assertNotIn(absent, standard, "a Standard build neither links nor enables the SDK")
+        surreal = generate("surreal", sdk=True)["pbx"]
+        self.assertIn(f"{sdk} in Frameworks", surreal)
+        self.assertNotIn(f"{sdk} in Embed", surreal, "a static framework is linked, never embedded")
+        self.assertIn("KL_SURREAL_SDK", surreal)
+        self.assertIn("-framework Accelerate", surreal)
+        opted_out = generate("surreal", sdk=True, env_extra={"KLEPTON_SURREAL_SDK": "0"})["pbx"]
+        self.assertNotIn(sdk, opted_out)
+        self.assertNotIn("KL_SURREAL_SDK", opted_out)
+        # Loaded by a test (never fetching), a Surreal build without the framework is the
+        # backend-only project; run as the generator it would fetch it or stop.
+        self.assertNotIn(sdk, generate("surreal", sdk=False)["pbx"])
 
     def test_privacy_survives_generator_and_plist(self):
         generated = generate("surreal")

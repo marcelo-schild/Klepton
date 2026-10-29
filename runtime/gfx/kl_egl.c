@@ -411,6 +411,9 @@ extern const char *kl_driver_target_name(void);
 // 4-sample depth renderbuffer, every glClear on them raised 0x506 (status
 // 0x8cd6), nothing was ever drawn into the eye textures and the player saw
 // only the untouched eye storage — a plain pink screen.
+// Spatial Zombies (x24151641901194680, Unity 6000.6 + OpenXR, SinglePassInstanced):
+// told none of the three names, Unity asked for STEREO_INSTANCING_ON variants its
+// shaders were never built with (~38000 "variant not found" a run) (2026-10-28).
 static int klgl_want_msrtt(void) {
     static int v = -1;
     if (v < 0) {
@@ -420,7 +423,8 @@ static int klgl_want_msrtt(void) {
                                      (t && (strcmp(t, "x9449316705178989") == 0 ||
                                             strcmp(t, "x6946182742093178") == 0 ||
                                             strcmp(t, "x4723352327707414") == 0 ||
-                                            strcmp(t, "x5437449896288644") == 0)));
+                                            strcmp(t, "x5437449896288644") == 0 ||
+                                            strcmp(t, "x24151641901194680") == 0)));
     }
     return v;
 }
@@ -484,6 +488,11 @@ static int klgl_want_multiview_ms(void) {
 //     selects a MIXED pair (GL_BGRA_EXT with GL_RGBA), invalid in every GLES
 //     profile: every texture upload fails GL_INVALID_OPERATION and samples
 //     black (the Simpsons Hit & Run VR port). Quest drivers tolerate the pair.
+//   * GL_KHR_texture_compression_astc_hdr: the same ASTC formats, with HDR
+//     blocks allowed in them. Unity reads its HDR ASTC GraphicsFormats from
+//     this name alone; Warhammer 40,000: Battle Sister ships its lightmaps that
+//     way, and without it "Texture creation failed. '145' is not supported"
+//     ended the level load on its loading screen (2026-10-28).
 static const char *const g_gl_ext_candidates[] = {
     "GL_EXT_texture_compression_s3tc",
     "GL_EXT_texture_compression_dxt1",
@@ -491,6 +500,7 @@ static const char *const g_gl_ext_candidates[] = {
     "GL_ANGLE_texture_compression_dxt5",
     "GL_EXT_texture_filter_anisotropic",
     "GL_EXT_texture_format_BGRA8888",
+    "GL_KHR_texture_compression_astc_hdr",
 };
 #define KL_GL_EXT_CANDIDATES \
     ((int)(sizeof g_gl_ext_candidates / sizeof g_gl_ext_candidates[0]))

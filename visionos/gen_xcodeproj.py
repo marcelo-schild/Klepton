@@ -255,6 +255,33 @@ CONTROLLER_MODE = os.environ.get("KLEPTON_CONTROLLER_MODE", "standard")
 if CONTROLLER_MODE not in ("standard", "surreal"):
     raise ValueError("KLEPTON_CONTROLLER_MODE must be standard or surreal")
 
+# Surreal Interactive's visionOS SDK (github.com/surreal-interactive/SwiftSDKBinary,
+# Apache-2.0), the pose source of a Surreal build (KleptonSurrealSDK.swift,
+# docs/SURREAL.md). ONLY for KLEPTON_CONTROLLER_MODE=surreal: a Standard build
+# neither fetches nor links it, so nothing changes for anyone without Surreal
+# Touch. A STATIC framework, so linked and never embedded.
+#
+# Building for Surreal Touch IS the decision to use it, so there is no switch at
+# run time and no fallback: the generator fetches it the first time
+# (tools/surreal_sdk_fetch.sh pins and verifies it), and a Surreal build that
+# cannot have it stops here with the reason instead of quietly shipping the old
+# Bluetooth backend. KLEPTON_SURREAL_SDK=0 is the one way to build Surreal
+# without it, on purpose. Only when run as the generator, not when a test loads
+# this file.
+SVR_NAME = "surreal_interactive_openxr_framework"
+_svr_dir = os.path.join(HERE, "Frameworks", f"{SVR_NAME}.xcframework")
+_svr_wanted = CONTROLLER_MODE == "surreal" and os.environ.get("KLEPTON_SURREAL_SDK", "1") != "0"
+_svr_fetched = os.path.isdir(_svr_dir) and any(
+    n.startswith(".klepton-fetched-") for n in os.listdir(_svr_dir))
+if _svr_wanted and not _svr_fetched and __name__ == "__main__":
+    if subprocess.run([os.path.join(HERE, "..", "tools", "surreal_sdk_fetch.sh")]).returncode != 0:
+        sys.exit("!! a Surreal Touch build needs Surreal Interactive's SDK, and it could not be "
+                 "fetched (above). Check the connection and build again, stage it with "
+                 "`make surreal-sdk`, or set KLEPTON_SURREAL_SDK=0 to build with Klepton's "
+                 "own Bluetooth backend instead.")
+SURREAL_SDK = _svr_wanted and os.path.isfile(
+    os.path.join(_svr_dir, "xros-arm64", f"{SVR_NAME}.framework", SVR_NAME))
+
 # The render scale an installer wants the game to START at (KLEPTON_RENDER_SCALE,
 # a fraction such as 0.75; AVP Play sets it with its MetalFX switch). It replaces
 # the target's own default (targets.py "render_scale") as KLRenderScaleDefault, so
@@ -273,6 +300,18 @@ if _rs_env:
     else:
         print(f"gen_xcodeproj: KLEPTON_RENDER_SCALE={_rs_env!r} is not a fraction in 0.5..1.0 "
               f"- the target's {RENDER_SCALE:.2f} stays", file=sys.stderr)
+
+# The frame generation a tester's install starts at (KLEPTON_FRAMEGEN=off|ahead|between):
+# replaces the target's own (targets.py "framegen") as KLFrameGenDefault, so a choice
+# made in the game still wins. Unset: the target's, as before.
+FRAMEGEN = KLT["framegen"]
+_fg_env = os.environ.get("KLEPTON_FRAMEGEN", "").strip().lower()
+if _fg_env:
+    if _fg_env in ("off", "ahead", "between"):
+        FRAMEGEN = _fg_env
+    else:
+        print(f"gen_xcodeproj: KLEPTON_FRAMEGEN={_fg_env!r} is not off, ahead or between "
+              f"- the target's {FRAMEGEN} stays", file=sys.stderr)
 
 # Compile-time launcher opt-in (also drives LAUNCHER_COND + the display name below).
 _launcher_on = _os.environ.get("KL_CUSTOM_LAUNCHER", "").strip().lower() in ("1", "true", "yes", "on")
@@ -357,7 +396,7 @@ ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon
                         + f"\t\t\t\tKL_MAX_RATE_DEFAULT = {int(KLT['max_rate'])};\n"
                         # ...and the frame generation it starts with (targets.py
                         # "framegen", KLFrameGenDefault): off, ahead or between.
-                        + f"\t\t\t\tKL_FRAMEGEN_DEFAULT = {KLT['framegen']};\n"
+                        + f"\t\t\t\tKL_FRAMEGEN_DEFAULT = {FRAMEGEN};\n"
                         + f"\t\t\t\tKL_OUTPUT_DEFAULT = {KLT['output']};\n"
                         # ...and which front the app shows: the boot report
                         # this project was developed against, or the start
@@ -483,7 +522,7 @@ SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swif
          "KleptonArrayViews.swift",
          "KleptonControllerInput.swift", "KleptonControllerMode.swift",
          "KleptonSurrealInput.swift", "KleptonSurrealBackend.swift", "KleptonSurrealView.swift",
-         "KleptonSurrealAim.swift", "KleptonSurrealAimView.swift",
+         "KleptonSurrealAim.swift", "KleptonSurrealAimView.swift", "KleptonSurrealSDK.swift",
          "KleptonMetalFXPreset.swift", "KleptonMetalFXAlpha.swift",
          "KleptonEyeMax.swift", "KleptonOverlayDepth.swift",
          "KleptonWalkaboutSave.swift",
@@ -506,6 +545,15 @@ swift_filerefs = "\n".join(
 swift_children = "\n".join(f'\t\t\t\t{s["ref"]},' for s in swift)
 swift_sources  = "\n".join(f'\t\t\t\t{s["bld"]},' for s in swift)
 F_RT    = oid("FRT");   B_RT_LNK = oid("BRTLK")
+# Surreal Interactive's SDK, when SURREAL_SDK: one file ref, one link, no embed.
+F_SVR   = oid("FSVR");  B_SVR_LNK = oid("BSVRLK")
+SVR_BUILDFILE = (f"\t\t{B_SVR_LNK} /* {SVR_NAME}.xcframework in Frameworks */ = "
+                 f"{{isa = PBXBuildFile; fileRef = {F_SVR}; }};\n" if SURREAL_SDK else "")
+SVR_FILEREF = (f"\t\t{F_SVR} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; "
+               f"name = {SVR_NAME}.xcframework; path = Frameworks/{SVR_NAME}.xcframework; "
+               f"sourceTree = \"<group>\"; }};\n" if SURREAL_SDK else "")
+SVR_LINK = f"\t\t\t\t{B_SVR_LNK},\n" if SURREAL_SDK else ""
+SVR_CHILD = f"\t\t\t\t{F_SVR},\n" if SURREAL_SDK else ""
 
 # One file ref + one embed build-file per embedded framework.
 guest = [{"name": g, "ref": oid(f"FG{i}"), "emb": oid(f"BG{i}"),
@@ -554,8 +602,10 @@ _display = _display.replace("\\", "\\\\").replace('"', '\\"')
 # Trailing newline, glued at line-start to the next setting — the same shape as
 # ENTITLEMENTS_SETTING / ASSETCATALOG_SETTING above, so it lands on its own line in
 # the output and expands to nothing (no blank line) when the flag is off.
-LAUNCHER_COND = ('\t\t\t\tSWIFT_ACTIVE_COMPILATION_CONDITIONS = "KL_CUSTOM_LAUNCHER $(inherited)";\n'
-                 if _launcher_on else "")
+# ...and KL_SURREAL_SDK, which is what lets KleptonSurrealSDK.swift call the SDK at all.
+_conds = (["KL_CUSTOM_LAUNCHER"] if _launcher_on else []) + (["KL_SURREAL_SDK"] if SURREAL_SDK else [])
+LAUNCHER_COND = (f'\t\t\t\tSWIFT_ACTIVE_COMPILATION_CONDITIONS = "{" ".join(_conds)} $(inherited)";\n'
+                 if _conds else "")
 
 # What the installed app says about itself: CFBundleShortVersionString and
 # CFBundleVersion. An installer sets these (KLEPTON_APP_VERSION — the guest's own
@@ -637,7 +687,7 @@ COMMON = f"""
 				// second target needed one. The failure is a link error naming
 				// VTDecompressionSession*, which reads as a missing SDK rather
 				// than as a build setting that was never updated.
-				OTHER_LDFLAGS = "-lz -lc++ -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface";
+				OTHER_LDFLAGS = "-lz -lc++ -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface{" -framework Accelerate" if SURREAL_SDK else ""}";
 				PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID};
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = xros;
@@ -667,7 +717,7 @@ PBX = f"""// !$*UTF8*$!
 		{B_C} /* kl_app.c in Sources */ = {{isa = PBXBuildFile; fileRef = {F_C}; }};
 		{B_ASSETS} /* Assets.xcassets in Resources */ = {{isa = PBXBuildFile; fileRef = {F_ASSETS}; }};
 		{B_RT_LNK} /* Klepton.xcframework in Frameworks */ = {{isa = PBXBuildFile; fileRef = {F_RT}; }};
-{buildfiles}
+{SVR_BUILDFILE}{buildfiles}
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -678,7 +728,7 @@ PBX = f"""// !$*UTF8*$!
 		{F_BRIDGE} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Klepton-Bridging-Header.h"; sourceTree = "<group>"; }};
 		{F_ASSETS} = {{isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = {_appicon_catalog}; sourceTree = "<group>"; }};
 		{F_RT} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = Klepton.xcframework; path = ../build/Klepton.xcframework; sourceTree = "<group>"; }};
-{filerefs}
+{SVR_FILEREF}{filerefs}
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -687,7 +737,7 @@ PBX = f"""// !$*UTF8*$!
 			buildActionMask = 2147483647;
 			files = (
 				{B_RT_LNK},
-			);
+{SVR_LINK}			);
 			runOnlyForDeploymentPostprocessing = 0;
 		}};
 /* End PBXFrameworksBuildPhase section */
@@ -732,7 +782,7 @@ PBX = f"""// !$*UTF8*$!
 			isa = PBXGroup;
 			children = (
 				{F_RT},
-{fwchildren}
+{SVR_CHILD}{fwchildren}
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -916,6 +966,10 @@ def main():
     # Vulkan guest is on a headset — so the build says which one it made.
     print(f"  embedded MoltenVK:         "
           + (', '.join(MVK) if MVK else "(none - run 'make mvk' for a Vulkan guest)"))
+    if CONTROLLER_MODE == "surreal":
+        print(f"  Surreal Touch poses:       "
+              + ("Surreal Interactive's SDK (linked)" if SURREAL_SDK
+                 else "KleptonSurrealBackend (KLEPTON_SURREAL_SDK=0)"))
     return 0
 
 

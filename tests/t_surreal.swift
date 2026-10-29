@@ -35,6 +35,13 @@ struct SurrealTests {
         expect(KleptonControllerMode.selected(defaults: defaults, bundleDefault: "standard") == .surreal, "Switch between launches")
         defaults.set("bad", forKey: KleptonControllerMode.preferenceKey)
         expect(KleptonControllerMode.selected(defaults: defaults, bundleDefault: "bad") == .standard, "Invalid settings fail safe")
+        expect(KleptonControllerMode.surrealAvailable(nil) && KleptonControllerMode.surrealAvailable("YES")
+               && !KleptonControllerMode.surrealAvailable("NO"), "Surreal Touch is there unless the build says NO")
+        KleptonControllerMode.surreal.save(defaults: defaults)
+        expect(KleptonControllerMode.selected(defaults: defaults, bundleDefault: "surreal", available: false) == .standard,
+               "Without Surreal Touch support every build is Standard")
+        expect(defaults.string(forKey: KleptonControllerMode.preferenceKey) == "standard",
+               "A stored Surreal choice is put back to Standard where Surreal Touch is not available")
         expect(SurrealHand(name: "Surreal Touch L D5A8") == .left, "Left name with suffix")
         expect(SurrealHand(name: "surreal touch right 123") == .right, "Right identity")
         expect(SurrealHand(name: "Surreal Touch L R") == nil, "Ambiguous hands rejected")

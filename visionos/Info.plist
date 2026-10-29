@@ -19,6 +19,8 @@
 	<string>$(KL_DATA_APK)</string>
 	<key>KLControllerModeDefault</key>
 	<string>$(KL_CONTROLLER_MODE_DEFAULT)</string>
+	<key>KLSurrealAvailable</key>
+	<string>$(KL_SURREAL_AVAILABLE)</string>
 	<key>KLGamepadMap</key>
 	<string>$(KL_GAMEPAD_MAP)</string>
 	<key>KLHandMattingDefault</key>

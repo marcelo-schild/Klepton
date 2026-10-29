@@ -52,22 +52,40 @@ class ProjectTests(unittest.TestCase):
         self.assertIn("example.existing.beatsaber", surreal["pbx"])
         self.assertNotIn("OpenSurreal", surreal["pbx"])
 
-    def test_surreal_sdk_only_in_surreal_builds(self):
+    def test_surreal_sdk_in_every_build(self):
+        # The mode is the player's choice at run time, so a game installed for standard
+        # controllers links the SDK too and can be switched to Surreal Touch in its start window.
         sdk = "surreal_interactive_openxr_framework.xcframework"
-        standard = generate(sdk=True)["pbx"]
-        for absent in [sdk, "KL_SURREAL_SDK", "-framework Accelerate"]:
-            self.assertNotIn(absent, standard, "a Standard build neither links nor enables the SDK")
-        surreal = generate("surreal", sdk=True)["pbx"]
-        self.assertIn(f"{sdk} in Frameworks", surreal)
-        self.assertNotIn(f"{sdk} in Embed", surreal, "a static framework is linked, never embedded")
-        self.assertIn("KL_SURREAL_SDK", surreal)
-        self.assertIn("-framework Accelerate", surreal)
-        opted_out = generate("surreal", sdk=True, env_extra={"KLEPTON_SURREAL_SDK": "0"})["pbx"]
-        self.assertNotIn(sdk, opted_out)
-        self.assertNotIn("KL_SURREAL_SDK", opted_out)
-        # Loaded by a test (never fetching), a Surreal build without the framework is the
-        # backend-only project; run as the generator it would fetch it or stop.
+        for mode in [None, "surreal"]:
+            pbx = generate(mode, sdk=True)["pbx"]
+            self.assertIn(f"{sdk} in Frameworks", pbx)
+            self.assertNotIn(f"{sdk} in Embed", pbx, "a static framework is linked, never embedded")
+            self.assertIn("KL_SURREAL_SDK", pbx)
+            self.assertIn("-framework Accelerate", pbx)
+        for mode in [None, "surreal"]:
+            opted_out = generate(mode, sdk=True, env_extra={"KLEPTON_SURREAL_SDK": "0"})["pbx"]
+            for absent in [sdk, "KL_SURREAL_SDK", "-framework Accelerate"]:
+                self.assertNotIn(absent, opted_out)
+        # Loaded by a test (never fetching), a build without the framework is the
+        # backend-only project; run as the generator it would fetch it first (and a
+        # Surreal build would stop if that failed).
+        self.assertNotIn(sdk, generate(sdk=False)["pbx"])
         self.assertNotIn(sdk, generate("surreal", sdk=False)["pbx"])
+
+    def test_surreal_support_off_builds_standard_only(self):
+        # AVP Play's "Surreal Touch support" off: no SDK, Standard whatever was asked, and the
+        # game told Surreal Touch is not there (KLSurrealAvailable NO hides its choice).
+        sdk = "surreal_interactive_openxr_framework.xcframework"
+        on = generate(sdk=True)["pbx"]
+        self.assertIn("KL_SURREAL_AVAILABLE = YES;", on)
+        for mode in [None, "surreal"]:
+            off = generate(mode, sdk=True, env_extra={"KLEPTON_SURREAL_SUPPORT": "0"})["pbx"]
+            self.assertIn("KL_SURREAL_AVAILABLE = NO;", off)
+            self.assertIn('KL_CONTROLLER_MODE_DEFAULT = "standard";', off)
+            for absent in [sdk, "KL_SURREAL_SDK", "-framework Accelerate"]:
+                self.assertNotIn(absent, off)
+        info = plistlib.loads((ROOT / "visionos/Info.plist").read_bytes())
+        self.assertEqual(info["KLSurrealAvailable"], "$(KL_SURREAL_AVAILABLE)")
 
     def test_privacy_survives_generator_and_plist(self):
         generated = generate("surreal")

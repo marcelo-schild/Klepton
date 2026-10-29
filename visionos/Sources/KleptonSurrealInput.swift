@@ -99,7 +99,14 @@ enum SurrealWire {
         if result.stick.y < -0.7 { result.buttons |= left ? OVRPRawButton.lThumbstickDown : OVRPRawButton.rThumbstickDown }
         if result.stick.x < -0.7 { result.buttons |= left ? OVRPRawButton.lThumbstickLeft : OVRPRawButton.rThumbstickLeft }
         if result.stick.x > 0.7 { result.buttons |= left ? OVRPRawButton.lThumbstickRight : OVRPRawButton.rThumbstickRight }
-        // The documented packet has no capacitive-touch fields. Do not invent touches.
+        // The documented packet has no capacitive-touch fields. Only touches the input
+        // itself proves are reported: a pressed face button or stick, and a stick pushed
+        // past the dead zone. Half-Life: Alyx's teleport is a SteamVR dpad with sub_mode
+        // "touch", which ignores a pushed stick unless /input/thumbstick/touch is set.
+        let stickBit = left ? OVRPRawButton.lThumbstick : OVRPRawButton.rThumbstick
+        let touchable = stickBit | (left ? OVRPRawButton.x | OVRPRawButton.y : OVRPRawButton.a | OVRPRawButton.b)
+        result.touches = result.buttons & touchable
+        if result.stick != .zero { result.touches |= stickBit }
         return result
     }
     static func vibration(sequence: UInt16, amplitude: Float, duration: Float, frequency: Float = 170) -> Data {

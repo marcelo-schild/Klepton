@@ -51,7 +51,13 @@ struct SurrealTests {
             let st = SurrealWire.buttons(buttonPacket(flags: 15, trigger: 127, grip: 255), hand: hand, settings: settings)!
             // Literal Oculus RAW masks, deliberately independent of the implementation constants.
             expect(st.buttons == (hand == .left ? 0x30100700 : 0x0C200007), "Oculus raw masks for faces, menu, stick, trigger, grip")
-            expect(st.touches == 0, "No invented touch sensor state")
+            expect(st.touches == (hand == .left ? 0x700 : 0x7), "Pressed faces and stick are touched; menu and grip are not")
+            let idle = SurrealWire.buttons(buttonPacket(trigger: 127, grip: 255), hand: hand, settings: settings)!
+            expect(idle.touches == 0, "No invented touch without a press or a push")
+            let pushed = SurrealWire.buttons(buttonPacket(y: 255), hand: hand, settings: settings)!
+            expect(pushed.touches == (hand == .left ? 0x400 : 0x4), "A pushed stick is touched (Alyx teleport: dpad sub_mode touch)")
+            let resting = SurrealWire.buttons(buttonPacket(x: 133, y: 124), hand: hand, settings: settings)!
+            expect(resting.touches == 0, "A stick inside the dead zone is not touched")
             near(st.indexTrigger, 1, "Trigger full scale"); near(st.handTrigger, 1, "Grip clamps")
         }
         let half = SurrealWire.buttons(buttonPacket(trigger: 64, grip: 32), hand: .left, settings: settings)!

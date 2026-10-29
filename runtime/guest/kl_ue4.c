@@ -106,6 +106,12 @@ static const char *const UE4_CHAIN[] = {
     // (x6072194326150034) aborted on OmniConnectShared_Create right after Vivox
     // came up. Self-contained (libc only); skipped where a guest does not ship it.
     "libOmniConnectShared.so",
+    // Heroic Labs' Nakama client (its C API: createDefaultNakamaClient,
+    // NClient_*, NSession_*), the same case once more: libUE4 binds against it,
+    // and Contractors (x2436897736439055) aborted on createDefaultNakamaClient
+    // as unresolved right after the platform check (2026-10-28). Built on
+    // libc++_shared, so after it; skipped where a guest does not ship it.
+    "libnakama-cpp.so",
     UE4_LIB,
 };
 

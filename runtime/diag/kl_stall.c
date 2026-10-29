@@ -145,10 +145,11 @@ static void *kls_main(void *arg) {
     thread_t self = mach_thread_self();
     static kls_rec recs[KLS_KEEP];
     unsigned long stalls = 0;
+    uint64_t reported = 0;      // a gap already printed while it lasted
     for (;;) {
         usleep(20000);
         uint64_t last = __atomic_load_n(&g_last_ns, __ATOMIC_ACQUIRE);
-        if (!last || (kls_now() - last) / 1000000 < (uint64_t)g_threshold_ms) continue;
+        if (!last || last == reported || (kls_now() - last) / 1000000 < (uint64_t)g_threshold_ms) continue;
         // A gap. Sample while it lasts, a few times, further apart each time so
         // a long one is covered without being flooded.
         int nrecs = 0, taken = 0;
@@ -157,7 +158,10 @@ static void *kls_main(void *arg) {
             if (taken < KLS_SAMPLES) { kls_sample(recs, &nrecs, self); taken++; }
             usleep(wait_us);
             if (wait_us < 400000) wait_us *= 2;
-            if ((kls_now() - last) / 1000000 > 60000) break;       // not a stall: the game stopped
+            // Not a stall: the game stopped. Said once, after 8 s rather than
+            // 60: a player looking at a frozen picture quits long before a
+            // minute, and the report never came (Battle Sister, 2026-10-28).
+            if ((kls_now() - last) / 1000000 > 8000) { reported = last; break; }
         }
         // The gap is from the last frame to the NEXT one, not to whenever this
         // thread next looked: measured to "now" every stall came out as one of

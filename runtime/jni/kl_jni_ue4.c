@@ -1727,6 +1727,14 @@ static klj_val klj_MP14_getVideoLastFrameData(void *env, void *self,
     const void *px = kl_avdec_frame(m->dec, &w, &h, &bytes, &serial);
     klj_media_trace("getVideoLastFrameData(serial)", px && bytes ? (long long)serial : -1);
     if (!px || !bytes) return (klj_val){.l = NULL};
+    // KL_MP14_NEW_FRAMES_ONLY: answer null for a frame already handed over,
+    // as Android's player does when nothing new was decoded. Vampire's UE 4.27
+    // copies every non-null answer into a new 4 MB sample, and two 30 fps
+    // movies asked every tick piled up ~6 GB in seconds in the sanctuary
+    // until the system ended the app (2026-10-29). Default 1 for `vampire`.
+    static int new_only = -1;
+    if (new_only < 0) new_only = kl_env_on("KL_MP14_NEW_FRAMES_ONLY", 0);
+    if (new_only && serial == m->buf_serial) return (klj_val){.l = NULL};
     if (w != m->last_w || h != m->last_h) {
         m->res_changed = 1;
         m->last_w = w; m->last_h = h;

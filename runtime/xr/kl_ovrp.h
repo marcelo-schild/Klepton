@@ -618,6 +618,18 @@ typedef struct {
     // Reloaded's second layer is its interface: transparent but for the menus,
     // and composited opaque it covered the whole world with black (2026-10-20).
     int   xr_flags;
+    // XR_FB_space_warp (moonshot s3-framegen): the motion vectors and depth the
+    // game drew for this layer's views, per eye — MTLTextures
+    // (kl_vulkan_xr_image_mtl), NULL where a view carries none — with the array
+    // slice of each and the part of the texture that holds them ({x0,y0,x1,y1}
+    // fractions, as `rect`; all zero = all of it). sw_planes = minDepth,
+    // maxDepth, nearZ, farZ as submitted; sw_delta = how the app space moved
+    // since the previous frame, {px,py,pz,qx,qy,qz,qw}.
+    void *sw_mv[2], *sw_depth[2];
+    int   sw_mv_slice[2], sw_depth_slice[2];
+    float sw_mv_rect[2][4];
+    float sw_planes[4];
+    float sw_delta[7];
 } kl_ovrp_proj_layer;
 
 // How many projection layers the guest's most recent frame submitted, and what

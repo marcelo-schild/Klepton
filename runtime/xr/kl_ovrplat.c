@@ -2789,6 +2789,95 @@ static uint64_t klplat_Voip_GetMicrophoneAvailability(void) {
     return klplat_request_err("ovr_Voip_GetMicrophoneAvailability",
                               KLPLAT_MSG_VOIP_MIC_AVAILABILITY);
 }
+// Two more requests that used to answer 0 ("could not be made"), for the same
+// reason as the leaderboards above and with the same cure: an ERROR completion.
+// A 0 request id makes the SDK drop the call's callback without ever running it,
+// so a title that waits on the callback waits forever. Drop Dead: Dual Strike
+// Edition (x1935017546592600) asks ovr_Room_GetCurrent at start (does the player
+// already sit in a room?) and ovr_Voip_SetSystemVoipSuppressed after its
+// leaderboard writes; with 0 its loading screen stopped after "Fetched Title
+// News" and never moved on (on device, 2026-10-28, frame loop running, every
+// thread parked). There is no room and no voice service on this host, so an error
+// is the true answer and the title takes its own "no room / no voice" path.
+// Nothing about ownership rides on either request.
+//
+// Both type values were read out of the title's running IL2CPP runtime with
+// KL_PROBE_ENUM=Oculus.Platform.Message/MessageType (Room_GetCurrent =
+// 161916164, Voip_SetSystemVoipSuppressed = 1161808298); the same run reproduced
+// the Leaderboard_WriteEntry (0x117FC8FE) and Voip_GetMicrophoneAvailability
+// (0x744CE345) values already used above.
+#define KLPLAT_MSG_ROOM_GET_CURRENT          0x09A6A504u // Room_GetCurrent
+#define KLPLAT_MSG_VOIP_SET_SYSTEM_SUPPRESSED 0x453FC9AAu // Voip_SetSystemVoipSuppressed
+// Drop Dead only: its boot waits on ApplicationLaunchManager.AssessCoordinatedLaunch,
+// which loops until PTSocialPlatformController_Oculus.HasCheckedLaunchState. Read
+// from the game's IL2CPP code, that flag is set by exactly one path that matters
+// here: the Rooms.GetCurrent completion, and only when it is NOT an error and
+// carries a Room that is not in state 4 and has no users (the error branch leaves
+// without ever checking the launch state). The honest answer for "the player is in
+// no room" is therefore a successful completion carrying an empty Room whose every
+// field reads as absent (see plat_is_room_field). Nobody is reported to be in a
+// room, so no multiplayer path starts; ownership plays no part. Every other title
+// keeps the error completion above.
+static int plat_is_request(const char *name);
+static int klplat_room_empty_ok(void) {
+    const char *t = kl_driver_target_name();
+    return t && strcmp(t, "x1935017546592600") == 0;
+}
+// ...and the second thing the same boot waits on. DeepLinkHelper.Ready, which
+// VrBootManager.LoadScene polls (state 4) before it loads anything, is only ever
+// raised by the callback the game registers for
+// Notification_ApplicationLifecycle_LaunchIntentChanged (0x04b34ca3, read out of
+// the running game with KL_PROBE_ENUM). The real platform posts that notification
+// once when an app starts; here nothing did, so the logo never went away. For a
+// normal launch the callback only logs the message, reads the launch details
+// (answered above: started normally, nothing attached) and raises Ready.
+// A notification carries request id 0, which is how the SDK tells it from a
+// reply (a reply with no waiting request is "Request with no handler").
+#define KLPLAT_MSG_LAUNCH_INTENT_CHANGED 0x04B34CA3u
+static void klplat_post_launch_intent_changed(void) {
+    static int posted;
+    pthread_mutex_lock(&g_msg_mu);
+    if (!posted) {
+        klplat_msg *m = klplat_msg_alloc_locked();
+        if (m) {
+            posted = 1;
+            klplat_commit_locked(m, KLPLAT_MSG_LAUNCH_INTENT_CHANGED, 0, "", 0,
+                                 KLPLAT_KIND_NONE);
+            m->request = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_msg_mu);
+    fprintf(stderr, "  [plat] posted Notification_ApplicationLifecycle_LaunchIntentChanged "
+                    "(launched normally, nothing attached)\n");
+}
+static uint64_t klplat_Room_GetCurrent(void) {
+    plat_hit("ovr_Room_GetCurrent");
+    if (klplat_room_empty_ok()) {
+        klplat_post_launch_intent_changed();
+        return klplat_request("ovr_Room_GetCurrent", KLPLAT_MSG_ROOM_GET_CURRENT, 0);
+    }
+    return klplat_request_failed("ovr_Room_GetCurrent");   // every other title: as before
+}
+// The empty Room's fields, and its DataStore: all absent (0 = zero ID, NULL
+// string/list, zero enum). Only reachable for the target above, because only it
+// is handed a Room handle; the requests of the family stay requests.
+static int plat_is_room_field(const char *name) {
+    if (!klplat_room_empty_ok()) return 0;
+    if (strncmp(name, "ovr_DataStore_", 14) == 0) return 1;
+    return strncmp(name, "ovr_Room_Get", 12) == 0 && !plat_is_request(name);
+}
+static uint64_t klplat_room_field(const char *name) {
+    plat_hit(name);
+    return 0;
+}
+static uint64_t klplat_Voip_SetSystemVoipSuppressed(int suppressed) {
+    (void)suppressed;
+    plat_hit("ovr_Voip_SetSystemVoipSuppressed");
+    if (!klplat_room_empty_ok())          // this title only; others: as before
+        return klplat_request_failed("ovr_Voip_SetSystemVoipSuppressed");
+    return klplat_request_err("ovr_Voip_SetSystemVoipSuppressed",
+                              KLPLAT_MSG_VOIP_SET_SYSTEM_SUPPRESSED);
+}
 static uint64_t klplat_Leaderboard_GetEntriesAfterRank(const char *name, int limit,
                                                        unsigned long long after_rank) {
     (void)name; (void)limit; (void)after_rank;
@@ -3010,9 +3099,16 @@ static const char *const g_plat_request[] = {
 //     ovr_Party_GetCurrent at start.
 //   ovr_Matchmaking_* — multiplayer matchmaking queues and rooms.
 //   ovr_RichPresence_* — destination and activity presence.
+//   ovr_CloudStorage_* — saves moved to and from Meta's cloud (Load, Save,
+//     the metadata and conflict queries). The data is not here to move, as the
+//     note at ovr_CloudStorage2_GetUserDirectoryPath says; that one keeps its
+//     own answer (the underscore after "CloudStorage" keeps it out, and the
+//     implemented names are matched first anyway). Space Pirate Trainer DX
+//     (x1663790613725314) asks LoadBucketMetadata once its start screen's
+//     timer runs out, and the refusal ended the game there (2026-10-28).
 static const char *const g_plat_request_prefix[] = {
     "ovr_Achievements_", "ovr_GroupPresence_", "ovr_Party_",
-    "ovr_Matchmaking_", "ovr_RichPresence_",
+    "ovr_Matchmaking_", "ovr_RichPresence_", "ovr_CloudStorage_",
 };
 
 // ---------------------------------------------------------------------------
@@ -3046,9 +3142,15 @@ static const char *const g_plat_request_prefix[] = {
 //     nothing the guest can learn from the call. It is deliberately NOT filed
 //     with the enumeration-answers-none group: those state an absence, and this
 //     one is a command with no reply.
+//   ovr_Voip_SetNewConnectionOptions(ovrVoipOptionsHandle) — the options every
+//     later voice connection is made with (an options cookie, above). No voice
+//     connection is ever made here, so there is nothing for them to apply to.
+//     Space Pirate Trainer DX sets it while its start screen's hold-the-button
+//     timer runs, and the refusal ended the game there (2026-10-28).
 static const char *const g_plat_drop[] = {
     "ovr_Log_NewEvent",
     "ovr_Voip_SetMicrophoneMuted",
+    "ovr_Voip_SetNewConnectionOptions",
 };
 
 static int plat_is_drop(const char *name) {
@@ -3337,6 +3439,19 @@ static uint64_t klplat_ID_FromString(uint64_t *out, const char *text) {
     return 1;
 }
 
+// ovr_Net_ReadPacket() — the peer-to-peer network's receive poll. It returns an
+// ovrPacketHandle, and NULL is the SDK's own "no packet waiting". There is no
+// peer on this host (the platform service is absent, so no room can be joined
+// and no connection can exist), so NULL is the true answer, not a made-up one.
+// Drop Dead: Dual Strike Edition (x1935017546592600) polls it from its network
+// update once the platform is up and the run ended there by name (on device).
+// Nothing about ownership rides on it. The packet accessors (ovr_Packet_*) read
+// a handle only a non-NULL answer could hand out, so they are never reached.
+static uint64_t klplat_Net_ReadPacket(void) {
+    plat_hit("ovr_Net_ReadPacket");
+    return 0;
+}
+
 static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"JNI_OnLoad",                (void *)klplat_JNI_OnLoad},
     {"ovr_IsPlatformInitialized", (void *)klplat_IsPlatformInitialized},
@@ -3413,7 +3528,10 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"ovr_Leaderboard_GetEntries",             (void *)klplat_Leaderboard_GetEntries},
     {"ovr_Leaderboard_WriteEntry",             (void *)klplat_Leaderboard_WriteEntry},
     {"ovr_Leaderboard_Get",                    (void *)klplat_Leaderboard_Get},
+    {"ovr_Net_ReadPacket",                     (void *)klplat_Net_ReadPacket},
     {"ovr_Voip_GetMicrophoneAvailability",     (void *)klplat_Voip_GetMicrophoneAvailability},
+    {"ovr_Room_GetCurrent",                    (void *)klplat_Room_GetCurrent},
+    {"ovr_Voip_SetSystemVoipSuppressed",       (void *)klplat_Voip_SetSystemVoipSuppressed},
     {"ovr_Leaderboard_GetEntriesAfterRank",    (void *)klplat_Leaderboard_GetEntriesAfterRank},
     {"ovr_Leaderboard_GetEntriesByIds",        (void *)klplat_Leaderboard_GetEntriesByIds},
     {"ovr_Leaderboard_WriteEntryWithSupplementaryMetric",
@@ -3434,6 +3552,7 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     // which is still what every guest but one gets (see the handler).
     {"ovr_User_GetOrgScopedID",                (void *)klplat_User_GetOrgScopedID},
     {"ovr_Message_GetUser",                    (void *)klplat_Message_GetPayload},
+    {"ovr_Message_GetRoom",                    (void *)klplat_Message_GetPayload},
     {"ovr_User_GetID",                         (void *)klplat_User_GetID},
     {"ovr_User_GetOculusID",                   (void *)klplat_User_GetOculusID},
     {"ovr_User_GetDisplayName",                (void *)klplat_User_GetDisplayName},
@@ -3556,6 +3675,8 @@ static void *klplat_sym(const char *name, int s) {
         return kl_named_stub(name, (void *)klplat_launch_field);
     if (plat_is_empty_array(name))
         return kl_named_stub(name, (void *)klplat_empty_array);
+    if (plat_is_room_field(name))
+        return kl_named_stub(name, (void *)klplat_room_field);
     if (plat_is_options_sink(name))
         return kl_named_stub(name, (void *)klplat_void);
     if (plat_is_init_async(name))

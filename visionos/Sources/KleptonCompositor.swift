@@ -3045,14 +3045,23 @@ final class KleptonCompositor {
     // samples it exactly where it would have sampled the game's own texture.
     private var fg: KLFrameGen?
     private var fgFailed = false
-    private struct FgSide { let pyramid: KLFrameGen.Pyramid; let q: simd_quatf; let tangents: SIMD4<Float>
-                            let topDown: Bool; let width: Int; let height: Int; let rect: SIMD4<Int32> }
+    /// One game picture as the generator keeps it: its pyramid for the search – or, where the game sent
+    /// its own motion vectors (XR_FB_space_warp), the field made from them and the picture pixels one
+    /// of its cells covers instead – with the pose and frustum it was drawn with. `serial` tells pictures
+    /// apart (fgPrevOf).
+    private struct FgSide { let pyramid: KLFrameGen.Pyramid?; let field: MTLTexture?; let cell: SIMD2<Float>
+                            let q: simd_quatf; let tangents: SIMD4<Float>; let view: SIMD4<Float>
+                            let topDown: Bool; let width: Int; let height: Int; let rect: SIMD4<Int32>; let serial: Int }
+    private var fgSerial = 0
     /// When this drawable is shown (composeFrame), and when the two newest game pictures were first
     /// shown: the generated picture's place between them is (now - newest) / (newest - older), so a
     /// game that delivers unevenly – Half-Life: Alyx below its 50 – gets each in-between where it
     /// belongs, and a second or third repeat one further on (up to one whole game frame).
     private var fgPresentation: Double = 0
     private var fgTimes: (older: Double, newer: Double) = (0, 0)
+    /// The game's time between pictures, smoothed (0 = none yet): "between" only for a game that is
+    /// slower than the display for good, not at one late picture.
+    private var fgSpanAvg: Double = 0
     /// The display's frame time, from the drawables' presentation times (0 = not known yet).
     private var fgPeriod: Double = 0
     private var fgLastPresentation: Double = 0
@@ -3076,7 +3085,28 @@ final class KleptonCompositor {
     /// it then is – what the newer picture has covered is only there (KLFrameGen.generate's olderColor).
     /// One per output, in the output's layout; `fgPrevOf` says which pyramid it belongs to.
     private var fgPrev: [String: MTLTexture] = [:]
-    private var fgPrevOf: [String: ObjectIdentifier] = [:]
+    private var fgPrevOf: [String: Int] = [:]
+    /// Whether an OVRPlugin game draws into the space-warp images it asked for (KLFrameGen.countWritten,
+    /// read back when the GPU is done): eight pictures in a row with nothing in them and the eye pass is
+    /// searched instead – PowerWash Simulator VR asks for them and leaves them untouched – until the game
+    /// draws into them again.
+    private final class FgMvWatch {
+        private let lock = NSLock()
+        private var emptyRun = 0
+        func report(_ written: UInt32) {
+            lock.lock(); defer { lock.unlock() }
+            let was = emptyRun >= 8
+            emptyRun = written == 0 ? emptyRun + 1 : 0
+            if was != (emptyRun >= 8) {
+                NSLog(was ? "[framegen] the game draws its motion vectors again – using them"
+                          : "[framegen] the game asked for motion-vector images but draws nothing into them – searching instead")
+            }
+        }
+        var empty: Bool { lock.lock(); defer { lock.unlock() }; return emptyRun >= 8 }
+    }
+    private let fgMvWatch = FgMvWatch()
+    private var fgMvCount: [MTLBuffer] = []
+    private var fgMvCountAt = 0
     private func fgSay(_ key: String, _ text: String) {
         if fgSaid.insert(key).inserted { NSLog("[framegen] \(text)") }
     }
@@ -3088,6 +3118,20 @@ final class KleptonCompositor {
         case .bgra8Unorm_srgb: return .bgra8Unorm
         default: return f
         }
+    }
+
+    /// The head's turn as a pixel map of a `size` picture whose cone `tangents` covers only `view` of it
+    /// (fractions; zero = all of it): worked out in that part and moved to where it lies.
+    private static func fgTurn(from: simd_quatf, to: simd_quatf, tangents: SIMD4<Float>, size: SIMD2<Float>,
+                               topDown: Bool, view: SIMD4<Float>) -> simd_float3x3 {
+        guard view.z > view.x, view.w > view.y else {
+            return KLFrameGen.rotationMap(from: from, to: to, tangents: tangents, size: size, topDown: topDown)
+        }
+        let o = SIMD2(view.x, view.y) * size, part = SIMD2(view.z - view.x, view.w - view.y) * size
+        let r = KLFrameGen.rotationMap(from: from, to: to, tangents: tangents, size: part, topDown: topDown)
+        let t = simd_float3x3(SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(o.x, o.y, 1))
+        let back = simd_float3x3(SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(-o.x, -o.y, 1))
+        return t * r * back
     }
 
     private func fgPrepass(stage: Int, on cmd: any MTLCommandBuffer, rendered: kl_ovrp_render_pose, haveRendered: Bool) {
@@ -3116,8 +3160,10 @@ final class KleptonCompositor {
 
         // This frame's pictures: (key, array texture, slice, pose, tangents, row 0 at the top).
         typealias Src = (key: String, tex: MTLTexture, slice: Int, q: simd_quatf, tangents: SIMD4<Float>, topDown: Bool, eye: Int,
-                         sub: SIMD4<Float>)
+                         sub: SIMD4<Float>, mv: MTLTexture?, mvSlice: Int, mvSub: SIMD4<Float>, view: SIMD4<Float>)
         var srcs: [Src] = []
+        // The eye pass's motion-vector image, looked at on every new picture (fgMvWatch).
+        var watch: MTLTexture? = nil
         if projLayerCount > 0 {
             for i in 0..<min(projLayerCount, projLayers.count) {
                 let pl = projLayers[i]
@@ -3131,8 +3177,13 @@ final class KleptonCompositor {
                     // The part of the texture that is the picture (Source 2's dynamic resolution), as
                     // fractions from row 0; all zero = all of it.
                     let rr = vi == 1 ? pl.rect.1 : pl.rect.0
+                    // The game's own motion vectors for this view, where it sends them.
+                    let mvp = vi == 1 ? pl.sw_mv.1 : pl.sw_mv.0
+                    let mv = KleptonFrameGen.gameVectors ? mvp.map { Unmanaged<MTLTexture>.fromOpaque($0).takeUnretainedValue() as MTLTexture } : nil
+                    let mr = vi == 1 ? pl.sw_mv_rect.1 : pl.sw_mv_rect.0
                     srcs.append(("l\(i).\(vi)", tex, Int(slice), q, SIMD4(tg.0, tg.1, tg.2, tg.3), pl.origin_top_left != 0, vi,
-                                 SIMD4(rr.0, rr.1, rr.2, rr.3)))
+                                 SIMD4(rr.0, rr.1, rr.2, rr.3), mv, Int(vi == 1 ? pl.sw_mv_slice.1 : pl.sw_mv_slice.0),
+                                 SIMD4(mr.0, mr.1, mr.2, mr.3), .zero))
                 }
             }
         } else if haveRendered {
@@ -3140,7 +3191,50 @@ final class KleptonCompositor {
             for eye in 0..<2 {
                 guard let a = eyeSource(eye, stage) else { continue }
                 let tg = eye == 1 ? rendered.tangents.1 : rendered.tangents.0
-                srcs.append(("e\(eye)", a.texture, a.slice, q, SIMD4(tg.0, tg.1, tg.2, tg.3), a.flipY, eye, .zero))
+                // The part of the texture the eye's cone covers, as a fraction of the texture the rect was
+                // measured against (viewport_of). On the canted display Assassin's Creed Nexus draws each eye
+                // over all of a 4800-wide texture, vectors too, but its cone is 3786 of it, the right eye's from
+                // 1014 (Mac with KL_OVRP_EYE_TAN=vision, 2026-10-29): the picture and its vectors stay whole,
+                // only the head's turn is worked out in that part – over the whole texture it came out a fifth
+                // too large and, for the right eye, beside where it belongs.
+                let vp = eye == 1 ? rendered.viewport.1 : rendered.viewport.0
+                let of = SIMD2(Float(rendered.viewport_of.0), Float(rendered.viewport_of.1))
+                let view: SIMD4<Float> = vp.2 > 0 && vp.3 > 0 && of.x > 0 && of.y > 0
+                    ? SIMD4(Float(vp.0) / of.x, Float(vp.1) / of.y, Float(vp.0 + vp.2) / of.x, Float(vp.1 + vp.3) / of.y)
+                    : .zero
+                // An OVRPlugin game with Application SpaceWarp (Assassin's Creed Nexus) draws its motion vectors
+                // into the images of the stage it drew the eyes into (ovrp_GetLayerTextureSpaceWarp).
+                var mv: MTLTexture? = nil
+                var mvSlice = 0
+                if KleptonFrameGen.gameVectors {
+                    var w: Int32 = 0, h: Int32 = 0, layers: Int32 = 0
+                    if let p = kl_vulkan_spacewarp_mtl(0, Int32(stage), &w, &h, &layers) {
+                        mv = Unmanaged<MTLTexture>.fromOpaque(p).takeUnretainedValue() as MTLTexture
+                        mvSlice = layers > 1 ? eye : 0
+                        if eye == 0, let mv { watch = mv }
+                        if fgMvWatch.empty { mv = nil }
+                    }
+                }
+                // "e.<eye>", like a layer's "l<i>.<eye>": both eyes in one 2-layer image share one output
+                // ("e/a"), since the composite looks the output up by the image. Keyed "e0"/"e1" each eye had
+                // its own, the second replaced the first, and the left eye showed a layer nothing wrote –
+                // flicker, old pictures, half-black ones (Assassin's Creed Nexus, headset, 2026-10-29).
+                srcs.append(("e.\(eye)", a.texture, a.slice, q, SIMD4(tg.0, tg.1, tg.2, tg.3), a.flipY, eye, .zero, mv, mvSlice, .zero, view))
+            }
+        }
+        // Where a layer brings the game's own vectors, the layers without them are left as they are:
+        // HITMAN 3 VR: Reloaded's second layer is its interface – menus and prompts that barely move –
+        // and searching it at 4036 px took most of a composite that ran 10 ms of a 10 ms display frame,
+        // until visionOS halved the display to 50 Hz and nothing was made at all (headset, 2026-10-29).
+        if srcs.contains(where: { $0.mv != nil }) {
+            let without = srcs.filter { $0.mv == nil }.map(\.key)
+            if !without.isEmpty {
+                fgSay("only mv", "only the layers with the game's own vectors get pictures; left as they are: " + without.joined(separator: ", "))
+                srcs.removeAll { $0.mv == nil }
+                for k in without {
+                    fgHist[k] = nil; fgPrev[k] = nil; fgPrevOf[k] = nil
+                    fgOut[k] = nil; fgOut[String(k.split(separator: ".").first ?? "") + "/a"] = nil
+                }
             }
         }
         guard !srcs.isEmpty else { return }
@@ -3193,7 +3287,9 @@ final class KleptonCompositor {
                       h.newer.rect == rect(s.eye, s.tex, s.sub) else { continue }
                 let id = ObjectIdentifier(s.tex)
                 // Both eyes of a 2-slice array share one output; a texture per eye gets one each.
-                let outKey = s.tex.arrayLength > 1 ? String(s.key.split(separator: ".").first ?? "") + "/a" : s.key
+                // Decided by the texture, not the name: the composite finds the output by it (mfxUpgraded).
+                let shared = srcs.contains { $0.tex === s.tex && $0.key != s.key }
+                let outKey = shared ? String(s.key.split(separator: ".").first ?? "") + "/a" : s.key
                 // The larger of the eyes' drawn parts, for both: they differ by a few pixels in a level
                 // (2340 vs 2352), and an output sized per eye was rebuilt every frame – black half-made
                 // pictures and a new unwarp grid each time (headset, 2026-10-28). The same rule as mfxContent.
@@ -3229,16 +3325,26 @@ final class KleptonCompositor {
                 // eye, else the rect the frustum was drawn into.
                 let rr = h.newer.rect
                 let rsize = rate != nil ? SIMD2(Float(src.width), Float(src.height)) : SIMD2(Float(rr.z), Float(rr.w))
-                let rot = KLFrameGen.rotationMap(from: h.newer.q, to: older.q, tangents: h.newer.tangents,
-                                                 size: rsize, topDown: h.newer.topDown)
+                let rot = Self.fgTurn(from: h.newer.q, to: older.q, tangents: h.newer.tangents, size: rsize,
+                                      topDown: h.newer.topDown, view: h.newer.view)
                 let screen = fgScreenSpace && rate != nil
                 // The older picture's colours, when they were kept for exactly that picture.
-                let oldColor = phase < 0 && fgPrevOf[s.key] == ObjectIdentifier(older.pyramid)
+                let oldColor = phase < 0 && fgPrevOf[s.key] == older.serial
                     ? fgPrev[s.key].flatMap { $0.makeTextureView(pixelFormat: Self.fgLinear($0.pixelFormat)) } : nil
-                fg.generate(older: older.pyramid, newer: h.newer.pyramid, newerColor: src, phase: phase,
-                            rotation: rot, rateMap: screen ? nil : rate?.buffer, rateLayer: s.eye,
-                            screenRateMap: screen ? rate?.buffer : nil, warpRect: rr, olderColor: oldColor,
-                            into: dst, commandBuffer: cmd)
+                if let field = h.newer.field {
+                    // The game's own vectors: in its screen pixels, so a foveated eye warps through the map.
+                    // Only the columns the composite shows (the eye's cone, 79 % of Nexus's texture), and 16
+                    // beyond for its filter.
+                    let v = h.newer.view, tw = Float(rr.z)
+                    let shown: SIMD2<Float>? = rate == nil && v.z > v.x ? SIMD2(max(0, v.x * tw - 16), min(tw, v.z * tw + 16)) : nil
+                    fg.generate(field: field, cell: h.newer.cell, newerColor: src, phase: phase, warpRect: rr, shownColumns: shown,
+                                screenRateMap: rate?.buffer, rateLayer: s.eye, olderColor: oldColor, into: dst, commandBuffer: cmd)
+                } else if let po = older.pyramid, let pn = h.newer.pyramid {
+                    fg.generate(older: po, newer: pn, newerColor: src, phase: phase,
+                                rotation: rot, rateMap: screen ? nil : rate?.buffer, rateLayer: s.eye,
+                                screenRateMap: screen ? rate?.buffer : nil, warpRect: rr, olderColor: oldColor,
+                                into: dst, commandBuffer: cmd)
+                } else { continue }
                 // The output holds the source's top-left ow×oh at 1:1: the composite's grid is built against
                 // the source, normalised to that part (the same route a MetalFX copy takes).
                 let origin = MfxOrigin(source: s.tex, content: SIMD2<Float>(Float(ow), Float(oh)))
@@ -3256,19 +3362,62 @@ final class KleptonCompositor {
         if staleInARow == 0 {
             // A new game picture: keep its pyramid, the one before it becomes "older".
             fgTimes = (fgTimes.newer, fgPresentation)
+            if let w = watch, let v = w.textureType == .type2DArray
+                ? w.makeTextureView(pixelFormat: w.pixelFormat, textureType: .type2D, levels: 0..<1, slices: 0..<1) : w {
+                if fgMvCount.isEmpty {
+                    fgMvCount = (0..<4).compactMap { _ in device.makeBuffer(length: 4, options: .storageModeShared) }
+                }
+                if !fgMvCount.isEmpty {
+                    let b = fgMvCount[fgMvCountAt % fgMvCount.count]; fgMvCountAt += 1
+                    b.contents().storeBytes(of: UInt32(0), as: UInt32.self)
+                    fg.countWritten(v, into: b, commandBuffer: cmd)
+                    let watcher = fgMvWatch
+                    cmd.addCompletedHandler { _ in watcher.report(b.contents().load(as: UInt32.self)) }
+                }
+            }
             for s in srcs {
                 guard let v = view2D(s.tex, s.slice) else { fgSay("view", "no 2D view of the eye texture (format \(s.tex.pixelFormat.rawValue)) – off"); continue }
                 let parity = (fgParity[s.key] ?? 0) ^ 1
                 fgParity[s.key] = parity
                 let r = rect(s.eye, v, s.sub)
+                let prev = fgHist[s.key]?.newer
+                fgSerial += 1
+                // The game's own vectors, where it sent them: the field straight from them, no pyramid.
+                // They are of the picture as the game saw it – a foveated eye's screen, else its rect.
+                var field: MTLTexture? = nil
+                var cell = SIMD2<Float>(0, 0)
+                if let mvt = s.mv,
+                   let mv2 = mvt.textureType == .type2DArray
+                       ? mvt.makeTextureView(pixelFormat: mvt.pixelFormat, textureType: .type2D, levels: 0..<1,
+                                             slices: s.mvSlice..<(s.mvSlice + 1)) : mvt {
+                    let pw = Float(rate != nil ? v.width : Int(r.z)), ph = Float(rate != nil ? v.height : Int(r.w))
+                    let W = Float(mv2.width), H = Float(mv2.height), m = s.mvSub
+                    let mr: SIMD4<Int32> = m.z > m.x && m.w > m.y
+                        ? SIMD4(Int32((m.x * W).rounded()), Int32((m.y * H).rounded()),
+                                Int32(((m.z - m.x) * W).rounded()), Int32(((m.w - m.y) * H).rounded()))
+                        : SIMD4(0, 0, Int32(W), Int32(H))
+                    // Across and down apart: 960x771 vectors for Nexus's 4800x3081 eye are 5 by 4 pixels, and
+                    // one size for both took the lower part's vectors from ever higher up (headset, 2026-10-29).
+                    cell = SIMD2(pw / Float(max(1, mr.z)), ph / Float(max(1, mr.w)))
+                    let rot = KleptonFrameGen.gameVectorsHaveHead
+                        ? prev.map { Self.fgTurn(from: s.q, to: $0.q, tangents: s.tangents, size: SIMD2(pw, ph),
+                                                 topDown: s.topDown, view: s.view) } : nil
+                    // The scale is for a picture with row 0 at the top; one GL drew has it at the bottom.
+                    let scale = KleptonFrameGen.gameVectorScale * SIMD2(1, s.topDown ? 1 : -1)
+                    field = fg.motionField(from: mv2, mvRect: mr, toPixels: scale * SIMD2(pw, ph),
+                                           cell: cell, rotation: rot, key: s.key, commandBuffer: cmd)
+                    if field != nil {
+                        fgSay("mv \(s.key)", "\(s.key): the game's own motion vectors (\(mr.z)x\(mr.w) at \(mr.x),\(mr.y), \(cell.x)x\(cell.y) picture pixels each) instead of a search")
+                    }
+                }
                 // A foveated eye's pyramid is of its screen, read through the map (fgScreenSpace).
                 let screen = fgScreenSpace && rate != nil
-                let pyr = fg.pyramid(of: v, rect: screen ? SIMD4(0, 0, Int32(v.width), Int32(v.height)) : r,
-                                     key: "\(s.key).\(parity)", rateMap: screen ? rate?.buffer : nil, rateLayer: s.eye,
-                                     commandBuffer: cmd)
-                let side = FgSide(pyramid: pyr, q: s.q, tangents: s.tangents, topDown: s.topDown, width: v.width, height: v.height,
-                                  rect: r)
-                let prev = fgHist[s.key]?.newer
+                let pyr = field != nil ? nil
+                    : fg.pyramid(of: v, rect: screen ? SIMD4(0, 0, Int32(v.width), Int32(v.height)) : r,
+                                 key: "\(s.key).\(parity)", rateMap: screen ? rate?.buffer : nil, rateLayer: s.eye,
+                                 commandBuffer: cmd)
+                let side = FgSide(pyramid: pyr, field: field, cell: cell, q: s.q, tangents: s.tangents, view: s.view, topDown: s.topDown,
+                                  width: v.width, height: v.height, rect: r, serial: fgSerial)
                 // A picture of another size (a resolution step) cannot be compared: no older one then.
                 fgHist[s.key] = (prev.flatMap { $0.width == side.width && $0.height == side.height && $0.rect == side.rect ? $0 : nil }, side)
             }
@@ -3280,12 +3429,21 @@ final class KleptonCompositor {
             // made a second and none of them more than the game drew (headset, 2026-10-28).
             if KleptonFrameGen.interp {
                 let span = fgTimes.newer - fgTimes.older
-                if fgPeriod > 0, fgTimes.older > 0, span > fgPeriod * 1.5, span < 0.060 {
+                if fgTimes.older > 0, span > 0 {
+                    let s = min(span, 0.060)
+                    fgSpanAvg = fgSpanAvg == 0 ? s : fgSpanAvg * 0.9 + s * 0.1
+                }
+                // At one late picture of a game as fast as the display, a middle held the newest back a
+                // display frame, the next one came on time and the held one was never shown: an older
+                // picture between the new ones. visionOS ran Assassin's Creed Nexus at 50 Hz for a whole
+                // session, 11 % of its pictures late, and 2030 such middles were made (headset,
+                // 2026-10-29); with the smoothed span 2 in a simulation of that, the 100 Hz cases unchanged.
+                if fgPeriod > 0, fgTimes.older > 0, span > fgPeriod * 1.5, span < 0.060, fgSpanAvg > fgPeriod * 1.5 {
                     generateAll(phase: -0.5)
                     // ...and this picture's colours kept for the next one, after the pass above has read the last.
                     if let blit = cmd.makeBlitCommandEncoder() {
                         for s in srcs {
-                            guard let pyr = fgHist[s.key]?.newer.pyramid else { continue }
+                            guard let newest = fgHist[s.key]?.newer else { continue }
                             let all = (0..<2).map { rect($0, s.tex) }
                             let ow = rate == nil ? s.tex.width : Int(all.map { $0.z }.max() ?? 0)
                             let oh = rate == nil ? s.tex.height : Int(all.map { $0.w }.max() ?? 0)
@@ -3302,7 +3460,7 @@ final class KleptonCompositor {
                             blit.copy(from: s.tex, sourceSlice: s.slice, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
                                       sourceSize: MTLSize(width: ow, height: oh, depth: 1),
                                       to: prev, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
-                            fgPrevOf[s.key] = ObjectIdentifier(pyr)
+                            fgPrevOf[s.key] = newest.serial
                         }
                         blit.endEncoding()
                     }

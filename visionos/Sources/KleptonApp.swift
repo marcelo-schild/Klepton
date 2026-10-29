@@ -689,9 +689,11 @@ struct PlayerSettingsView: View {
             // Frame generation (KleptonFrameGen), for every game that shows a picture of its own – among
             // the main settings, where its owner wanted it ("nicht erst bei erweitert"). In the game a
             // tap of Create + Options with the performance panel shown cycles the three, to compare
-            // (KleptonTapAction: unless the game's setting has the tap do something else). Not for a
-            // mixed-reality game: a moved in-between picture moves the edges to the room as well.
-            if Immersive.wanted, !KleptonRendering.targetIsMixedReality {
+            // (KleptonTapAction: unless the game's setting has the tap do something else). A mixed-reality
+            // game too: it had been left out on the guess that a moved in-between moves the edges to the room
+            // as well, never tried – they move with the picture's alpha, as the things in them do. Its owner
+            // asked for it with LEGO Bricktales (2026-10-29).
+            if Immersive.wanted {
                 GroupBox(klT("Frame generation", "Zwischenbilder")) {
                     FrameGenPicker().frame(maxWidth: .infinity, alignment: .leading)
                 }

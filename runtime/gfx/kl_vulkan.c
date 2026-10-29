@@ -61,6 +61,10 @@ void kl_vulkan_xr_image_capture(unsigned long long i, unsigned w, unsigned h, lo
                                 unsigned a, unsigned fr, int e, int l) {
     (void)i; (void)w; (void)h; (void)f; (void)a; (void)fr; (void)e; (void)l;
 }
+void kl_vulkan_xr_image_capture_raw(unsigned long long i, unsigned w, unsigned h, unsigned bpp,
+                                    int depth, unsigned a, const char *path) {
+    (void)i; (void)w; (void)h; (void)bpp; (void)depth; (void)a; (void)path;
+}
 int   kl_vulkan_available(void) { return 0; }
 void  kl_vulkan_stats(unsigned *p, unsigned *c) { if (p) *p = 0; if (c) *c = 0; }
 int   kl_vulkan_guest_active(void) { return 0; }
@@ -85,6 +89,9 @@ unsigned long long kl_vulkan_spacewarp_image(int depth, int s, unsigned w, unsig
 }
 void *kl_vulkan_layer_mtl_texture(int k, int s, int e, int *w, int *h) {
     (void)k; (void)s; (void)e; if (w) *w = 0; if (h) *h = 0; return NULL;
+}
+void *kl_vulkan_spacewarp_mtl(int depth, int s, int *w, int *h, int *layers) {
+    (void)depth; (void)s; if (w) *w = 0; if (h) *h = 0; if (layers) *layers = 0; return NULL;
 }
 // These two are referenced only by the visionOS compositor, so the host gates
 // never missed them — the device link did.
@@ -2405,16 +2412,16 @@ unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
     return (uint64_t)(uintptr_t)img;
 }
 
-// See kl_vulkan.h. Not published anywhere and never sampled by a compositor:
-// the guest renders its motion-vector pass into these and that is the end of
-// them.
+// See kl_vulkan.h. The guest renders its motion-vector pass into these; the
+// compositor's frame generation reads the motion vectors of the stage it shows
+// (kl_vulkan_spacewarp_mtl).
+static klvk_img_slot g_sw[2][KLVK_EYE_STAGES];
 unsigned long long kl_vulkan_spacewarp_image(int depth, int stage,
                                              unsigned w, unsigned h, int layers) {
     if (!kl_vulkan_guest_active()) return 0;
     if (stage < 0 || stage >= KLVK_EYE_STAGES || !w || !h) return 0;
     if (layers < 1) layers = 1;
     if (layers > 2) layers = 2;
-    static klvk_img_slot g_sw[2][KLVK_EYE_STAGES];
     klvk_img_slot *slot = &g_sw[depth ? 1 : 0][stage];
     // D24_S8 is what the guest names, and it is not a format this GPU has; the
     // 32-bit float depth is what its own "24 bits or more" targets already use.
@@ -2438,6 +2445,16 @@ unsigned long long kl_vulkan_spacewarp_image(int depth, int stage,
     VKI("spacewarp %s image stage %d = VkImage %p (%ux%u, %d layer(s))\n",
         depth ? "depth" : "motion-vector", stage, (void *)img, w, h, layers);
     return (uint64_t)(uintptr_t)img;
+}
+
+void *kl_vulkan_spacewarp_mtl(int depth, int stage, int *w, int *h, int *layers) {
+    if (w) *w = 0; if (h) *h = 0; if (layers) *layers = 0;
+    if (!kl_vulkan_guest_active() || stage < 0 || stage >= KLVK_EYE_STAGES) return NULL;
+    klvk_img_slot *slot = &g_sw[depth ? 1 : 0][stage];
+    if (!slot->img) return NULL;
+    void *t = eye_mtl_texture(g_devs[0], slot->img);
+    if (t) { if (w) *w = (int)slot->w; if (h) *h = (int)slot->h; if (layers) *layers = (int)slot->layers; }
+    return t;
 }
 
 unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, unsigned h,
@@ -3032,7 +3049,9 @@ void kl_vulkan_xr_image_capture(unsigned long long image, unsigned w, unsigned h
     }
     int every = kl_env_int("KL_VK_OUT_EVERY", 1);
     if (every < 1) every = 1;
-    if (frame % (unsigned)every) return;
+    // KL_VK_OUT_RUN=n: n frames in a row each time, for a pair the motion between them is measured on.
+    int run = kl_env_int("KL_VK_OUT_RUN", 1);
+    if (frame % (unsigned)every >= (unsigned)(run < 1 ? 1 : run)) return;
     klvk_device *d = g_devs[0];
     char path[1024];
     snprintf(path, sizeof path, "%s/xr_f%05u_layer%d_eye%d.png", dir, frame, layer, eye);
@@ -3040,6 +3059,77 @@ void kl_vulkan_xr_image_capture(unsigned long long image, unsigned w, unsigned h
     if (cap_image_layer(d, d->queue, (VkImage)(uintptr_t)image, w, h, (VkFormat)vk_format,
                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, array_layer, path, NULL, 0))
         g_presented++;
+}
+
+// See kl_vulkan.h. cap_image_layer's copy without its RGBA8 assumptions: the
+// texels go to the file as they are, `bpp` bytes each, depth through the depth
+// aspect. For the space-warp images (RGBA16F motion vectors, D32 depth), which
+// a PNG cannot hold.
+void kl_vulkan_xr_image_capture_raw(unsigned long long image, unsigned w, unsigned h,
+                                    unsigned bpp, int depth, unsigned layer, const char *path) {
+    if (!image || !path || !kl_vulkan_guest_active() || !w || !h || !bpp) return;
+    klvk_device *d = g_devs[0];
+    VkDeviceSize need = (VkDeviceSize)w * h * bpp;
+    if (!d || !cap_prepare(d, need)) { VKI("raw capture setup failed\n"); return; }
+    VkImageAspectFlags aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageLayout cur = depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                              : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    d->ResetCommandBuffer(d->cap_cmd, 0);
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    d->BeginCommandBuffer(d->cap_cmd, &bi);
+    VkImageMemoryBarrier to_src = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = cur,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = (VkImage)(uintptr_t)image,
+        .subresourceRange = { depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                                    : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layer, 1 },
+    };
+    d->CmdPipelineBarrier(d->cap_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to_src);
+    VkBufferImageCopy region = {
+        .imageSubresource = { aspect, 0, layer, 1 },
+        .imageExtent = { w, h, 1 },
+    };
+    d->CmdCopyImageToBuffer(d->cap_cmd, (VkImage)(uintptr_t)image,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->cap_buf, 1, &region);
+    VkImageMemoryBarrier back = to_src;
+    back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    back.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    back.newLayout = cur;
+    d->CmdPipelineBarrier(d->cap_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &back);
+    d->EndCommandBuffer(d->cap_cmd);
+    VkSubmitInfo si = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &d->cap_cmd,
+    };
+    d->ResetFences(d->dev, 1, &d->cap_fence);
+    if (d->QueueSubmit(d->queue, 1, &si, d->cap_fence) != VK_SUCCESS) return;
+    d->WaitForFences(d->dev, 1, &d->cap_fence, VK_TRUE, 2000000000ull);
+    void *mapped = NULL;
+    if (d->MapMemory(d->dev, d->cap_mem, 0, need, 0, &mapped) != VK_SUCCESS) return;
+    VkMappedMemoryRange mmr = {
+        .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+        .memory = d->cap_mem, .offset = 0, .size = VK_WHOLE_SIZE,
+    };
+    if (d->InvalidateMappedMemoryRanges) d->InvalidateMappedMemoryRanges(d->dev, 1, &mmr);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fwrite(mapped, 1, (size_t)need, f);
+        fclose(f);
+        VKI("-> %s (%ux%u, %u bytes a texel)\n", path, w, h, bpp);
+    }
+    d->UnmapMemory(d->dev, d->cap_mem);
 }
 
 void kl_vulkan_capture_eyes(unsigned frame, int stage) {
@@ -3067,8 +3157,23 @@ void kl_vulkan_capture_eyes(unsigned frame, int stage) {
     if (!dir || !kl_vulkan_guest_active()) return;
     int every = kl_env_int("KL_VK_OUT_EVERY", 1);
     if (every < 1) every = 1;
-    if (frame % (unsigned)every) return;
+    int run = kl_env_int("KL_VK_OUT_RUN", 1);
+    if (frame % (unsigned)every >= (unsigned)(run < 1 ? 1 : run)) return;
     if (stage < 0 || stage >= KLVK_EYE_STAGES) return;
+    // KL_XR_SPACEWARP_OUT: the motion vectors the guest drew for this stage (Application SpaceWarp),
+    // raw, beside the eye pictures – the OVRPlugin counterpart of the OpenXR dump in kl_openxr.c.
+    {
+        static const char *swdir = (const char *)-1;
+        if (swdir == (const char *)-1) swdir = kl_env_str("KL_XR_SPACEWARP_OUT", NULL);
+        klvk_img_slot *mv = &g_sw[0][stage];
+        if (swdir && mv->img)
+            for (uint32_t eye = 0; eye < (mv->layers > 1 ? 2u : 1u); eye++) {
+                char path[1024];
+                snprintf(path, sizeof path, "%s/sw_f%05u_s%d_eye%u_mv_%ux%u.rgba16f", swdir, frame, stage,
+                         eye, mv->w, mv->h);
+                kl_vulkan_xr_image_capture_raw((unsigned long long)(uintptr_t)mv->img, mv->w, mv->h, 8, 0, eye, path);
+            }
+    }
     static int all = -1;
     if (all < 0) all = kl_env_on("KL_VK_OUT_ALL", 0);
 

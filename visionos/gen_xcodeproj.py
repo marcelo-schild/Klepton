@@ -301,6 +301,18 @@ if _rs_env:
         print(f"gen_xcodeproj: KLEPTON_RENDER_SCALE={_rs_env!r} is not a fraction in 0.5..1.0 "
               f"- the target's {RENDER_SCALE:.2f} stays", file=sys.stderr)
 
+# The frame generation a tester's install starts at (KLEPTON_FRAMEGEN=off|ahead|between):
+# replaces the target's own (targets.py "framegen") as KLFrameGenDefault, so a choice
+# made in the game still wins. Unset: the target's, as before.
+FRAMEGEN = KLT["framegen"]
+_fg_env = os.environ.get("KLEPTON_FRAMEGEN", "").strip().lower()
+if _fg_env:
+    if _fg_env in ("off", "ahead", "between"):
+        FRAMEGEN = _fg_env
+    else:
+        print(f"gen_xcodeproj: KLEPTON_FRAMEGEN={_fg_env!r} is not off, ahead or between "
+              f"- the target's {FRAMEGEN} stays", file=sys.stderr)
+
 # Compile-time launcher opt-in (also drives LAUNCHER_COND + the display name below).
 _launcher_on = _os.environ.get("KL_CUSTOM_LAUNCHER", "").strip().lower() in ("1", "true", "yes", "on")
 # NB: the bundle id is deliberately NOT switched by the launcher flag. It is a SIGNING
@@ -384,7 +396,7 @@ ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon
                         + f"\t\t\t\tKL_MAX_RATE_DEFAULT = {int(KLT['max_rate'])};\n"
                         # ...and the frame generation it starts with (targets.py
                         # "framegen", KLFrameGenDefault): off, ahead or between.
-                        + f"\t\t\t\tKL_FRAMEGEN_DEFAULT = {KLT['framegen']};\n"
+                        + f"\t\t\t\tKL_FRAMEGEN_DEFAULT = {FRAMEGEN};\n"
                         + f"\t\t\t\tKL_OUTPUT_DEFAULT = {KLT['output']};\n"
                         # ...and which front the app shows: the boot report
                         # this project was developed against, or the start

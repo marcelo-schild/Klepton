@@ -137,13 +137,17 @@ unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
                                          unsigned w, unsigned h, int fmt, int layers);
 
 // The two extra images an eye layer carries when the guest asked for
-// Application SpaceWarp: motion vectors (RGBA16F) and their depth. Nothing on
-// this host consumes them — reprojection here is the visionOS compositor's —
-// but a provider that asked for them treats their absence as "the eye textures
-// could not be created" and stops its display, so they have to EXIST. One pair
+// Application SpaceWarp: motion vectors (RGBA16F) and their depth. A provider
+// that asked for them treats their absence as "the eye textures could not be
+// created" and stops its display, so they have to EXIST; the compositor's frame
+// generation reads the motion vectors (kl_vulkan_spacewarp_mtl). One pair
 // per stage, re-allocated when the shape asked for changes. 0 on failure.
 unsigned long long kl_vulkan_spacewarp_image(int depth, int stage,
                                              unsigned w, unsigned h, int layers);
+// ...and the MTLTexture behind the one of `stage` (depth != 0: its depth), with
+// its size and array layers, for the compositor's frame generation; NULL while
+// the guest has asked for none.
+void *kl_vulkan_spacewarp_mtl(int depth, int stage, int *w, int *h, int *layers);
 
 // ...and the MTLTexture behind one of those, for a compositor that has to draw
 // the layer. The eye layer is deliberately NOT reachable here: its textures go
@@ -275,6 +279,12 @@ void kl_vulkan_xr_image_not_eye(unsigned long long image);
 void kl_vulkan_xr_image_capture(unsigned long long image, unsigned w, unsigned h,
                                 long long vk_format, unsigned array_layer,
                                 unsigned frame, int eye, int layer);
+// ...and one array layer of such an image as raw texels (`bpp` bytes each; depth
+// != 0 copies the depth aspect of a depth/stencil image) to `path`. For images
+// a PNG cannot hold: the XR_FB_space_warp motion vectors and depth.
+void kl_vulkan_xr_image_capture_raw(unsigned long long image, unsigned w, unsigned h,
+                                    unsigned bpp, int depth, unsigned array_layer,
+                                    const char *path);
 
 // t_fove: the foveated-intermediate refusal when an indirect draw recorded in a
 // SECONDARY command buffer is played inside its multiview pass (MoltenVK splits

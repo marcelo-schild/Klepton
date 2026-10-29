@@ -252,6 +252,27 @@ static void kl_driver_env_defaults(const kl_target *t) {
         setenv("KL_GHOSTTOWN_OVERLAY_COLOR", "1", 0);
         setenv("KL_OVRP_ENQ_OWNS_OVERLAYS", "1", 0);
     }
+    else if (!strcmp(t->name, "vampire")) {
+        // Vampire: The Masquerade - Justice (UE 4.27, Vulkan). Ended by the
+        // system on entering the sanctuary for the first time: the footprint
+        // went 2.5 -> 8 GB in six seconds with no error in the log
+        // (2026-10-29). KL_TRACE_MMAP named one site in libUE4 mapping 1654
+        // blocks of 4 MB — a 1280x720 RGBA video sample each — as two
+        // discipline movies started: the engine copied the same decoded frame
+        // again on every tick (kl_jni_ue4.c, KL_MP14_NEW_FRAMES_ONLY).
+        setenv("KL_MP14_NEW_FRAMES_ONLY", "1", 0);
+    }
+    else if (!strcmp(t->name, "x5812519008825194")) {
+        // AC Nexus: ShaderWarmupManager.PopulatePSOCache is one frame that
+        // compiles every pipeline in MoltenVK and then waits for the GPU to
+        // work through them. The game got in after ~90 s three times; once the
+        // first level was finished the same frame took longer than the app's
+        // 120 s watchdog (60 s compiling, then 60+ s at the frame-end wait
+        // with the GPU still submitting), and the watchdog's SIGALRM ended
+        // every start from then on (2026-10-29). A watchdog is for a frame
+        // that never returns, not for a slow one.
+        setenv("KL_ALARM", "600", 0);
+    }
     else if (!strcmp(t->name, "wrath2")) {
         // wrath2's world never appears because the GAME thread grinds through FMOD
         // Studio bank loading (UEngine::LoadMap -> LoadBanksForMap -> loadBankFile),
@@ -423,6 +444,18 @@ static void kl_driver_env_defaults(const kl_target *t) {
             setenv("KL_VK_FOZ_RECORD", "auto", 0);
             setenv("KL_VK_DEVICE_INFO", "auto", 0);
         }
+    }
+    if (!strcmp(t->name, "x3231001163584154")) {
+        // Warhammer 40,000: Battle Sister: its lightmaps are HDR ASTC (Unity's
+        // GraphicsFormat 145), which Unity takes as supported only when the
+        // extension string names GL_KHR_texture_compression_astc_hdr — named
+        // here only if ANGLE names it (kl_egl.c, the backend candidates).
+        setenv("KL_GL_BACKEND_EXT", "1", 0);
+        // Its BLAST shaders are rewritten at glShaderSource (kl_glfb.c,
+        // KL_GLFB_PROBE_CUBE_ARRAY, KL_GLFB_NO_GRADING_LUT); a program Unity
+        // cached as a binary skips that, and keeps whatever an earlier
+        // toolchain made of it. Always from source, so a change reaches them.
+        setenv("KL_GLFB_PROGRAM_BINARY", "0", 0);
     }
     // Every Unity title under the profile for untested games gets what
     // Walkabout, Demeo, Arkham Shadow and Moss were given for their hitches:

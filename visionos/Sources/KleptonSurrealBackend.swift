@@ -42,6 +42,9 @@ final class KleptonSurrealBackend: NSObject, CBCentralManagerDelegate, CBPeriphe
     private var diagnosticLog: FileHandle?
     private var diagnosticBytes = 0
     private var loggedPackets: Set<String> = []
+    // Edge-triggered diagnostics, BLE queue only: grip press/release and pose confidence.
+    private var gripDown = [false, false]
+    private var poseConfident = [true, true]
     private var loggedDiscoveries: Set<UUID> = []
 
     /// Connection events and the first packet size only; never per-frame pose data.
@@ -373,11 +376,27 @@ final class KleptonSurrealBackend: NSObject, CBCentralManagerDelegate, CBPeriphe
         switch characteristic.uuid.uuidString {
         case SurrealWire.pose:
             guard let pose = SurrealPose(data) else { return }
-            edit { $0.hands[hand.rawValue].receivePose(pose, at: now) }
+            let i = hand.rawValue
+            var gap = 0.0, clockReset = false
+            edit {
+                if $0.hands[i].pose != nil { gap = now - $0.hands[i].receivedAt }
+                clockReset = $0.hands[i].receivePose(pose, at: now)
+            }
+            if gap >= 0.25 { trace(String(format: "pose gap hand=%d %.0f ms", i, gap * 1000)) }
+            if clockReset { trace("pose clock reset hand=\(i)") }
+            if (pose.confidence > 0) != poseConfident[i] {
+                poseConfident[i] = pose.confidence > 0
+                trace("pose confidence hand=\(i) \(poseConfident[i] ? "back" : "zero")")
+            }
         case SurrealWire.input:
             let settings = snapshot().settings
             guard let input = SurrealWire.buttons(data, hand: hand, settings: settings) else { return }
             edit { $0.hands[hand.rawValue].input = input; $0.hands[hand.rawValue].hasInput = true }
+            if (input.handTrigger > 0.55) != gripDown[hand.rawValue] {
+                gripDown[hand.rawValue].toggle()
+                trace(String(format: "grip hand=%d %@ (%.2f)", hand.rawValue,
+                             gripDown[hand.rawValue] ? "down" : "up", input.handTrigger))
+            }
         case "2A19":
             if let value = data.first, value <= 100 { edit { $0.hands[hand.rawValue].battery = Int(value) } }
         case SurrealWire.controlResponse:

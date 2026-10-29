@@ -8,7 +8,7 @@ xcrun --sdk xrsimulator swiftc -target arm64-apple-xros26.0-simulator -sdk "$(xc
   -parse-as-library -o "$OUT/SurrealHarness" \
   Sources/KleptonControllerInput.swift Sources/KleptonControllerMode.swift \
   Sources/KleptonSurrealInput.swift Sources/KleptonSurrealBackend.swift Sources/KleptonSurrealView.swift \
-  Sources/KleptonSurrealAim.swift Sources/KleptonSurrealAimView.swift \
+  Sources/KleptonSurrealAim.swift Sources/KleptonSurrealAimView.swift Sources/KleptonSurrealSDK.swift \
   SurrealHarness/SurrealHarnessApp.swift
 cp SurrealHarness/Info.plist "$OUT/Info.plist"
 codesign --force --sign - "$OUT"

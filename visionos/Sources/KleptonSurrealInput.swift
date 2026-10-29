@@ -198,6 +198,32 @@ struct SurrealOrientationCalibration {
 }
 
 /// All calls made while the backend's lock is held. No Bluetooth calls under that lock.
+/// Five grip squeezes on BOTH controllers within three seconds: the in-game way to throw
+/// away registration when the controllers have drifted, without going back to the launcher.
+/// A squeeze is a press above 0.55 after a release below 0.35, so a held grip counts once.
+struct SurrealResetGesture {
+    static let squeezes = 5
+    static let window: Double = 3
+    private var pressed = [false, false]
+    private var presses: [[Double]] = [[], []]
+
+    /// Feed every input packet; true once, when the gesture completes.
+    mutating func update(hand: Int, grip: Float, at time: Double) -> Bool {
+        guard (0...1).contains(hand), grip.isFinite else { return false }
+        if pressed[hand] {
+            if grip < 0.35 { pressed[hand] = false }
+            return false
+        }
+        guard grip > 0.55 else { return false }
+        pressed[hand] = true
+        presses[hand].append(time)
+        for h in 0...1 { presses[h].removeAll { time - $0 > Self.window } }
+        guard presses.allSatisfy({ $0.count >= Self.squeezes }) else { return false }
+        presses = [[], []]
+        return true
+    }
+}
+
 struct SurrealHandCache {
     var deviceID: UUID?
     var connected = false

@@ -45,6 +45,7 @@ final class KleptonSurrealBackend: NSObject, CBCentralManagerDelegate, CBPeriphe
     // Edge-triggered diagnostics, BLE queue only: grip press/release and pose confidence.
     private var gripDown = [false, false]
     private var poseConfident = [true, true]
+    private var resetGesture = SurrealResetGesture()   // BLE queue only
     private var loggedDiscoveries: Set<UUID> = []
 
     /// Connection events and the first packet size only; never per-frame pose data.
@@ -396,6 +397,12 @@ final class KleptonSurrealBackend: NSObject, CBCentralManagerDelegate, CBPeriphe
                 gripDown[hand.rawValue].toggle()
                 trace(String(format: "grip hand=%d %@ (%.2f)", hand.rawValue,
                              gripDown[hand.rawValue] ? "down" : "up", input.handTrigger))
+            }
+            if resetGesture.update(hand: hand.rawValue, grip: input.handTrigger, at: now) {
+                // Same reset as the launcher's button; the next still grip hold re-registers.
+                trace("reset gesture: \(SurrealResetGesture.squeezes) grip squeezes on both controllers — tracking reset")
+                recalibrate()
+                for h in 0...1 { vibrate(hand: h, amplitude: 0.8, duration: 0.25) }
             }
         case "2A19":
             if let value = data.first, value <= 100 { edit { $0.hands[hand.rawValue].battery = Int(value) } }

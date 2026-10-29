@@ -254,23 +254,35 @@ if GAME_LANGUAGE and not re.fullmatch(r"device|en|[a-z]{2,3}_[A-Z]{2}", GAME_LAN
 CONTROLLER_MODE = os.environ.get("KLEPTON_CONTROLLER_MODE", "standard")
 if CONTROLLER_MODE not in ("standard", "surreal"):
     raise ValueError("KLEPTON_CONTROLLER_MODE must be standard or surreal")
+# AVP Play's "Surreal Touch support" (KLEPTON_SURREAL_SUPPORT=0: off). Off, the game is
+# built for standard controllers only: Standard mode whatever was asked, no SDK fetched
+# or linked, and KLSurrealAvailable NO, so the start window offers no controller type and
+# no Surreal panel (KleptonControllerMode.available). On, as before.
+SURREAL_SUPPORT = os.environ.get("KLEPTON_SURREAL_SUPPORT", "1") != "0"
+if not SURREAL_SUPPORT and CONTROLLER_MODE == "surreal":
+    print("gen_xcodeproj: Surreal Touch support is off (KLEPTON_SURREAL_SUPPORT=0) - "
+          "building for standard controllers", file=sys.stderr)
+    CONTROLLER_MODE = "standard"
 
 # Surreal Interactive's visionOS SDK (github.com/surreal-interactive/SwiftSDKBinary,
-# Apache-2.0), the pose source of a Surreal build (KleptonSurrealSDK.swift,
-# docs/SURREAL.md). ONLY for KLEPTON_CONTROLLER_MODE=surreal: a Standard build
-# neither fetches nor links it, so nothing changes for anyone without Surreal
-# Touch. A STATIC framework, so linked and never embedded.
+# Apache-2.0), the pose source of Surreal mode (KleptonSurrealSDK.swift,
+# docs/SURREAL.md). A STATIC framework, so linked and never embedded.
 #
-# Building for Surreal Touch IS the decision to use it, so there is no switch at
-# run time and no fallback: the generator fetches it the first time
-# (tools/surreal_sdk_fetch.sh pins and verifies it), and a Surreal build that
-# cannot have it stops here with the reason instead of quietly shipping the old
-# Bluetooth backend. KLEPTON_SURREAL_SDK=0 is the one way to build Surreal
-# without it, on purpose. Only when run as the generator, not when a test loads
-# this file.
+# Linked into EVERY build, whichever mode it starts in: the mode is the player's
+# choice in the game's start window, read when the game starts
+# (KleptonControllers.usesSurrealSDK), so a game installed for standard
+# controllers can be switched to Surreal Touch there and gets the SDK as well –
+# its owner asked for exactly that (2026-10-29). In Standard mode nothing calls
+# it. The generator fetches it the first time (tools/surreal_sdk_fetch.sh pins
+# and verifies it). A build that STARTS in Surreal mode stops when it cannot have
+# it, rather than quietly shipping the old Bluetooth backend; any other build goes
+# on without it and says so – a GitHub outage must not stop a game that has
+# nothing to do with Surreal Touch (Surreal mode then uses the Bluetooth backend).
+# KLEPTON_SURREAL_SDK=0 builds without it on purpose. Only when run as the
+# generator, not when a test loads this file.
 SVR_NAME = "surreal_interactive_openxr_framework"
 _svr_dir = os.path.join(HERE, "Frameworks", f"{SVR_NAME}.xcframework")
-_svr_wanted = CONTROLLER_MODE == "surreal" and os.environ.get("KLEPTON_SURREAL_SDK", "1") != "0"
+_svr_wanted = SURREAL_SUPPORT and os.environ.get("KLEPTON_SURREAL_SDK", "1") != "0"
 _svr_fetched = os.path.isdir(_svr_dir) and any(
     n.startswith(".klepton-fetched-") for n in os.listdir(_svr_dir))
 if _svr_wanted and not _svr_fetched and __name__ == "__main__":
@@ -280,10 +292,14 @@ if _svr_wanted and not _svr_fetched and __name__ == "__main__":
     # installer, 2026-10-29).
     if subprocess.run([os.path.join(HERE, "..", "tools", "surreal_sdk_fetch.sh")],
                       stdout=sys.stderr).returncode != 0:
-        sys.exit("!! a Surreal Touch build needs Surreal Interactive's SDK, and it could not be "
-                 "fetched (above). Check the connection and build again, stage it with "
-                 "`make surreal-sdk`, or set KLEPTON_SURREAL_SDK=0 to build with Klepton's "
-                 "own Bluetooth backend instead.")
+        if CONTROLLER_MODE == "surreal":
+            sys.exit("!! a Surreal Touch build needs Surreal Interactive's SDK, and it could not be "
+                     "fetched (above). Check the connection and build again, stage it with "
+                     "`make surreal-sdk`, or set KLEPTON_SURREAL_SDK=0 to build with Klepton's "
+                     "own Bluetooth backend instead.")
+        print("  Surreal Interactive's SDK could not be fetched (above) - building without it; "
+              "Surreal Touch in this game then uses Klepton's own Bluetooth backend. The next "
+              "build tries again.", file=sys.stderr)
 SURREAL_SDK = _svr_wanted and os.path.isfile(
     os.path.join(_svr_dir, "xros-arm64", f"{SVR_NAME}.framework", SVR_NAME))
 
@@ -467,6 +483,7 @@ _usage_settings = "".join(
     for k, v in USAGE_DESCRIPTIONS.items())
 ASSETCATALOG_SETTING += _usage_settings
 ASSETCATALOG_SETTING += f'\t\t\t\tKL_CONTROLLER_MODE_DEFAULT = "{CONTROLLER_MODE}";\n'
+ASSETCATALOG_SETTING += f'\t\t\t\tKL_SURREAL_AVAILABLE = {"YES" if SURREAL_SUPPORT else "NO"};\n'
 
 # Trim the asset catalog to THIS target. The shared Assets.xcassets holds one icon
 # stack per target (~26), and actool compiles ALL of them into the app's Assets.car
@@ -971,10 +988,13 @@ def main():
     # Vulkan guest is on a headset — so the build says which one it made.
     print(f"  embedded MoltenVK:         "
           + (', '.join(MVK) if MVK else "(none - run 'make mvk' for a Vulkan guest)"))
-    if CONTROLLER_MODE == "surreal":
+    if not SURREAL_SUPPORT:
+        print("  Surreal Touch:             off (KLEPTON_SURREAL_SUPPORT=0) - standard controllers only")
+    else:
         print(f"  Surreal Touch poses:       "
               + ("Surreal Interactive's SDK (linked)" if SURREAL_SDK
-                 else "KleptonSurrealBackend (KLEPTON_SURREAL_SDK=0)"))
+                 else "KleptonSurrealBackend (no SDK in this build)")
+              + f", starting in {CONTROLLER_MODE} mode")
     return 0
 
 

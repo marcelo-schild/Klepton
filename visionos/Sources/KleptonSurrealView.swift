@@ -17,7 +17,10 @@ struct KleptonControllerSettingsView: View {
     var boxed = true
 
     var body: some View {
-        if boxed {
+        // AVP Play's "Surreal Touch support" off: only standard controllers, nothing to choose.
+        if !KleptonControllerMode.available {
+            EmptyView()
+        } else if boxed {
             GroupBox(klT("Controllers", "Controller")) { controls }
         } else {
             controls

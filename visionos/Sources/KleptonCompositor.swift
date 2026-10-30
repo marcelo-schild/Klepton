@@ -4688,7 +4688,13 @@ final class KleptonCompositor {
                 let c = control[i+1], d = control[min(control.count-1,i+2)]
                 for k in 0..<3 {
                     let t = Float(k)/3, t2 = t*t, t3 = t2*t
-                    centers.append(0.5*((2*b)+(-a+c)*t+(2*a-5*b+4*c-d)*t2+(-a+3*b-3*c+d)*t3))
+                    // Catmull-Rom, one typed term at a time: as a single expression
+                    // Swift 6.3 (Xcode 26.6) gives up type-checking it.
+                    let c1: SIMD3<Float> = (c - a) * t
+                    let c2: SIMD3<Float> = (2 * a - 5 * b + 4 * c - d) * t2
+                    let c3: SIMD3<Float> = (3 * b - a - 3 * c + d) * t3
+                    let sum: SIMD3<Float> = 2 * b + c1 + c2 + c3
+                    centers.append(0.5 * sum)
                     let fraction = (Float(i)+t)/Float(control.count-1)
                     sizes.append(radius*(1-0.38*fraction))
                 }

@@ -126,6 +126,7 @@ struct SurrealTests {
         let badPulse = SurrealWire.vibration(sequence: 0, amplitude: .nan, duration: .infinity)
         expect(badPulse.count == 13, "Invalid haptic values do not trap")
         testResetGesture()
+        testPoseSmoother()
         expect(Array(SurrealWire.tlv(type: SurrealWire.modeRequest, sequence: 0)) == [0x0D, 2, 0, 0, 0], "Mode request wire format")
         expect(Array(SurrealWire.tlv(type: SurrealWire.modeSet, sequence: 0x0201, data: [SurrealWire.controllerMode]))
                == [0x0C, 3, 0, 0x01, 0x02, 0x00], "Set controller mode wire format")
@@ -289,6 +290,40 @@ struct SurrealTests {
                    "Fixed rotation calibration preserves live hand position and physical grip")
         }
     }
+
+    static func testPoseSmoother() {
+        // A still hand with ±3 mm / ±1° of tracker noise at 90 Hz: the output must shake far less.
+        var s = KleptonPoseSmoother()
+        var rng = SystemRandomNumberGenerator()
+        var rawSpread: Float = 0, outSpread: Float = 0, rawTurn: Float = 0, outTurn: Float = 0
+        var lastRaw = SIMD3<Float>(0, 1, 0), lastOut = lastRaw
+        var lastRawQ = simd_quatf(angle: 0, axis: [0, 1, 0]), lastOutQ = lastRawQ
+        for i in 0..<360 {
+            let n = SIMD3<Float>(Float.random(in: -0.003...0.003, using: &rng), Float.random(in: -0.003...0.003, using: &rng),
+                                 Float.random(in: -0.003...0.003, using: &rng))
+            let rq = simd_quatf(angle: Float.random(in: -0.017...0.017, using: &rng), axis: [0, 1, 0])
+            let (p, q) = s.filter(position: SIMD3(0, 1, 0) + n, orientation: rq, at: Double(i) / 90)
+            if i > 30 {
+                rawSpread += simd_length(SIMD3(0, 1, 0) + n - lastRaw); outSpread += simd_length(p - lastOut)
+                rawTurn += abs((rq * lastRawQ.inverse).angle); outTurn += abs((q * lastOutQ.inverse).angle)
+            }
+            lastRaw = SIMD3(0, 1, 0) + n; lastOut = p; lastRawQ = rq; lastOutQ = q
+        }
+        expect(outSpread < rawSpread * 0.25, "Still-hand position noise is mostly smoothed away")
+        expect(outTurn < rawTurn * 0.35, "Still-hand rotation noise is mostly smoothed away")
+        // A 1.5 m/s sweep: the output keeps up within a few centimetres.
+        var f = KleptonPoseSmoother()
+        var out = SIMD3<Float>.zero
+        for i in 0..<45 {
+            out = f.filter(position: SIMD3(Float(i) * 1.5 / 90, 1, 0), orientation: simd_quatf(angle: 0, axis: [0, 1, 0]), at: Double(i) / 90).0
+        }
+        expect(abs(out.x - 44 * 1.5 / 90) < 0.04, "Fast motion follows with little lag")
+        // A gap (hand lost) starts again from the new sample instead of sliding to it.
+        _ = f.filter(position: [0, 1, 0], orientation: simd_quatf(angle: 0, axis: [0, 1, 0]), at: 10)
+        expect(f.filter(position: [0.5, 1, 0], orientation: simd_quatf(angle: 0, axis: [0, 1, 0]), at: 10.5).0.x == 0.5,
+               "After a gap the filter restarts at the sample")
+    }
+
 
     static func testResetGesture() {
         // One squeeze = press then release; hands alternate 0.1 s apart.

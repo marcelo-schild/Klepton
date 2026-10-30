@@ -65,3 +65,43 @@ enum OVRPRawButton {
     static let lIndexTrigger: UInt32  = 0x1000_0000   // (v)
     static let lHandTrigger: UInt32   = 0x2000_0000   // (v)
 }
+
+/// One Euro filter (Casiez, Roussel & Vogel, CHI 2012) for a rigid pose: a low-pass whose
+/// cutoff rises with speed, so a still hand's tracker noise is smoothed away while a fast
+/// motion passes with little lag. Position cutoff in Hz = minCutoff + beta * speed (m/s);
+/// rotation the same with rad/s. Used for hand tracking in Surreal's hands mode, where the
+/// predicted ARKit wrist shook the hands and fingers in Half-Life: Alyx (2026-10-29).
+struct KleptonPoseSmoother {
+    var minCutoff: Float = 1.0, beta: Float = 8.0
+    var rotMinCutoff: Float = 1.0, rotBeta: Float = 1.5
+    var derivativeCutoff: Float = 1.0
+    private var last: (time: Double, p: SIMD3<Float>, q: simd_quatf, v: Float, w: Float)?
+
+    mutating func reset() { last = nil }
+
+    private static func alpha(_ cutoff: Float, _ dt: Float) -> Float {
+        let tau = 1 / (2 * Float.pi * cutoff)
+        return 1 / (1 + tau / dt)
+    }
+
+    /// The smoothed pose at `time`. A gap over 0.1 s (a hand lost) starts again from the sample.
+    mutating func filter(position p: SIMD3<Float>, orientation raw: simd_quatf, at time: Double) -> (SIMD3<Float>, simd_quatf) {
+        guard let prev = last, time > prev.time, time - prev.time < 0.1,
+              p.x.isFinite, p.y.isFinite, p.z.isFinite else {
+            last = (time, p, raw.normalized, 0, 0)
+            return (p, raw.normalized)
+        }
+        let dt = Float(max(1.0 / 240, time - prev.time))
+        // Same hemisphere as the last output, so the slerp takes the short way.
+        let q = simd_dot(raw.vector, prev.q.vector) < 0 ? simd_quatf(vector: -raw.vector) : raw
+        let speed = simd_length(p - prev.p) / dt
+        let v = prev.v + (speed - prev.v) * Self.alpha(derivativeCutoff, dt)
+        let outP = prev.p + (p - prev.p) * Self.alpha(minCutoff + beta * v, dt)
+        let delta = (q * prev.q.inverse).normalized
+        let angle = 2 * acos(min(1, abs(delta.real)))
+        let w = prev.w + (angle / dt - prev.w) * Self.alpha(derivativeCutoff, dt)
+        let outQ = simd_slerp(prev.q, q, Self.alpha(rotMinCutoff + rotBeta * w, dt)).normalized
+        last = (time, outP, outQ, v, w)
+        return (outP, outQ)
+    }
+}

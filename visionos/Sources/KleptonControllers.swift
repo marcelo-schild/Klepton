@@ -443,6 +443,58 @@ final class KleptonControllers {
             surreal.setEnabled(mode == .surreal)
         }
     }
+    /// Surreal SDK builds only: hands instead of the controllers, switched by five grip
+    /// squeezes on both controllers (SurrealResetGesture). Render thread only.
+    private var surrealHandsMode = false
+
+    private func toggleSurrealHands() {
+        surrealHandsMode.toggle()
+        // Whatever the last source held must not stay held in the other.
+        for hand in 0...1 {
+            pinchHeld[hand] = false
+            if Self.discretePinch { resetDiscretePinch(hand) }
+            kl_ovrp_set_controller_input(Int32(hand), 0, 0, 0, 0, 0, 0)
+            KleptonSurrealSDK.shared.vibrate(hand: hand, amplitude: 0.8, duration: 0.25)
+        }
+        if surrealHandsMode {
+            KleptonSurrealSDK.shared.note("hands mode: hand tracking drives both hands, the controllers are ignored")
+        } else {
+            // After hands mode the SDK's controllers came back misaligned (2026-10-28):
+            // restart it so it finds them where they are.
+            KleptonSurrealSDK.shared.note("controllers mode: re-aligning them where they are")
+            KleptonSurrealSDK.shared.realign()
+        }
+    }
+
+    /// The wrist the hand's pose (and its OVR skeleton) hang from, One-Euro smoothed while
+    /// Surreal's hands mode is on (nil otherwise: the raw anchor). The predicted ARKit wrist
+    /// shook the hands in Half-Life: Alyx (2026-10-29). KL_HAND_SMOOTH=0 turns it off;
+    /// KL_HAND_SMOOTH_MIN (Hz) and KL_HAND_SMOOTH_BETA tune it.
+    private var smoothedWrist: [simd_float4x4?] = [nil, nil]
+    private var wristSmoother: [KleptonPoseSmoother] = {
+        var s = KleptonPoseSmoother()
+        let env = ProcessInfo.processInfo.environment
+        if let v = env["KL_HAND_SMOOTH_MIN"].flatMap(Float.init), v > 0 { s.minCutoff = v; s.rotMinCutoff = v }
+        if let v = env["KL_HAND_SMOOTH_BETA"].flatMap(Float.init), v >= 0 { s.beta = v }
+        return [s, s]
+    }()
+    private static let handSmoothing = ProcessInfo.processInfo.environment["KL_HAND_SMOOTH"] != "0"
+
+    private func smoothWrists(leftHand: HandAnchor?, rightHand: HandAnchor?, at time: TimeInterval) {
+        for hand in 0...1 {
+            let anchor = hand == 0 ? leftHand : rightHand
+            guard usesSurrealSDK, surrealHandsMode, Self.handSmoothing, let anchor, anchor.isTracked else {
+                smoothedWrist[hand] = nil; wristSmoother[hand].reset(); continue
+            }
+            let m = anchor.originFromAnchorTransform
+            let (p, q) = wristSmoother[hand].filter(position: SIMD3(m.columns.3.x, m.columns.3.y, m.columns.3.z),
+                                                    orientation: simd_quatf(m), at: time)
+            var out = simd_float4x4(q)
+            out.columns.3 = SIMD4(p, 1)
+            smoothedWrist[hand] = out
+        }
+    }
+
     /// Surreal mode through Surreal Interactive's SDK rather than KleptonSurrealBackend.
     /// Never in Standard mode, and never in a build without the SDK.
     private let usesSurrealSDK = KleptonControllerMode.selected() == .surreal && KleptonSurrealSDK.enabled
@@ -895,8 +947,8 @@ final class KleptonControllers {
     /// times a second while rotating the hand. That is the hilts jumping
     /// around. Holding the last known wrist-local offset instead means losing
     /// the skeleton costs precision, not position.
-    private func gripPose(_ anchor: HandAnchor, hand: Int) -> (SIMD3<Float>, simd_quatf) {
-        let origin = anchor.originFromAnchorTransform
+    private func gripPose(_ anchor: HandAnchor, hand: Int, wrist: simd_float4x4? = nil) -> (SIMD3<Float>, simd_quatf) {
+        let origin = wrist ?? anchor.originFromAnchorTransform
         let wristRot = simd_quatf(origin)
 
         // --- orientation.
@@ -2324,12 +2376,15 @@ final class KleptonControllers {
     /// and describe the same instant the head pose does.
     func update(leftHand: HandAnchor?, rightHand: HandAnchor?,
                 at presentationTime: TimeInterval, headTransform: simd_float4x4? = nil) {
-        if usesSurrealSDK {
+        if usesSurrealSDK, KleptonSurrealSDK.shared.takeToggleRequest() { toggleSurrealHands() }
+        smoothWrists(leftHand: leftHand, rightHand: rightHand, at: presentationTime)
+        if usesSurrealSDK, !surrealHandsMode {
             // Already aligned and predicted by the SDK; the hand anchors are its business.
             for hand in 0...1 { submit(KleptonSurrealSDK.shared.sample(hand: hand), hand: hand) }
             return
         }
-        if mode == .surreal {
+        // Surreal SDK in hands mode falls through to the hand path below, as Standard does.
+        if mode == .surreal, !usesSurrealSDK {
             let handPositionOnly = surreal.snapshot().settings.positionFromHands
             let alignmentTarget = headTransform.flatMap { SurrealControllerOrientation.forward(head: $0) }
             for hand in 0...1 {
@@ -2403,7 +2458,7 @@ final class KleptonControllers {
                 continue
             } else if let anchor = (hand == 0 ? leftHand : rightHand) {
                 handSuppressed[hand] = false
-                let (p, q) = gripPose(anchor, hand: hand)
+                let (p, q) = gripPose(anchor, hand: hand, wrist: smoothedWrist[hand])
                 st.position = p; st.orientation = q
                 // A Sense controller wrote this hand's input, but its pose
                 // dropped out for this frame. The hand may stand in for the
@@ -2582,7 +2637,9 @@ final class KleptonControllers {
             return
         }
         jointStats[hand].seen += 1
-        let world = trackingRebase * anchor.originFromAnchorTransform
+        // The same smoothed wrist as the hand's pose in Surreal's hands mode, so the
+        // fingers stay on the hand; the raw anchor otherwise.
+        let world = trackingRebase * (smoothedWrist[hand] ?? anchor.originFromAnchorTransform)
         var mask: UInt32 = 0
         for (i, name) in Self.jointOrder.enumerated() {
             let j = sk.joint(name)
